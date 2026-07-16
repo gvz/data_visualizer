@@ -1,5 +1,6 @@
-// Module declarations are added task by task as modules are implemented.
-pub mod types;
+pub mod app;
 pub mod config;
+pub mod demo;
 pub mod store;
+pub mod types;
 pub mod viz;

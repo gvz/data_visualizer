@@ -1,0 +1,13 @@
+[screens.main]
+
+[[screens.main.panels]]
+type = "numeric"
+channel = "demo.sine"
+
+[[screens.main.panels]]
+type = "numeric"
+channel = "demo.counter"
+
+[[screens.main.panels]]
+type = "numeric"
+channel = "demo.enabled"

@@ -1,0 +1,32 @@
+[channels."demo.sine"]
+topic      = "demo"
+proto_path = "DemoBatch.samples.sine"
+ts_path    = "DemoBatch.samples.t_ns"
+type       = "float"
+unit       = "V"
+color      = "#ff8800"
+max_rate   = 2000
+history_s  = 10.0
+
+[channels."demo.counter"]
+topic      = "demo"
+proto_path = "DemoBatch.samples.counter"
+ts_path    = "DemoBatch.samples.t_ns"
+type       = "int"
+max_rate   = 2000
+history_s  = 10.0
+
+[channels."demo.enabled"]
+topic      = "demo"
+proto_path = "DemoBatch.samples.enabled"
+ts_path    = "DemoBatch.samples.t_ns"
+type       = "bool"
+max_rate   = 2000
+history_s  = 10.0
+
+[channels."demo.log"]
+topic      = "demo"
+proto_path = "DemoBatch.samples.message"
+ts_path    = "DemoBatch.samples.t_ns"
+type       = "text"
+max_lines  = 200
