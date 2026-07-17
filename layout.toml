@@ -1,13 +1,42 @@
 [screens.main]
 
 [[screens.main.panels]]
-type = "numeric"
+type = "waveform"
+channels = ["demo.sine"]
+time_window_s = 5.0
+cursors = true
+
+[[screens.main.panels]]
+type = "gauge"
 channel = "demo.sine"
+min = -10.0
+max = 10.0
 
 [[screens.main.panels]]
 type = "numeric"
 channel = "demo.counter"
 
 [[screens.main.panels]]
-type = "numeric"
+type = "state_graph"
 channel = "demo.enabled"
+states = { 0 = "OFF", 1 = "ON" }
+time_window_s = 30.0
+
+[[screens.main.panels]]
+type = "log"
+channels = ["demo.log"]
+max_lines = 200
+
+[screens.analysis]
+
+[[screens.analysis.panels]]
+type = "spectrum"
+channel = "demo.sine"
+fft_size = 1024
+window = "hann"
+
+[[screens.analysis.panels]]
+type = "xy_scatter"
+x_channel = "demo.sine"
+y_channel = "demo.counter"
+time_window_s = 2.0
