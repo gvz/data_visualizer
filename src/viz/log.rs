@@ -67,7 +67,7 @@ impl VizPanel for LogPanel {
             ui.text_edit_singleline(&mut self.filter);
             let mut max = self.max_lines as i64;
             ui.label("max lines:");
-            ui.add(egui::DragValue::new(&mut max).clamp_range(1..=100_000));
+            ui.add(egui::DragValue::new(&mut max).range(1..=100_000));
             self.max_lines = max.max(1) as usize;
         });
     }
