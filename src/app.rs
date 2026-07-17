@@ -59,6 +59,7 @@ pub struct DataVisApp {
     add_panel: AddPanelDialog,
     new_screen_name: String,
     status: String,
+    conn_state: Option<Arc<std::sync::atomic::AtomicU8>>,
 }
 
 impl DataVisApp {
@@ -68,6 +69,7 @@ impl DataVisApp {
         registry: PanelRegistry,
         workspace: Workspace,
         layout_path: PathBuf,
+        conn_state: Option<Arc<std::sync::atomic::AtomicU8>>,
     ) -> Self {
         let panel_type = registry
             .type_names()
@@ -83,6 +85,7 @@ impl DataVisApp {
             add_panel: AddPanelDialog { panel_type, ..Default::default() },
             new_screen_name: String::new(),
             status: String::new(),
+            conn_state,
         }
     }
 
@@ -151,7 +154,17 @@ impl DataVisApp {
                     self.add_panel.open = true;
                 }
                 ui.separator();
-                ui.colored_label(egui::Color32::LIGHT_GREEN, "LIVE");
+                let (label, color) = match self
+                    .conn_state
+                    .as_ref()
+                    .map(|s| s.load(std::sync::atomic::Ordering::Relaxed))
+                {
+                    None | Some(crate::ingest::LIVE) => ("LIVE", egui::Color32::LIGHT_GREEN),
+                    Some(crate::ingest::CONNECTING) => ("CONNECTING", egui::Color32::YELLOW),
+                    Some(crate::ingest::TIMEOUT) => ("TIMEOUT", egui::Color32::RED),
+                    Some(_) => ("?", egui::Color32::GRAY),
+                };
+                ui.colored_label(color, label);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(&self.status);
                 });
