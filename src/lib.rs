@@ -4,3 +4,4 @@ pub mod demo;
 pub mod store;
 pub mod types;
 pub mod viz;
+pub mod workspace;

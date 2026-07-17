@@ -61,6 +61,13 @@ impl PanelRegistry {
         self.ctors.insert(name, ctor);
     }
 
+    /// Registered panel type strings, sorted for stable UI listings.
+    pub fn type_names(&self) -> Vec<&'static str> {
+        let mut v: Vec<&'static str> = self.ctors.keys().copied().collect();
+        v.sort_unstable();
+        v
+    }
+
     pub fn build(
         &self,
         entry: &PanelEntry,
