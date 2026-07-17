@@ -7,6 +7,9 @@ use crate::config::{ChannelRegistry, PanelEntry};
 use crate::store::ChannelStore;
 use crate::types::SampleType;
 
+pub mod common;
+pub mod decimate;
+pub mod measure;
 pub mod numeric;
 
 /// A visualization panel. Panels only see the ChannelStore trait — live vs
