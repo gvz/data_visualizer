@@ -15,6 +15,9 @@ egui_tiles = { version = "0.9", features = ["serde"] }
 zmq = "0.10"
 prost-reflect = "0.14"
 protox = "0.7"
+mcap = "0.8"
+rfd = "0.14"
+crossbeam-channel = "0.5"
 
 [dev-dependencies]
 tempfile = "3"

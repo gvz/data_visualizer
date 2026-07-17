@@ -2,6 +2,7 @@ pub mod app;
 pub mod config;
 pub mod demo;
 pub mod ingest;
+pub mod record;
 pub mod store;
 pub mod types;
 pub mod viz;
