@@ -26,16 +26,19 @@ pub struct ChannelDesc {
 
 pub struct ProtoSchema {
     pool: DescriptorPool,
+    schema_bytes: Vec<u8>,
 }
 
 impl ProtoSchema {
     pub fn from_path(proto_file: &Path) -> anyhow::Result<Self> {
+        use prost_reflect::prost::Message as _;
         let include_dir = proto_file.parent().unwrap_or(Path::new("."));
         let fds = protox::compile([proto_file], [include_dir])
             .with_context(|| format!("compiling proto schema {}", proto_file.display()))?;
+        let schema_bytes = fds.encode_to_vec();
         let pool = DescriptorPool::from_file_descriptor_set(fds)
             .context("building descriptor pool from compiled schema")?;
-        Ok(Self { pool })
+        Ok(Self { pool, schema_bytes })
     }
 
     pub fn resolve(&self, proto_path: &str, ts_path: &str) -> anyhow::Result<ChannelDesc> {
@@ -54,6 +57,10 @@ impl ProtoSchema {
             .get_message_by_name(&val_msg)
             .ok_or_else(|| anyhow!("message type {:?} not found in proto schema", val_msg))?;
         Ok(ChannelDesc { msg_desc, val_path: val_steps, ts_path: ts_steps })
+    }
+
+    pub fn schema_bytes(&self) -> &[u8] {
+        &self.schema_bytes
     }
 
     #[cfg(test)]
@@ -157,5 +164,21 @@ message B { int64 t = 1; float v = 2; }
     #[test]
     fn from_path_nonexistent_file_is_err() {
         assert!(ProtoSchema::from_path(std::path::Path::new("/nonexistent/schema.proto")).is_err());
+    }
+
+    #[test]
+    fn schema_bytes_is_valid_file_descriptor_set() {
+        use prost_reflect::prost::Message as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_proto(dir.path(), r#"
+syntax = "proto3";
+message Ping { int64 t_ns = 1; float v = 2; }
+"#);
+        let schema = ProtoSchema::from_path(&path).unwrap();
+        let bytes = schema.schema_bytes();
+        assert!(!bytes.is_empty());
+        // Must decode back to a valid FileDescriptorSet.
+        let fds = prost_types::FileDescriptorSet::decode(bytes).unwrap();
+        assert!(!fds.file.is_empty());
     }
 }

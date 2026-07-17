@@ -1055,6 +1055,7 @@ dependencies = [
  "egui_tiles",
  "mcap",
  "prost-reflect",
+ "prost-types",
  "protox",
  "rfd",
  "rustfft",
