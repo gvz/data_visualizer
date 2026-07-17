@@ -13,6 +13,7 @@ pub mod gauge;
 pub mod measure;
 pub mod numeric;
 pub mod spectrum;
+pub mod state_graph;
 pub mod waveform;
 pub mod xy_scatter;
 
@@ -49,6 +50,7 @@ impl PanelRegistry {
         reg.register(numeric::TYPE_NAME, numeric::ctor);
         reg.register(spectrum::TYPE_NAME, spectrum::ctor);
         reg.register(waveform::TYPE_NAME, waveform::ctor);
+        reg.register(state_graph::TYPE_NAME, state_graph::ctor);
         reg.register(xy_scatter::TYPE_NAME, xy_scatter::ctor);
         reg
     }
