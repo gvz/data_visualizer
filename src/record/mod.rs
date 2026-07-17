@@ -19,12 +19,25 @@ impl Drop for RecordHandle {
     }
 }
 
-/// Stub — implemented in Task 3.
 pub fn start_recording(
-    _output_dir: &std::path::Path,
-    _registry: &crate::config::ChannelRegistry,
-    _schema_bytes: Vec<u8>,
-    _receiver: crossbeam_channel::Receiver<RecordMsg>,
+    output_dir: &std::path::Path,
+    registry: &crate::config::ChannelRegistry,
+    schema_bytes: Vec<u8>,
+    receiver: crossbeam_channel::Receiver<RecordMsg>,
 ) -> anyhow::Result<RecordHandle> {
-    Err(anyhow::anyhow!("start_recording: not yet implemented"))
+    let gap_count = Arc::new(AtomicU64::new(0));
+    let record_failed = Arc::new(AtomicBool::new(false));
+    let stop_tx = writer::spawn_recorder(
+        output_dir,
+        registry,
+        &schema_bytes,
+        receiver,
+        gap_count.clone(),
+        record_failed.clone(),
+    )?;
+    Ok(RecordHandle {
+        gap_count,
+        record_failed,
+        stop_tx,
+    })
 }
