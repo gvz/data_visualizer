@@ -12,3 +12,9 @@ egui_plot = "0.28"
 rustfft = "6"
 serde_json = "1"
 egui_tiles = { version = "0.9", features = ["serde"] }
+zmq = "0.10"
+prost-reflect = "0.14"
+protox = "0.7"
+
+[dev-dependencies]
+tempfile = "3"
