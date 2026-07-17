@@ -11,6 +11,7 @@ pub mod common;
 pub mod decimate;
 pub mod measure;
 pub mod numeric;
+pub mod spectrum;
 pub mod waveform;
 
 /// A visualization panel. Panels only see the ChannelStore trait — live vs
@@ -43,6 +44,7 @@ impl PanelRegistry {
     pub fn with_builtins() -> Self {
         let mut reg = Self { ctors: HashMap::new() };
         reg.register(numeric::TYPE_NAME, numeric::ctor);
+        reg.register(spectrum::TYPE_NAME, spectrum::ctor);
         reg.register(waveform::TYPE_NAME, waveform::ctor);
         reg
     }
