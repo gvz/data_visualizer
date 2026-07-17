@@ -10,6 +10,7 @@ use crate::types::SampleType;
 pub mod common;
 pub mod decimate;
 pub mod gauge;
+pub mod log;
 pub mod measure;
 pub mod numeric;
 pub mod spectrum;
@@ -47,6 +48,7 @@ impl PanelRegistry {
     pub fn with_builtins() -> Self {
         let mut reg = Self { ctors: HashMap::new() };
         reg.register(gauge::TYPE_NAME, gauge::ctor);
+        reg.register(log::TYPE_NAME, log::ctor);
         reg.register(numeric::TYPE_NAME, numeric::ctor);
         reg.register(spectrum::TYPE_NAME, spectrum::ctor);
         reg.register(waveform::TYPE_NAME, waveform::ctor);
