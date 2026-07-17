@@ -18,7 +18,7 @@ protox = "0.7"
 mcap = "0.8"
 rfd = "0.14"
 crossbeam-channel = "0.5"
+prost-types = "0.13"
 
 [dev-dependencies]
 tempfile = "3"
-prost-types = "0.13"

@@ -1,9 +1,13 @@
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use eframe::egui;
 
 use crate::config::{ChannelRegistry, LayoutConfig, PanelEntry};
+use crate::record::playback::PlaybackStore;
+use crate::record::{start_recording, RecordHandle};
 use crate::store::ChannelStore;
 use crate::viz::PanelRegistry;
 use crate::workspace::Workspace;
@@ -49,9 +53,22 @@ pub fn build_panel_entry(panel_type: &str, selected: &[String]) -> Option<PanelE
     Some(PanelEntry { panel_type: panel_type.to_string(), config: cfg })
 }
 
+pub(crate) struct ReplayState {
+    store: Arc<PlaybackStore>,
+    playing: bool,
+    speed: f32,
+    last_frame: Instant,
+}
+
+pub(crate) enum AppMode {
+    Live,
+    Replay(ReplayState),
+}
+
 /// Top-level eframe app: menu bar, screen tabs, tiled workspace, dialogs.
 pub struct DataVisApp {
     store: Arc<dyn ChannelStore>,
+    live_store: Arc<dyn ChannelStore>,
     channels: ChannelRegistry,
     registry: PanelRegistry,
     workspace: Workspace,
@@ -60,6 +77,11 @@ pub struct DataVisApp {
     new_screen_name: String,
     status: String,
     conn_state: Option<Arc<std::sync::atomic::AtomicU8>>,
+    mode: AppMode,
+    // Recording state
+    record_handle: Option<RecordHandle>,
+    record_sender_slot: Option<Arc<Mutex<Option<crossbeam_channel::Sender<crate::record::RecordMsg>>>>>,
+    ingest_schema_bytes: Vec<u8>,
 }
 
 impl DataVisApp {
@@ -70,6 +92,8 @@ impl DataVisApp {
         workspace: Workspace,
         layout_path: PathBuf,
         conn_state: Option<Arc<std::sync::atomic::AtomicU8>>,
+        record_sender_slot: Option<Arc<Mutex<Option<crossbeam_channel::Sender<crate::record::RecordMsg>>>>>,
+        ingest_schema_bytes: Vec<u8>,
     ) -> Self {
         let panel_type = registry
             .type_names()
@@ -77,6 +101,7 @@ impl DataVisApp {
             .map(|s| s.to_string())
             .unwrap_or_default();
         Self {
+            live_store: store.clone(),
             store,
             channels,
             registry,
@@ -86,6 +111,10 @@ impl DataVisApp {
             new_screen_name: String::new(),
             status: String::new(),
             conn_state,
+            mode: AppMode::Live,
+            record_handle: None,
+            record_sender_slot,
+            ingest_schema_bytes,
         }
     }
 
@@ -104,6 +133,91 @@ impl DataVisApp {
             }
             Err(e) => self.status = format!("layout load failed: {e}"),
         }
+    }
+
+    fn start_recording(&mut self) {
+        if self.record_sender_slot.is_none() {
+            self.status = "Recording not available in demo mode".to_string();
+            return;
+        }
+        let (tx, rx) = crate::record::record_channel();
+        // Install sender so the ingest thread starts queuing messages.
+        if let Some(slot) = &self.record_sender_slot {
+            *slot.lock().unwrap() = Some(tx);
+        }
+        match start_recording(
+            Path::new("."),
+            &self.channels,
+            self.ingest_schema_bytes.clone(),
+            rx,
+        ) {
+            Ok(handle) => {
+                self.record_handle = Some(handle);
+                self.status = "Recording started".to_string();
+            }
+            Err(e) => {
+                // Remove sender since the recorder won't consume it.
+                if let Some(slot) = &self.record_sender_slot {
+                    *slot.lock().unwrap() = None;
+                }
+                self.status = format!("Record failed: {e}");
+            }
+        }
+    }
+
+    fn stop_recording(&mut self) {
+        // Remove sender first so ingest stops queuing, then drop handle to signal recorder.
+        if let Some(slot) = &self.record_sender_slot {
+            *slot.lock().unwrap() = None;
+        }
+        self.record_handle = None;
+        self.status = "Recording stopped".to_string();
+    }
+
+    fn open_recording(&mut self) {
+        if self.record_handle.is_some() {
+            self.status = "Stop recording before opening a file".to_string();
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("MCAP recording", &["mcap"])
+            .pick_file()
+        else {
+            return;
+        };
+
+        if self.ingest_schema_bytes.is_empty() {
+            self.status = "Replay not available in demo mode (no proto schema)".to_string();
+            return;
+        }
+        let schema = match crate::ingest::loader::ProtoSchema::from_bytes(&self.ingest_schema_bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                self.status = format!("Failed to reconstruct schema: {e}");
+                return;
+            }
+        };
+        match PlaybackStore::load(&path, &self.channels, &schema) {
+            Ok(playback) => {
+                self.store = playback.clone();
+                self.mode = AppMode::Replay(ReplayState {
+                    store: playback,
+                    playing: false,
+                    speed: 1.0,
+                    last_frame: Instant::now(),
+                });
+                self.status = format!("Loaded {}", path.display());
+            }
+            Err(e) => {
+                self.status = format!("Failed to load recording: {e}");
+            }
+        }
+    }
+
+    fn close_replay(&mut self) {
+        self.store = self.live_store.clone();
+        self.mode = AppMode::Live;
+        self.status = "Replay closed".to_string();
     }
 
     fn menu_bar(&mut self, ctx: &egui::Context) {
@@ -130,6 +244,7 @@ impl DataVisApp {
     fn toolbar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                // Screen selector
                 ui.label("screen:");
                 let mut selected = self.workspace.active.clone();
                 egui::ComboBox::from_id_source("screen-select")
@@ -154,17 +269,53 @@ impl DataVisApp {
                     self.add_panel.open = true;
                 }
                 ui.separator();
-                let (label, color) = match self
-                    .conn_state
-                    .as_ref()
-                    .map(|s| s.load(std::sync::atomic::Ordering::Relaxed))
-                {
-                    None | Some(crate::ingest::LIVE) => ("LIVE", egui::Color32::LIGHT_GREEN),
-                    Some(crate::ingest::CONNECTING) => ("CONNECTING", egui::Color32::YELLOW),
-                    Some(crate::ingest::TIMEOUT) => ("TIMEOUT", egui::Color32::RED),
-                    Some(_) => ("?", egui::Color32::GRAY),
-                };
-                ui.colored_label(color, label);
+
+                match &self.mode {
+                    AppMode::Live => {
+                        // Connection state indicator
+                        let (label, color) = match self
+                            .conn_state
+                            .as_ref()
+                            .map(|s| s.load(std::sync::atomic::Ordering::Relaxed))
+                        {
+                            None | Some(crate::ingest::LIVE) => ("LIVE", egui::Color32::LIGHT_GREEN),
+                            Some(crate::ingest::CONNECTING) => ("CONNECTING", egui::Color32::YELLOW),
+                            Some(crate::ingest::TIMEOUT) => ("TIMEOUT", egui::Color32::RED),
+                            Some(_) => ("?", egui::Color32::GRAY),
+                        };
+                        ui.colored_label(color, label);
+                        ui.separator();
+
+                        // Record controls
+                        if self.record_handle.is_none() {
+                            if ui.button("Rec").clicked() {
+                                self.start_recording();
+                            }
+                            if ui.button("Open recording").clicked() {
+                                self.open_recording();
+                            }
+                        } else {
+                            if ui.button("Stop Rec").clicked() {
+                                self.stop_recording();
+                            }
+                            if let Some(handle) = &self.record_handle {
+                                let gaps = handle.gap_count.load(Ordering::Relaxed);
+                                if gaps > 0 {
+                                    ui.colored_label(egui::Color32::RED, format!("{gaps} gaps"));
+                                }
+                                if handle.record_failed.load(Ordering::Relaxed) {
+                                    ui.colored_label(egui::Color32::RED, "WRITE ERROR");
+                                }
+                            }
+                        }
+                    }
+                    AppMode::Replay(_) => {
+                        ui.colored_label(egui::Color32::LIGHT_BLUE, "REPLAY");
+                        ui.separator();
+                        // Replay controls are rendered inline in update() after this call.
+                    }
+                }
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(&self.status);
                 });
@@ -230,18 +381,79 @@ impl DataVisApp {
 
 impl eframe::App for DataVisApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Live data keeps coming whether or not there is input.
         ctx.request_repaint();
+
+        // Advance playback clock before any rendering.
+        if let AppMode::Replay(ref mut rs) = self.mode {
+            if rs.playing {
+                let delta_ns = rs.last_frame.elapsed().as_nanos() as i64;
+                let advance = (delta_ns as f64 * rs.speed as f64) as i64;
+                let pos = rs.store.position_ns.load(Ordering::Relaxed);
+                let end = rs.store.start_ns + rs.store.duration_ns;
+                let new_pos = (pos + advance).min(end);
+                rs.store.position_ns.store(new_pos, Ordering::Relaxed);
+                if new_pos >= end {
+                    rs.playing = false;
+                }
+            }
+            rs.last_frame = Instant::now();
+        }
+
         self.menu_bar(ctx);
         self.toolbar(ctx);
+
+        // Replay controls panel — rendered inline to avoid borrow conflict with close_replay().
+        // The close button sets a local flag; close_replay() is called after the borrow ends.
+        let mut close_replay = false;
+        if let AppMode::Replay(ref mut rs) = self.mode {
+            egui::TopBottomPanel::top("replay_controls").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let play_label = if rs.playing { "Pause" } else { "Play" };
+                    if ui.button(play_label).clicked() {
+                        rs.playing = !rs.playing;
+                    }
+
+                    let pos = rs.store.position_ns.load(Ordering::Relaxed);
+                    let start = rs.store.start_ns;
+                    let dur = rs.store.duration_ns.max(1);
+                    let mut offset = (pos - start) as f64;
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut offset, 0.0..=(dur as f64))
+                                .text("pos")
+                                .custom_formatter(|v, _| format!("{:.1}s", v / 1e9)),
+                        )
+                        .changed()
+                    {
+                        rs.store.position_ns.store(start + offset as i64, Ordering::Relaxed);
+                    }
+
+                    egui::ComboBox::from_label("speed")
+                        .selected_text(format!("{}x", rs.speed))
+                        .show_ui(ui, |ui| {
+                            for &s in &[0.25f32, 0.5, 1.0, 2.0, 4.0] {
+                                ui.selectable_value(&mut rs.speed, s, format!("{s}x"));
+                            }
+                        });
+
+                    if ui.button("Close").clicked() {
+                        close_replay = true;
+                    }
+                });
+            });
+        }
+        if close_replay {
+            self.close_replay();
+        }
+
         self.add_panel_window(ctx);
+
         egui::CentralPanel::default().show(ctx, |ui| {
             self.workspace.ui(ui, self.store.as_ref());
         });
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // Spec: layout auto-saves on exit.
         let _ = self.workspace.to_config().save(&self.layout_path);
     }
 }
@@ -249,6 +461,13 @@ impl eframe::App for DataVisApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_mode_transitions_compile() {
+        // Checks that AppMode, ReplayState types exist and are constructible.
+        // Full UI tests require eframe harness; this just verifies the types.
+        let _live = AppMode::Live;
+    }
 
     #[test]
     fn build_entry_single_channel_types() {

@@ -63,6 +63,16 @@ impl ProtoSchema {
         &self.schema_bytes
     }
 
+    pub fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
+        use prost_reflect::prost::Message as _;
+        let fds = prost_types::FileDescriptorSet::decode(bytes)
+            .context("decoding FileDescriptorSet from schema bytes")?;
+        let schema_bytes = bytes.to_vec();
+        let pool = DescriptorPool::from_file_descriptor_set(fds)
+            .context("building descriptor pool from schema bytes")?;
+        Ok(Self { pool, schema_bytes })
+    }
+
     #[cfg(test)]
     pub fn pool_for_test(&self) -> &DescriptorPool {
         &self.pool

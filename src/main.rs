@@ -24,9 +24,9 @@ fn main() -> anyhow::Result<()> {
 
     let store = Arc::new(LiveStore::from_registry(&channels));
 
-    let conn_state = if demo {
+    let (conn_state, record_sender_slot, ingest_schema_bytes) = if demo {
         datavis::demo::spawn_demo(store.clone(), &channels);
-        None
+        (None, None, vec![])
     } else {
         let config = IngestConfig {
             endpoint,
@@ -34,13 +34,12 @@ fn main() -> anyhow::Result<()> {
         };
         match datavis::ingest::spawn_ingest(config, &channels, store.clone()) {
             Ok(handle) => {
-                let _schema_bytes = handle.schema_bytes;
-                let _record_sender = handle.record_sender;
-                Some(handle.conn_state)
+                let schema_bytes = handle.schema_bytes.clone();
+                (Some(handle.conn_state), Some(handle.record_sender), schema_bytes)
             }
             Err(e) => {
                 eprintln!("ingest: failed to start ({e}); running without live data");
-                None
+                (None, None, vec![])
             }
         }
     };
@@ -48,7 +47,16 @@ fn main() -> anyhow::Result<()> {
     let registry = PanelRegistry::with_builtins();
     let workspace = Workspace::from_config(&layout, &registry, &channels);
     let dyn_store: Arc<dyn ChannelStore> = store;
-    let app = DataVisApp::new(dyn_store, channels, registry, workspace, layout_path, conn_state);
+    let app = DataVisApp::new(
+        dyn_store,
+        channels,
+        registry,
+        workspace,
+        layout_path,
+        conn_state,
+        record_sender_slot,
+        ingest_schema_bytes,
+    );
 
     eframe::run_native(
         "datavis",
