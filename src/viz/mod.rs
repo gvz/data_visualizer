@@ -14,6 +14,7 @@ pub mod measure;
 pub mod numeric;
 pub mod spectrum;
 pub mod waveform;
+pub mod xy_scatter;
 
 /// A visualization panel. Panels only see the ChannelStore trait — live vs
 /// replay is transparent here.
@@ -48,6 +49,7 @@ impl PanelRegistry {
         reg.register(numeric::TYPE_NAME, numeric::ctor);
         reg.register(spectrum::TYPE_NAME, spectrum::ctor);
         reg.register(waveform::TYPE_NAME, waveform::ctor);
+        reg.register(xy_scatter::TYPE_NAME, xy_scatter::ctor);
         reg
     }
 
