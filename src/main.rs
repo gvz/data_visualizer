@@ -33,7 +33,11 @@ fn main() -> anyhow::Result<()> {
             proto_path: PathBuf::from(&schema_path),
         };
         match datavis::ingest::spawn_ingest(config, &channels, store.clone()) {
-            Ok(handle) => Some(handle.conn_state),
+            Ok(handle) => {
+                let _schema_bytes = handle.schema_bytes;
+                let _record_sender = handle.record_sender;
+                Some(handle.conn_state)
+            }
             Err(e) => {
                 eprintln!("ingest: failed to start ({e}); running without live data");
                 None

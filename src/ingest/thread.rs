@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use crate::ingest::decode::decode_batch;
 use crate::ingest::router::TopicRouter;
 use crate::ingest::{CONNECTING, LIVE, TIMEOUT};
+use crate::record::RecordMsg;
 use crate::store::ChannelStore;
 
 pub fn run_loop(
@@ -12,11 +13,12 @@ pub fn run_loop(
     router: TopicRouter,
     store: Arc<dyn ChannelStore>,
     state: Arc<AtomicU8>,
+    record_sender: Arc<std::sync::Mutex<Option<crossbeam_channel::Sender<RecordMsg>>>>,
 ) {
     let mut backoff_ms = 100u64;
     loop {
         state.store(CONNECTING, Ordering::Relaxed);
-        match connect_and_recv(&endpoint, &router, store.as_ref(), &state) {
+        match connect_and_recv(&endpoint, &router, store.as_ref(), &state, &record_sender) {
             Ok(()) => {
                 backoff_ms = 100;
             }
@@ -34,6 +36,7 @@ fn connect_and_recv(
     router: &TopicRouter,
     store: &dyn ChannelStore,
     state: &Arc<AtomicU8>,
+    record_sender: &Arc<std::sync::Mutex<Option<crossbeam_channel::Sender<RecordMsg>>>>,
 ) -> anyhow::Result<()> {
     let ctx = zmq::Context::new();
     let socket = ctx.socket(zmq::SUB)?;
@@ -54,6 +57,15 @@ fn connect_and_recv(
                 decode_batch(&parts[1], bindings, store);
                 state.store(LIVE, Ordering::Relaxed);
                 last_live = Instant::now();
+
+                // Push to recorder queue if recording is active.
+                if let Ok(guard) = record_sender.try_lock() {
+                    if let Some(tx) = guard.as_ref() {
+                        let log_time_ns = crate::types::now_ns();
+                        let topic_arc: Arc<str> = topic.into();
+                        let _ = tx.try_send((topic_arc, parts[1].clone(), log_time_ns));
+                    }
+                }
             }
             Ok(_) => {
                 // Malformed multipart (wrong frame count); ignore.

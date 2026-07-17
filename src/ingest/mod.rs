@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU8;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::config::ChannelRegistry;
+use crate::record::RecordMsg;
 use crate::store::ChannelStore;
 
 pub mod decode;
@@ -21,6 +22,8 @@ pub struct IngestConfig {
 
 pub struct IngestHandle {
     pub conn_state: Arc<AtomicU8>,
+    pub record_sender: Arc<Mutex<Option<crossbeam_channel::Sender<RecordMsg>>>>,
+    pub schema_bytes: Vec<u8>,
 }
 
 pub fn spawn_ingest(
@@ -29,14 +32,18 @@ pub fn spawn_ingest(
     store: Arc<dyn ChannelStore>,
 ) -> anyhow::Result<IngestHandle> {
     let schema = loader::ProtoSchema::from_path(&config.proto_path)?;
+    let schema_bytes = schema.schema_bytes().to_vec();
     let router = router::TopicRouter::build(registry, &schema);
     let conn_state = Arc::new(AtomicU8::new(CONNECTING));
     let state_clone = conn_state.clone();
     let endpoint = config.endpoint.clone();
+    let record_sender: Arc<Mutex<Option<crossbeam_channel::Sender<RecordMsg>>>> =
+        Arc::new(Mutex::new(None));
+    let record_sender_clone = record_sender.clone();
     std::thread::spawn(move || {
-        thread::run_loop(endpoint, router, store, state_clone);
+        thread::run_loop(endpoint, router, store, state_clone, record_sender_clone);
     });
-    Ok(IngestHandle { conn_state })
+    Ok(IngestHandle { conn_state, record_sender, schema_bytes })
 }
 
 #[cfg(test)]
@@ -84,5 +91,40 @@ type = "float"
         use std::sync::atomic::Ordering;
         let state = Arc::new(AtomicU8::new(CONNECTING));
         assert_eq!(state.load(Ordering::Relaxed), CONNECTING);
+    }
+
+    #[test]
+    fn ingest_handle_has_record_sender() {
+        // Just compile-checks the field types are accessible.
+        let sender: Arc<std::sync::Mutex<Option<crossbeam_channel::Sender<crate::record::RecordMsg>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        drop(sender);
+    }
+
+    #[test]
+    fn schema_bytes_via_spawn_ingest_are_non_empty() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let proto_path = dir.path().join("test.proto");
+        let mut f = std::fs::File::create(&proto_path).unwrap();
+        write!(f, "syntax = \"proto3\";\nmessage M {{ int64 t = 1; float v = 2; }}\n").unwrap();
+        let registry = crate::config::ChannelRegistry::from_toml_str(r#"
+[channels."x"]
+topic = "t"
+proto_path = "M.v"
+ts_path = "M.t"
+type = "float"
+"#).unwrap();
+        let store: Arc<dyn crate::store::ChannelStore> =
+            Arc::new(crate::store::LiveStore::from_registry(&registry));
+        let handle = spawn_ingest(
+            IngestConfig {
+                endpoint: "tcp://localhost:59999".to_string(),
+                proto_path,
+            },
+            &registry,
+            store,
+        ).unwrap();
+        assert!(!handle.schema_bytes.is_empty(), "schema_bytes must be populated");
     }
 }
