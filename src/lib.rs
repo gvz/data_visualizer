@@ -1,4 +1,5 @@
 pub mod app;
+pub mod channel_tree;
 pub mod config;
 pub mod demo;
 pub mod ingest;

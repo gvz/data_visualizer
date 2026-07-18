@@ -77,6 +77,25 @@ impl ScreenState {
         Self { tree: Tree::empty(egui::Id::new(("screen", name))), panels: Vec::new() }
     }
 
+    fn remove_panel(&mut self, tile_id: TileId) {
+        let pane_idx = match self.tree.tiles.get(tile_id) {
+            Some(Tile::Pane(i)) => *i,
+            _ => return,
+        };
+        self.tree.remove_recursively(tile_id);
+        if pane_idx < self.panels.len() {
+            self.panels.remove(pane_idx);
+        }
+        // Shift down any pane indices that were above the removed one.
+        for (_, tile) in self.tree.tiles.iter_mut() {
+            if let Tile::Pane(i) = tile {
+                if *i > pane_idx {
+                    *i -= 1;
+                }
+            }
+        }
+    }
+
     fn from_screen_config(
         name: &str,
         sc: &ScreenConfig,
@@ -176,8 +195,11 @@ impl Workspace {
         let Some(st) = self.screens.get_mut(&self.active) else {
             return;
         };
-        let mut behavior = TreeBehavior { store, panels: &mut st.panels };
+        let mut behavior = TreeBehavior { store, panels: &mut st.panels, pending_remove: None };
         st.tree.ui(&mut behavior, ui);
+        if let Some(tile_id) = behavior.pending_remove {
+            st.remove_panel(tile_id);
+        }
     }
 
     pub fn add_screen(&mut self, name: &str) {
@@ -220,13 +242,14 @@ impl Workspace {
 struct TreeBehavior<'a> {
     store: &'a dyn ChannelStore,
     panels: &'a mut Vec<PanelSlot>,
+    pending_remove: Option<TileId>,
 }
 
 impl egui_tiles::Behavior<usize> for TreeBehavior<'_> {
     fn pane_ui(
         &mut self,
         ui: &mut egui::Ui,
-        _tile_id: TileId,
+        tile_id: TileId,
         pane: &mut usize,
     ) -> egui_tiles::UiResponse {
         if let Some(slot) = self.panels.get_mut(*pane) {
@@ -235,6 +258,13 @@ impl egui_tiles::Behavior<usize> for TreeBehavior<'_> {
                 .show(ui, |ui| slot.panel.config_ui(ui));
             slot.panel.render(ui, self.store);
         }
+        ui.interact(ui.max_rect(), ui.id().with("pane_ctx"), egui::Sense::hover())
+            .context_menu(|ui| {
+                if ui.button("Delete panel").clicked() {
+                    self.pending_remove = Some(tile_id);
+                    ui.close_menu();
+                }
+            });
         egui_tiles::UiResponse::None
     }
 

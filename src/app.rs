@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use eframe::egui;
 
+use crate::channel_tree::ChannelTree;
 use crate::config::{ChannelRegistry, LayoutConfig, PanelEntry};
 use crate::record::playback::PlaybackStore;
 use crate::record::{start_recording, RecordHandle};
@@ -82,6 +83,9 @@ pub struct DataVisApp {
     record_handle: Option<RecordHandle>,
     record_sender_slot: Option<Arc<Mutex<Option<crossbeam_channel::Sender<crate::record::RecordMsg>>>>>,
     ingest_schema_bytes: Vec<u8>,
+    // Channel picker sidebar
+    channel_tree: ChannelTree,
+    sidebar_visible: bool,
 }
 
 impl DataVisApp {
@@ -100,6 +104,7 @@ impl DataVisApp {
             .first()
             .map(|s| s.to_string())
             .unwrap_or_default();
+        let channel_tree = ChannelTree::build(&channels);
         Self {
             live_store: store.clone(),
             store,
@@ -115,6 +120,8 @@ impl DataVisApp {
             record_handle: None,
             record_sender_slot,
             ingest_schema_bytes,
+            channel_tree,
+            sidebar_visible: true,
         }
     }
 
@@ -268,6 +275,9 @@ impl DataVisApp {
                 if ui.button("+ panel").clicked() {
                     self.add_panel.open = true;
                 }
+                if ui.selectable_label(self.sidebar_visible, "Channels").clicked() {
+                    self.sidebar_visible = !self.sidebar_visible;
+                }
                 ui.separator();
 
                 match &self.mode {
@@ -321,6 +331,62 @@ impl DataVisApp {
                 });
             });
         });
+    }
+
+    fn channel_picker_side(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("channel_picker")
+            .min_width(160.0)
+            .default_width(200.0)
+            .show(ctx, |ui| {
+                ui.heading("Channels");
+                ui.separator();
+
+                let avail_h = ui.available_height();
+                egui::ScrollArea::vertical()
+                    .id_source("ch_tree_scroll")
+                    .max_height((avail_h - 90.0).max(60.0))
+                    .show(ui, |ui| {
+                        self.channel_tree.ui(ui, &mut self.add_panel.selected);
+                    });
+
+                ui.separator();
+
+                ui.label(match self.add_panel.panel_type.as_str() {
+                    "xy_scatter" => "select exactly 2 channels",
+                    "waveform" | "log" => "select 1 or more channels",
+                    _ => "select 1 channel",
+                });
+                egui::ComboBox::from_id_source("sidebar_panel_type")
+                    .selected_text(&self.add_panel.panel_type)
+                    .show_ui(ui, |ui| {
+                        for t in self.registry.type_names() {
+                            ui.selectable_value(
+                                &mut self.add_panel.panel_type,
+                                t.to_string(),
+                                t,
+                            );
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    let entry = build_panel_entry(
+                        &self.add_panel.panel_type,
+                        &self.add_panel.selected,
+                    );
+                    if ui.add_enabled(entry.is_some(), egui::Button::new("Add")).clicked() {
+                        if let Some(e) = entry {
+                            if let Err(err) =
+                                self.workspace.add_panel(&e, &self.registry, &self.channels)
+                            {
+                                self.status = format!("add panel failed: {err}");
+                            }
+                            self.add_panel.selected.clear();
+                        }
+                    }
+                    if !self.add_panel.selected.is_empty() && ui.button("Clear").clicked() {
+                        self.add_panel.selected.clear();
+                    }
+                });
+            });
     }
 
     fn add_panel_window(&mut self, ctx: &egui::Context) {
@@ -447,6 +513,10 @@ impl eframe::App for DataVisApp {
         }
 
         self.add_panel_window(ctx);
+
+        if self.sidebar_visible {
+            self.channel_picker_side(ctx);
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             self.workspace.ui(ui, self.store.as_ref());
