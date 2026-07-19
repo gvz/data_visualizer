@@ -1,4 +1,5 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::config::ChannelRegistry;
 use crate::store::{ChannelStore, SoaRing, TextBuf};
@@ -22,6 +23,9 @@ struct ChannelSlot {
 pub struct LiveStore {
     channels: Vec<ChannelSlot>,
     type_errors: AtomicU64,
+    /// When non-zero, `now_ns()` returns this value instead of the wall clock.
+    /// Set by the app to implement live scrubbing without entering replay mode.
+    pub view_override: Arc<AtomicI64>,
 }
 
 impl LiveStore {
@@ -43,7 +47,7 @@ impl LiveStore {
                 ChannelSlot { meta, data }
             })
             .collect();
-        Self { channels, type_errors: AtomicU64::new(0) }
+        Self { channels, type_errors: AtomicU64::new(0), view_override: Arc::new(AtomicI64::new(0)) }
     }
 
     /// Count of writes dropped because value type didn't match channel type.
@@ -61,6 +65,11 @@ impl LiveStore {
 }
 
 impl ChannelStore for LiveStore {
+    fn now_ns(&self) -> i64 {
+        let v = self.view_override.load(Ordering::Relaxed);
+        if v != 0 { v } else { crate::types::now_ns() }
+    }
+
     fn write_numeric(&self, channel: ChannelId, ts: i64, val: NumericVal) {
         match (&self.slot(channel).data, val) {
             (ChannelData::Float(r), NumericVal::Float(v)) => r.push(ts, v),

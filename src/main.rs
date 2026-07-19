@@ -23,6 +23,11 @@ fn main() -> anyhow::Result<()> {
     let layout = LayoutConfig::load(&layout_path)?;
 
     let store = Arc::new(LiveStore::from_registry(&channels));
+    let live_view_ns = store.view_override.clone();
+    let live_history_s = channels
+        .iter_ids()
+        .map(|id| channels.meta(id).history_s)
+        .fold(5.0_f64, f64::max);
 
     let (conn_state, record_sender_slot, ingest_schema_bytes) = if demo {
         datavis::demo::spawn_demo(store.clone(), &channels);
@@ -56,6 +61,8 @@ fn main() -> anyhow::Result<()> {
         conn_state,
         record_sender_slot,
         ingest_schema_bytes,
+        live_view_ns,
+        live_history_s,
     );
 
     eframe::run_native(

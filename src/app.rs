@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -86,6 +86,10 @@ pub struct DataVisApp {
     // Channel picker sidebar
     channel_tree: ChannelTree,
     sidebar_visible: bool,
+    // Live scrub
+    live_view_ns: Arc<AtomicI64>,
+    live_view_offset_ns: i64,
+    live_history_s: f64,
 }
 
 impl DataVisApp {
@@ -98,6 +102,8 @@ impl DataVisApp {
         conn_state: Option<Arc<std::sync::atomic::AtomicU8>>,
         record_sender_slot: Option<Arc<Mutex<Option<crossbeam_channel::Sender<crate::record::RecordMsg>>>>>,
         ingest_schema_bytes: Vec<u8>,
+        live_view_ns: Arc<AtomicI64>,
+        live_history_s: f64,
     ) -> Self {
         let panel_type = registry
             .type_names()
@@ -122,6 +128,9 @@ impl DataVisApp {
             ingest_schema_bytes,
             channel_tree,
             sidebar_visible: true,
+            live_view_ns,
+            live_view_offset_ns: 0,
+            live_history_s,
         }
     }
 
@@ -224,6 +233,7 @@ impl DataVisApp {
     fn close_replay(&mut self) {
         self.store = self.live_store.clone();
         self.mode = AppMode::Live;
+        self.live_view_offset_ns = 0;
         self.status = "Replay closed".to_string();
     }
 
@@ -322,7 +332,6 @@ impl DataVisApp {
                     AppMode::Replay(_) => {
                         ui.colored_label(egui::Color32::LIGHT_BLUE, "REPLAY");
                         ui.separator();
-                        // Replay controls are rendered inline in update() after this call.
                     }
                 }
 
@@ -465,42 +474,94 @@ impl eframe::App for DataVisApp {
             rs.last_frame = Instant::now();
         }
 
+        // Keep the live store's view_override in sync with the scrub offset.
+        // 0 means "use wall clock"; non-zero freezes the view at that ns value.
+        if matches!(self.mode, AppMode::Live) {
+            let v = if self.live_view_offset_ns != 0 {
+                crate::types::now_ns() + self.live_view_offset_ns
+            } else {
+                0
+            };
+            self.live_view_ns.store(v, Ordering::Relaxed);
+        }
+
         self.menu_bar(ctx);
         self.toolbar(ctx);
 
-        // Replay controls panel — rendered inline to avoid borrow conflict with close_replay().
-        // The close button sets a local flag; close_replay() is called after the borrow ends.
+        // Live timeline — always visible in live mode so the user can scrub history.
+        if let AppMode::Live = self.mode {
+            egui::TopBottomPanel::bottom("live_timeline").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let right_reserved = 70.0;
+                    let slider_w = (ui.available_width() - right_reserved).max(60.0);
+                    let mut offset_secs = self.live_view_offset_ns as f64 / 1e9;
+                    if ui
+                        .add_sized(
+                            [slider_w, ui.spacing().interact_size.y],
+                            egui::Slider::new(&mut offset_secs, -self.live_history_s..=0.0)
+                                .show_value(false),
+                        )
+                        .changed()
+                    {
+                        // Snap to live within 100 ms of the right edge.
+                        self.live_view_offset_ns = if offset_secs > -0.1 {
+                            0
+                        } else {
+                            (offset_secs * 1e9) as i64
+                        };
+                    }
+                    if self.live_view_offset_ns == 0 {
+                        ui.colored_label(egui::Color32::LIGHT_GREEN, "LIVE");
+                    } else {
+                        ui.label(format!("{:.1}s", self.live_view_offset_ns as f64 / 1e9));
+                    }
+                });
+            });
+        }
+
+        // Timeline bottom panel — close_replay flag defers the borrow-conflicting call.
         let mut close_replay = false;
         if let AppMode::Replay(ref mut rs) = self.mode {
-            egui::TopBottomPanel::top("replay_controls").show(ctx, |ui| {
+            egui::TopBottomPanel::bottom("timeline").show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     let play_label = if rs.playing { "Pause" } else { "Play" };
                     if ui.button(play_label).clicked() {
                         rs.playing = !rs.playing;
                     }
 
-                    let pos = rs.store.position_ns.load(Ordering::Relaxed);
-                    let start = rs.store.start_ns;
-                    let dur = rs.store.duration_ns.max(1);
-                    let mut offset = (pos - start) as f64;
-                    if ui
-                        .add(
-                            egui::Slider::new(&mut offset, 0.0..=(dur as f64))
-                                .text("pos")
-                                .custom_formatter(|v, _| format!("{:.1}s", v / 1e9)),
-                        )
-                        .changed()
-                    {
-                        rs.store.position_ns.store(start + offset as i64, Ordering::Relaxed);
-                    }
-
-                    egui::ComboBox::from_label("speed")
+                    egui::ComboBox::from_id_source("timeline_speed")
                         .selected_text(format!("{}x", rs.speed))
                         .show_ui(ui, |ui| {
                             for &s in &[0.25f32, 0.5, 1.0, 2.0, 4.0] {
                                 ui.selectable_value(&mut rs.speed, s, format!("{s}x"));
                             }
                         });
+
+                    ui.separator();
+
+                    let pos = rs.store.position_ns.load(Ordering::Relaxed);
+                    let start = rs.store.start_ns;
+                    let dur = rs.store.duration_ns.max(1);
+                    let mut offset = (pos - start) as f64;
+
+                    // Reserve space for the right-side label and close button, give the
+                    // rest to the slider so it stretches across the full window width.
+                    let right_reserved = 140.0;
+                    let slider_w = (ui.available_width() - right_reserved).max(60.0);
+                    if ui
+                        .add_sized(
+                            [slider_w, ui.spacing().interact_size.y],
+                            egui::Slider::new(&mut offset, 0.0..=(dur as f64))
+                                .show_value(false),
+                        )
+                        .changed()
+                    {
+                        rs.store.position_ns.store(start + offset as i64, Ordering::Relaxed);
+                    }
+
+                    let t_secs = (pos - start) as f64 / 1e9;
+                    let dur_secs = dur as f64 / 1e9;
+                    ui.label(format!("{:.1}s / {:.1}s", t_secs, dur_secs));
 
                     if ui.button("Close").clicked() {
                         close_replay = true;
