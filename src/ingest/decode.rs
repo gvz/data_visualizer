@@ -2,7 +2,7 @@ use prost_reflect::{DynamicMessage, ReflectMessage, Value};
 
 use crate::ingest::router::ChannelBinding;
 use crate::store::ChannelStore;
-use crate::types::{NumericVal, SampleType};
+use crate::types::{now_ns, NumericVal, SampleType};
 
 pub fn decode_batch(data: &[u8], bindings: &[ChannelBinding], store: &dyn ChannelStore) -> usize {
     if bindings.is_empty() {
@@ -53,9 +53,7 @@ fn decode_batch_channel(msg: &DynamicMessage, binding: &ChannelBinding, store: &
         let Value::Message(sample_msg) = sample_val else {
             continue;
         };
-        let Some(ts) = get_named_field(sample_msg, ts_leaf).and_then(|v| extract_ts(&v)) else {
-            continue;
-        };
+        let ts = resolve_ts(get_named_field(sample_msg, ts_leaf).and_then(|v| extract_ts(&v)));
         let Some(val_v) = get_named_field(sample_msg, val_leaf) else {
             continue;
         };
@@ -70,9 +68,7 @@ fn decode_single_channel(msg: &DynamicMessage, binding: &ChannelBinding, store: 
     let val_leaf = &binding.val_path[0];
     let ts_leaf = &binding.ts_path[0];
 
-    let Some(ts) = get_named_field(msg, ts_leaf).and_then(|v| extract_ts(&v)) else {
-        return 0;
-    };
+    let ts = resolve_ts(get_named_field(msg, ts_leaf).and_then(|v| extract_ts(&v)));
     let Some(val_v) = get_named_field(msg, val_leaf) else {
         return 0;
     };
@@ -103,6 +99,13 @@ fn write_value(binding: &ChannelBinding, ts: i64, val: &Value, store: &dyn Chann
             }
         }
     }
+}
+
+/// A sample's timestamp, falling back to UTC-now when the message carries none.
+/// Proto3 reports an unset scalar as `0`, so a non-positive value is treated as
+/// "no timestamp" and stamped with the current time rather than 1970.
+fn resolve_ts(ts: Option<i64>) -> i64 {
+    ts.filter(|&t| t > 0).unwrap_or_else(now_ns)
 }
 
 fn extract_ts(val: &Value) -> Option<i64> {
@@ -247,6 +250,34 @@ eu_offset = 1.0
         let bindings = router.bindings_for("accel");
         // Malformed proto bytes — must not panic, must return 0.
         assert_eq!(decode_batch(b"not valid protobuf at all!!!", bindings, &store), 0);
+    }
+
+    #[test]
+    fn missing_timestamp_falls_back_to_now() {
+        let (schema, _dir, registry) = make_schema_and_registry();
+        let store = LiveStore::from_registry(&registry);
+        let router = TopicRouter::build(&registry, &schema);
+        let bindings = router.bindings_for("accel");
+        let before = now_ns();
+        // t_ns = 0 (proto3 default for an unset field) → "no timestamp".
+        let data = encode_accel_batch(&schema, &[(0, 2.0)]);
+
+        let count = decode_batch(&data, bindings, &store);
+        assert_eq!(count, 1);
+
+        let after = now_ns();
+        let ch = registry.id("accel.x").unwrap();
+        match store.snapshot(ch, ALL) {
+            ChannelSnapshot::Float { ts, .. } => {
+                assert_eq!(ts.len(), 1);
+                assert!(
+                    ts[0] >= before && ts[0] <= after,
+                    "sample stamped with now: {} not in [{before}, {after}]",
+                    ts[0]
+                );
+            }
+            other => panic!("wrong snapshot variant: {other:?}"),
+        }
     }
 
     #[test]

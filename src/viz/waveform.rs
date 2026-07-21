@@ -5,9 +5,9 @@ use crate::config::ChannelRegistry;
 use crate::store::ChannelStore;
 use crate::types::{SampleType, TimeWindow};
 use crate::viz::common::{
-    bind, binding_color, binding_error, effective_window_s, label_config_row, opt_bool,
-    opt_f64_opt, opt_label, opt_str_array, refresh_binding, serialize_label, snapshot_to_f64,
-    window_config_row, Binding, RebindCtx,
+    bind, binding_color, binding_error, effective_window_s, format_time_of_day, label_config_row,
+    opt_bool, opt_f64_opt, opt_label, opt_str_array, refresh_binding, serialize_label,
+    snapshot_to_f64, window_config_row, Binding, RebindCtx,
 };
 use crate::viz::decimate::decimate_minmax;
 use crate::viz::measure::{stats, Stats};
@@ -34,6 +34,11 @@ pub struct WaveformPanel {
     /// Cursor positions in absolute ns so they stay put while the plot scrolls.
     cursor_a_ns: Option<i64>,
     cursor_b_ns: Option<i64>,
+    /// Fixed x-origin (absolute ns, whole second) picked once. Plotting relative
+    /// to this constant — rather than the per-frame window start — keeps grid
+    /// lines anchored to absolute time (they scroll with the data) while still
+    /// fitting the samples' small offsets in f64 without precision loss.
+    epoch_ns: Option<i64>,
 }
 
 pub fn ctor(
@@ -51,6 +56,7 @@ pub fn ctor(
         dots: opt_bool(cfg, "dots", false),
         cursor_a_ns: None,
         cursor_b_ns: None,
+        epoch_ns: None,
     }))
 }
 
@@ -134,6 +140,14 @@ impl VizPanel for WaveformPanel {
         let t0 = end_ns - span_ns;
         let window = TimeWindow { start_ns: t0, end_ns: end_ns + 1 };
 
+        // Fixed plot origin (whole second) chosen on first render. All x values
+        // are (ns - anchor)/1e9, so grid lines sit at absolute times and scroll
+        // with the data instead of staying pinned to the screen.
+        let anchor = *self
+            .epoch_ns
+            .get_or_insert(end_ns - end_ns.rem_euclid(1_000_000_000));
+        let x_of = move |ns: i64| (ns - anchor) as f64 / 1e9;
+
         // Snapshots kept for the stats table below the plot.
         let mut snaps: Vec<(usize, Vec<i64>, Vec<f64>)> = Vec::new();
         for (i, b) in self.bound.iter().enumerate() {
@@ -150,12 +164,25 @@ impl VizPanel for WaveformPanel {
         let footer_h = if self.cursors { 120.0 } else { 24.0 };
         let plot = Plot::new(("waveform", &self.title))
             .legend(Legend::default())
-            .include_x(0.0)
-            .include_x(win_s)
+            .include_x(x_of(t0))
+            .include_x(x_of(end_ns))
+            // X is plotted relative to the fixed anchor; label the ticks with the
+            // absolute UTC time of day so grid lines read as wall-clock time.
+            .x_axis_formatter(move |mark, _| {
+                format_time_of_day(anchor + (mark.value * 1e9) as i64)
+            })
+            .label_formatter(move |name, p| {
+                let t = format_time_of_day(anchor + (p.x * 1e9) as i64);
+                if name.is_empty() {
+                    format!("{t}\n{:.4}", p.y)
+                } else {
+                    format!("{name}\n{t}\n{:.4}", p.y)
+                }
+            })
             .height((ui.available_height() - footer_h).max(80.0));
         let inner = plot.show(ui, |plot_ui| {
             for (i, ts, vals) in &snaps {
-                let points = decimate_minmax(ts, vals, t0, MAX_PLOT_BUCKETS);
+                let points = decimate_minmax(ts, vals, anchor, MAX_PLOT_BUCKETS);
                 let b = &self.bound[*i];
                 let color = binding_color(b, *i);
                 plot_ui.line(Line::new(PlotPoints::from(points)).color(color).name(&b.name));
@@ -164,7 +191,7 @@ impl VizPanel for WaveformPanel {
                     let pts: Vec<[f64; 2]> = ts
                         .iter()
                         .zip(vals)
-                        .map(|(&t, &v)| [(t - t0) as f64 / 1e9, v])
+                        .map(|(&t, &v)| [x_of(t), v])
                         .collect();
                     plot_ui.points(
                         Points::new(pts).color(color).shape(MarkerShape::Circle).radius(3.0_f32),
@@ -177,13 +204,13 @@ impl VizPanel for WaveformPanel {
                     (self.cursor_b_ns, Color32::LIGHT_BLUE),
                 ] {
                     let Some(c) = cur else { continue };
-                    plot_ui.vline(VLine::new((c - t0) as f64 / 1e9).color(color));
+                    plot_ui.vline(VLine::new(x_of(c)).color(color));
                     // Dot on each curve at its sample nearest the cursor, so the
                     // snap to real samples is visible instead of a bare line.
                     for (_, ts, vals) in &snaps {
                         if let Some((t, v)) = nearest_point(ts, vals, c) {
                             plot_ui.points(
-                                Points::new(vec![[(t - t0) as f64 / 1e9, v]])
+                                Points::new(vec![[x_of(t), v]])
                                     .color(color)
                                     .shape(MarkerShape::Circle)
                                     .radius(4.0_f32),
@@ -196,7 +223,7 @@ impl VizPanel for WaveformPanel {
         });
         if self.cursors && inner.response.clicked() {
             if let Some(p) = inner.inner {
-                let raw_ts = t0 + (p.x * 1e9) as i64;
+                let raw_ts = anchor + (p.x * 1e9) as i64;
                 let ts = nearest_sample_ts(&snaps, raw_ts).unwrap_or(raw_ts);
                 let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
                 if ctrl {
@@ -211,7 +238,7 @@ impl VizPanel for WaveformPanel {
         // and, per channel, the value at that sample.
         for (cur, name) in [(self.cursor_a_ns, "A"), (self.cursor_b_ns, "B")] {
             let Some(c) = cur else { continue };
-            let mut line = format!("cursor {name}: t = {:.4} s", (c - t0) as f64 / 1e9);
+            let mut line = format!("cursor {name}: t = {} UTC", format_time_of_day(c));
             for (i, ts, vals) in &snaps {
                 if let Some((_, v)) = nearest_point(ts, vals, c) {
                     line.push_str(&format!("  {} = {:.4}", self.bound[*i].name, v));
