@@ -6,7 +6,10 @@ use rustfft::FftPlanner;
 use crate::config::ChannelRegistry;
 use crate::store::ChannelStore;
 use crate::types::{SampleType, TimeWindow};
-use crate::viz::common::{bind, binding_error, opt_i64, req_str, snapshot_to_f64, Binding};
+use crate::viz::common::{
+    bind, binding_error, label_config_row, opt_i64, opt_label, opt_str, refresh_binding,
+    serialize_label, snapshot_to_f64, Binding, RebindCtx,
+};
 use crate::viz::VizPanel;
 
 pub const TYPE_NAME: &str = "spectrum";
@@ -16,6 +19,7 @@ const ACCEPTED: &[SampleType] = &[SampleType::Float, SampleType::Int];
 /// FFT of the newest `fft_size` samples, drawn as magnitude in dB over Hz.
 pub struct SpectrumPanel {
     bound: Binding,
+    label: Option<String>,
     fft_size: usize,
     hann_window: bool,
 }
@@ -24,7 +28,7 @@ pub fn ctor(
     cfg: &toml::Table,
     reg: &ChannelRegistry,
 ) -> anyhow::Result<Box<dyn VizPanel>> {
-    let name = req_str(cfg, "channel", TYPE_NAME)?;
+    let name = opt_str(cfg, "channel");
     let fft_size = (opt_i64(cfg, "fft_size", 1024).max(1) as usize)
         .next_power_of_two()
         .clamp(64, 65_536);
@@ -35,6 +39,7 @@ pub fn ctor(
     };
     Ok(Box::new(SpectrumPanel {
         bound: bind(&name, reg, ACCEPTED),
+        label: opt_label(cfg),
         fft_size,
         hann_window,
     }))
@@ -90,7 +95,7 @@ pub(crate) fn estimate_rate(ts: &[i64]) -> Option<(f64, bool)> {
 
 impl VizPanel for SpectrumPanel {
     fn title(&self) -> &str {
-        &self.bound.name
+        self.label.as_deref().unwrap_or(&self.bound.name)
     }
 
     fn accepted_types(&self) -> &[SampleType] {
@@ -98,6 +103,7 @@ impl VizPanel for SpectrumPanel {
     }
 
     fn config_ui(&mut self, ui: &mut egui::Ui) {
+        label_config_row(ui, &mut self.label, &self.bound.name);
         ui.horizontal(|ui| {
             ui.label("fft size:");
             for size in [256usize, 1024, 4096, 16_384] {
@@ -108,6 +114,10 @@ impl VizPanel for SpectrumPanel {
     }
 
     fn render(&mut self, ui: &mut egui::Ui, store: &dyn ChannelStore) {
+        if self.bound.name.is_empty() {
+            ui.label(egui::RichText::new("Drop a channel here").weak());
+            return;
+        }
         if binding_error(ui, &self.bound, TYPE_NAME) {
             return;
         }
@@ -146,7 +156,10 @@ impl VizPanel for SpectrumPanel {
             .x_axis_label("Hz")
             .y_axis_label("dB")
             .show(ui, |plot_ui| {
-                plot_ui.line(Line::new(PlotPoints::from(bins)).color(self.bound.color));
+                plot_ui.line(
+                    Line::new(PlotPoints::from(bins))
+                        .color(crate::viz::common::binding_color(&self.bound, 0)),
+                );
             });
     }
 
@@ -158,7 +171,16 @@ impl VizPanel for SpectrumPanel {
             "window".to_string(),
             toml::Value::String(if self.hann_window { "hann" } else { "none" }.to_string()),
         );
+        serialize_label(&mut t, &self.label);
         t
+    }
+
+    fn drop_channel(&mut self, name: &str, reg: &crate::config::ChannelRegistry) {
+        self.bound = bind(name, reg, ACCEPTED);
+    }
+
+    fn refresh_bindings(&mut self, ctx: &RebindCtx) {
+        refresh_binding(&mut self.bound, ACCEPTED, ctx);
     }
 }
 

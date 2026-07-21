@@ -4,7 +4,10 @@ use egui_plot::{Plot, PlotPoints, Points};
 use crate::config::ChannelRegistry;
 use crate::store::ChannelStore;
 use crate::types::{SampleType, TimeWindow};
-use crate::viz::common::{bind, binding_error, opt_f64, req_str, snapshot_to_f64, Binding};
+use crate::viz::common::{
+    bind, binding_error, effective_window_s, label_config_row, opt_f64_opt, opt_label, opt_str,
+    refresh_binding, serialize_label, snapshot_to_f64, window_config_row, Binding, RebindCtx,
+};
 use crate::viz::VizPanel;
 
 pub const TYPE_NAME: &str = "xy_scatter";
@@ -15,22 +18,25 @@ const ACCEPTED: &[SampleType] = &[SampleType::Float, SampleType::Int];
 /// newest sample backwards (uniform-rate assumption; no interpolation in v1).
 pub struct XyScatterPanel {
     title: String,
+    label: Option<String>,
     x: Binding,
     y: Binding,
-    time_window_s: f64,
+    /// Visible span in seconds; `None` follows the global default.
+    time_window_s: Option<f64>,
 }
 
 pub fn ctor(
     cfg: &toml::Table,
     reg: &ChannelRegistry,
 ) -> anyhow::Result<Box<dyn VizPanel>> {
-    let xn = req_str(cfg, "x_channel", TYPE_NAME)?;
-    let yn = req_str(cfg, "y_channel", TYPE_NAME)?;
+    let xn = opt_str(cfg, "x_channel");
+    let yn = opt_str(cfg, "y_channel");
     Ok(Box::new(XyScatterPanel {
-        title: format!("{xn} / {yn}"),
+        title: if xn.is_empty() && yn.is_empty() { String::new() } else { format!("{xn} / {yn}") },
+        label: opt_label(cfg),
         x: bind(&xn, reg, ACCEPTED),
         y: bind(&yn, reg, ACCEPTED),
-        time_window_s: opt_f64(cfg, "time_window_s", 1.0),
+        time_window_s: opt_f64_opt(cfg, "time_window_s"),
     }))
 }
 
@@ -46,7 +52,7 @@ pub(crate) fn index_align(x: &[f64], y: &[f64]) -> Vec<[f64; 2]> {
 
 impl VizPanel for XyScatterPanel {
     fn title(&self) -> &str {
-        &self.title
+        self.label.as_deref().unwrap_or(&self.title)
     }
 
     fn accepted_types(&self) -> &[SampleType] {
@@ -54,13 +60,17 @@ impl VizPanel for XyScatterPanel {
     }
 
     fn config_ui(&mut self, ui: &mut egui::Ui) {
+        label_config_row(ui, &mut self.label, &self.title);
         ui.horizontal(|ui| {
-            ui.label("window [s]:");
-            ui.add(egui::Slider::new(&mut self.time_window_s, 0.05..=10.0).logarithmic(true));
+            window_config_row(ui, &mut self.time_window_s, 0.05..=10.0);
         });
     }
 
     fn render(&mut self, ui: &mut egui::Ui, store: &dyn ChannelStore) {
+        if self.x.name.is_empty() || self.y.name.is_empty() {
+            ui.label(egui::RichText::new("Drop two channels here (x then y)").weak());
+            return;
+        }
         let xe = binding_error(ui, &self.x, TYPE_NAME);
         let ye = binding_error(ui, &self.y, TYPE_NAME);
         if xe || ye {
@@ -74,7 +84,7 @@ impl VizPanel for XyScatterPanel {
                 return;
             }
         };
-        let span = (self.time_window_s * 1e9) as i64;
+        let span = (effective_window_s(ui.ctx(), self.time_window_s) * 1e9) as i64;
         let window = TimeWindow { start_ns: end_ns - span, end_ns: end_ns + 1 };
         let xs = store.snapshot(xid, window);
         let ys = store.snapshot(yid, window);
@@ -88,7 +98,7 @@ impl VizPanel for XyScatterPanel {
                 plot_ui.points(
                     Points::new(PlotPoints::from(pts))
                         .radius(1.5_f32)
-                        .color(self.y.color),
+                        .color(crate::viz::common::binding_color(&self.y, 0)),
                 );
             });
     }
@@ -97,8 +107,23 @@ impl VizPanel for XyScatterPanel {
         let mut t = toml::Table::new();
         t.insert("x_channel".to_string(), toml::Value::String(self.x.name.clone()));
         t.insert("y_channel".to_string(), toml::Value::String(self.y.name.clone()));
-        t.insert("time_window_s".to_string(), toml::Value::Float(self.time_window_s));
+        if let Some(w) = self.time_window_s {
+            t.insert("time_window_s".to_string(), toml::Value::Float(w));
+        }
+        serialize_label(&mut t, &self.label);
         t
+    }
+
+    fn drop_channel(&mut self, name: &str, reg: &crate::config::ChannelRegistry) {
+        // Shift: new → x, old x → y; title follows.
+        let new_x = bind(name, reg, ACCEPTED);
+        self.y = std::mem::replace(&mut self.x, new_x);
+        self.title = format!("{} / {}", self.x.name, self.y.name);
+    }
+
+    fn refresh_bindings(&mut self, ctx: &RebindCtx) {
+        refresh_binding(&mut self.x, ACCEPTED, ctx);
+        refresh_binding(&mut self.y, ACCEPTED, ctx);
     }
 }
 
@@ -156,15 +181,12 @@ time_window_s = 2.0"#,
     }
 
     #[test]
-    fn missing_channel_key_is_err() {
+    fn missing_channel_key_builds_empty_panel() {
         let channels = registry();
         let reg = PanelRegistry::with_builtins();
-        let e: PanelEntry = toml::from_str(
-            r#"type = "xy_scatter"
-x_channel = "demo.sine""#,
-        )
-        .unwrap();
-        assert!(reg.build(&e, &channels).is_err());
+        let e: PanelEntry = toml::from_str(r#"type = "xy_scatter""#).unwrap();
+        let p = reg.build(&e, &channels).unwrap();
+        assert_eq!(p.title(), "");
     }
 
     #[test]

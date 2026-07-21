@@ -1,7 +1,11 @@
+use std::collections::BTreeMap;
+
 use anyhow::anyhow;
 use eframe::egui::{self, Color32};
 
 use crate::config::ChannelRegistry;
+use crate::dynamic_channel::{resolve_or_register_drop, MqttTopicMap};
+use crate::store::ChannelStore;
 use crate::types::{ChannelId, ChannelSnapshot, Sample, SampleType};
 
 /// A panel's link to one channel: resolved id + validity + display metadata.
@@ -11,6 +15,42 @@ pub struct Binding {
     pub type_ok: bool,
     pub unit: String,
     pub color: Color32,
+    /// True when the channel has no explicit color configured — the panel
+    /// should assign one from the palette (see `palette_color`).
+    pub auto_color: bool,
+}
+
+/// Qualitative palette (Tableau 10) for auto-coloring plotted series. Distinct,
+/// colorblind-friendlier than a single default gray.
+pub const PALETTE: &[Color32] = &[
+    Color32::from_rgb(0x1f, 0x77, 0xb4), // blue
+    Color32::from_rgb(0xff, 0x7f, 0x0e), // orange
+    Color32::from_rgb(0x2c, 0xa0, 0x2c), // green
+    Color32::from_rgb(0xd6, 0x27, 0x28), // red
+    Color32::from_rgb(0x94, 0x67, 0xbd), // purple
+    Color32::from_rgb(0x8c, 0x56, 0x4b), // brown
+    Color32::from_rgb(0xe3, 0x77, 0xc2), // pink
+    Color32::from_rgb(0xbc, 0xbd, 0x22), // olive
+    Color32::from_rgb(0x17, 0xbe, 0xcf), // cyan
+    Color32::from_rgb(0x7f, 0x7f, 0x7f), // gray
+];
+
+/// Palette color for the i-th series (wraps around).
+pub fn palette_color(i: usize) -> Color32 {
+    PALETTE[i % PALETTE.len()]
+}
+
+/// The channel-config default color; channels using it get palette colors.
+const DEFAULT_CHANNEL_COLOR: &str = "#cccccc";
+
+/// Resolve a binding's line color: its explicit config color, or a palette
+/// color keyed by `series` when the channel left the color at the default.
+pub fn binding_color(b: &Binding, series: usize) -> Color32 {
+    if b.auto_color {
+        palette_color(series)
+    } else {
+        b.color
+    }
 }
 
 /// Resolve a channel name. Unknown names and wrong types still produce a
@@ -25,6 +65,7 @@ pub fn bind(name: &str, reg: &ChannelRegistry, accepted: &[SampleType]) -> Bindi
                 type_ok: accepted.contains(&m.sample_type),
                 unit: m.unit.clone(),
                 color: parse_hex_color(&m.color),
+                auto_color: m.color.trim().eq_ignore_ascii_case(DEFAULT_CHANNEL_COLOR),
             }
         }
         None => Binding {
@@ -33,7 +74,30 @@ pub fn bind(name: &str, reg: &ChannelRegistry, accepted: &[SampleType]) -> Bindi
             type_ok: true,
             unit: String::new(),
             color: Color32::GRAY,
+            auto_color: true,
         },
+    }
+}
+
+/// Context for re-resolving a panel's unknown channels against newly-discovered
+/// MQTT topics — mirrors the drop path, but keyed by the binding's own name.
+pub struct RebindCtx<'a> {
+    pub channels: &'a ChannelRegistry,
+    pub store: &'a dyn ChannelStore,
+    /// Shared routing table + discovered-topic snapshot; `None` outside Live.
+    pub mqtt: Option<(&'a MqttTopicMap, &'a BTreeMap<String, String>)>,
+}
+
+/// Re-attempt to resolve one binding whose channel is currently unknown. If the
+/// binding's name is now a registered channel — or a discovered MQTT topic that
+/// can be registered on the fly — the binding is rebound in place. No-op for
+/// empty or already-resolved bindings.
+pub fn refresh_binding(b: &mut Binding, accepted: &[SampleType], ctx: &RebindCtx) {
+    if b.id.is_some() || b.name.is_empty() {
+        return;
+    }
+    if let Some(name) = resolve_or_register_drop(&b.name, ctx.channels, ctx.store, ctx.mqtt) {
+        *b = bind(&name, ctx.channels, accepted);
     }
 }
 
@@ -132,6 +196,64 @@ pub fn opt_f64(cfg: &toml::Table, key: &str, default: f64) -> f64 {
     }
 }
 
+/// Like `opt_f64` but returns `None` when the key is absent — used for panel
+/// settings that fall back to a global default rather than a fixed literal.
+pub fn opt_f64_opt(cfg: &toml::Table, key: &str) -> Option<f64> {
+    match cfg.get(key) {
+        Some(toml::Value::Float(f)) => Some(*f),
+        Some(toml::Value::Integer(i)) => Some(*i as f64),
+        _ => None,
+    }
+}
+
+// ---- global visible-time-window default ----
+
+/// Fallback visible span (seconds) when neither the panel nor the app set one.
+pub const DEFAULT_WINDOW_S: f64 = 10.0;
+
+fn global_window_id() -> egui::Id {
+    egui::Id::new("datavis_global_window_s")
+}
+
+/// The app-wide default visible time span in seconds. The app publishes this
+/// into egui's ctx data each frame; panels read it here (no signature change).
+pub fn global_window_s(ctx: &egui::Context) -> f64 {
+    ctx.data(|d| d.get_temp::<f64>(global_window_id()))
+        .unwrap_or(DEFAULT_WINDOW_S)
+}
+
+/// Publish the app-wide default visible time span so panels can read it.
+pub fn set_global_window_s(ctx: &egui::Context, secs: f64) {
+    ctx.data_mut(|d| d.insert_temp(global_window_id(), secs));
+}
+
+/// Effective window for a panel: its explicit override, else the global default.
+pub fn effective_window_s(ctx: &egui::Context, override_s: Option<f64>) -> f64 {
+    override_s.unwrap_or_else(|| global_window_s(ctx))
+}
+
+/// Config-UI row for a panel's time window: a checkbox toggling between the
+/// global default and a per-panel override slider (`range` in seconds).
+pub fn window_config_row(
+    ui: &mut egui::Ui,
+    window: &mut Option<f64>,
+    range: std::ops::RangeInclusive<f64>,
+) {
+    let g = global_window_s(ui.ctx());
+    let mut override_on = window.is_some();
+    if ui.checkbox(&mut override_on, "override window").changed() {
+        *window = override_on.then_some(g);
+    }
+    match window {
+        Some(w) => {
+            ui.add(egui::Slider::new(w, range).logarithmic(true).suffix(" s"));
+        }
+        None => {
+            ui.label(format!("global: {g:.1} s"));
+        }
+    }
+}
+
 pub fn opt_i64(cfg: &toml::Table, key: &str, default: i64) -> i64 {
     match cfg.get(key) {
         Some(toml::Value::Integer(i)) => *i,
@@ -144,6 +266,55 @@ pub fn opt_bool(cfg: &toml::Table, key: &str, default: bool) -> bool {
         Some(toml::Value::Boolean(b)) => *b,
         _ => default,
     }
+}
+
+pub fn opt_str(cfg: &toml::Table, key: &str) -> String {
+    cfg.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
+}
+
+// ---- customizable panel label ----
+
+/// Optional custom panel label from config. Empty string counts as unset so
+/// the panel falls back to its default (the first channel dropped in).
+pub fn opt_label(cfg: &toml::Table) -> Option<String> {
+    cfg.get("label")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Config-UI row for a panel's custom label. The field is pre-filled with the
+/// current label, or the `default` when none is set, so the default text is
+/// there to edit. Clearing it (or typing the default back) reverts to default.
+pub fn label_config_row(ui: &mut egui::Ui, label: &mut Option<String>, default: &str) {
+    ui.horizontal(|ui| {
+        ui.label("label:");
+        let mut text = label.clone().unwrap_or_else(|| default.to_string());
+        if ui
+            .add(egui::TextEdit::singleline(&mut text).hint_text("panel label"))
+            .changed()
+        {
+            *label = if text.trim().is_empty() || text == default {
+                None
+            } else {
+                Some(text)
+            };
+        }
+    });
+}
+
+/// Write the `label` key when a custom label is set (omitted when default).
+pub fn serialize_label(t: &mut toml::Table, label: &Option<String>) {
+    if let Some(l) = label {
+        t.insert("label".to_string(), toml::Value::String(l.clone()));
+    }
+}
+
+pub fn opt_str_array(cfg: &toml::Table, key: &str) -> Vec<String> {
+    cfg.get(key)
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -228,5 +399,39 @@ b = true"#).unwrap();
         assert_eq!(opt_f64(&cfg, "missing", 7.5), 7.5);
         assert_eq!(opt_i64(&cfg, "f", 0), 2);
         assert!(opt_bool(&cfg, "b", false));
+    }
+
+    #[test]
+    fn refresh_binding_resolves_discovered_mqtt_topic() {
+        use crate::store::LiveStore;
+        use std::collections::HashMap;
+        use std::sync::RwLock;
+
+        let reg = registry();
+        let store = LiveStore::from_registry(&reg);
+        // A binding to an unconfigured MQTT topic is unresolved at first.
+        let mut b = bind("home/sensors/temp", &reg, &[SampleType::Float]);
+        assert!(b.id.is_none());
+
+        // No discovered snapshot yet → refresh is a no-op.
+        refresh_binding(
+            &mut b,
+            &[SampleType::Float],
+            &RebindCtx { channels: &reg, store: &store, mqtt: None },
+        );
+        assert!(b.id.is_none());
+
+        // Topic now discovered → registered on the fly and the binding resolves.
+        let topic_map: MqttTopicMap = RwLock::new(HashMap::new());
+        let mut snap = BTreeMap::new();
+        snap.insert("home/sensors/temp".to_string(), "21.5".to_string());
+        refresh_binding(
+            &mut b,
+            &[SampleType::Float],
+            &RebindCtx { channels: &reg, store: &store, mqtt: Some((&topic_map, &snap)) },
+        );
+        assert!(b.id.is_some());
+        assert!(b.type_ok);
+        assert_eq!(reg.meta(b.id.unwrap()).sample_type, SampleType::Float);
     }
 }

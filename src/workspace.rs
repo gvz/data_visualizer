@@ -2,12 +2,17 @@ use std::collections::BTreeMap;
 
 use anyhow::anyhow;
 use eframe::egui;
-use egui_tiles::{Tile, TileId, Tree};
+use egui_tiles::{Container, LinearDir, Tile, TileId, Tree};
 
 use crate::config::{ChannelRegistry, LayoutConfig, PanelEntry, ScreenConfig};
+use crate::dynamic_channel::{resolve_or_register_drop, MqttTopicMap};
 use crate::store::ChannelStore;
 use crate::types::SampleType;
 use crate::viz::{PanelRegistry, VizPanel};
+
+/// Drop-time context for registering discovered MQTT topics on the fly:
+/// the shared routing table and the current discovered-topic snapshot.
+pub type MqttDropCtx<'a> = (&'a MqttTopicMap, &'a BTreeMap<String, String>);
 
 /// A panel plus the layout.toml type string needed to re-serialize it.
 pub struct PanelSlot {
@@ -56,6 +61,24 @@ fn default_tree(name: &str, n: usize) -> Tree<usize> {
     Tree::new_grid(egui::Id::new(("screen", name)), (0..n).collect())
 }
 
+/// Deserialize a persisted tile tree, tolerating egui_tiles' non-round-trippable
+/// `width`/`height`. Those are `f32` defaulting to `INFINITY` ("fill available
+/// space"); serde_json writes infinity as `null`, which then fails to parse back
+/// into `f32` — so a naive `from_str` rejects every tree we ever saved and the
+/// whole layout (panel sizes and splits) is silently lost. Restore the null
+/// fields to a value above `f32::MAX` so the cast yields infinity again.
+fn parse_tree(json: &str) -> Option<Tree<usize>> {
+    let mut v: serde_json::Value = serde_json::from_str(json).ok()?;
+    if let Some(obj) = v.as_object_mut() {
+        for k in ["width", "height"] {
+            if obj.get(k).is_some_and(serde_json::Value::is_null) {
+                obj.insert(k.to_string(), serde_json::json!(1e40));
+            }
+        }
+    }
+    serde_json::from_value(v).ok()
+}
+
 /// A persisted tree is usable only if its panes are exactly {0..n} once each.
 fn tree_panes_valid(t: &Tree<usize>, n: usize) -> bool {
     let mut seen = vec![false; n];
@@ -96,6 +119,40 @@ impl ScreenState {
         }
     }
 
+    /// Split `target` (a pane) into a new linear container laid out along
+    /// `dir`, keeping the existing panel and adding a fresh, unconfigured panel
+    /// of `type_name` beside it. The target's TileId is reused for the new
+    /// container so its position in the parent (or the root pointer) is intact,
+    /// which sidesteps parent-kind-specific child rewiring.
+    fn split_panel(
+        &mut self,
+        target: TileId,
+        dir: LinearDir,
+        type_name: &str,
+        reg: &PanelRegistry,
+        channels: &ChannelRegistry,
+    ) {
+        let old_idx = match self.tree.tiles.get(target) {
+            Some(Tile::Pane(i)) => *i,
+            _ => return,
+        };
+        let entry = PanelEntry { panel_type: type_name.to_string(), config: toml::Table::new() };
+        let panel = reg.build(&entry, channels).unwrap_or_else(|e| {
+            Box::new(ErrorPanel {
+                title: format!("{type_name} (unconfigured)"),
+                msg: e.to_string(),
+                orig: entry.config.clone(),
+            })
+        });
+        let new_idx = self.panels.len();
+        self.panels.push(PanelSlot { type_name: type_name.to_string(), panel });
+        let moved = self.tree.tiles.insert_pane(old_idx);
+        let added = self.tree.tiles.insert_pane(new_idx);
+        if let Some(tile) = self.tree.tiles.get_mut(target) {
+            *tile = Tile::Container(Container::new_linear(dir, vec![moved, added]));
+        }
+    }
+
     fn from_screen_config(
         name: &str,
         sc: &ScreenConfig,
@@ -119,7 +176,7 @@ impl ScreenState {
         let tree = sc
             .tiles_json
             .as_deref()
-            .and_then(|j| serde_json::from_str::<Tree<usize>>(j).ok())
+            .and_then(parse_tree)
             .filter(|t| tree_panes_valid(t, panels.len()))
             .unwrap_or_else(|| default_tree(name, panels.len()));
         Self { tree, panels }
@@ -191,14 +248,54 @@ impl Workspace {
         cfg
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui, store: &dyn ChannelStore) {
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        store: &dyn ChannelStore,
+        channels: &ChannelRegistry,
+        reg: &PanelRegistry,
+        mqtt: Option<MqttDropCtx>,
+    ) {
+        let type_names = reg.type_names();
         let Some(st) = self.screens.get_mut(&self.active) else {
             return;
         };
-        let mut behavior = TreeBehavior { store, panels: &mut st.panels, pending_remove: None };
+        let mut behavior = TreeBehavior {
+            store,
+            panels: &mut st.panels,
+            pending_remove: None,
+            pending_split: None,
+            type_names: &type_names,
+            channels,
+            mqtt,
+        };
         st.tree.ui(&mut behavior, ui);
-        if let Some(tile_id) = behavior.pending_remove {
+        let pending_remove = behavior.pending_remove;
+        let pending_split = behavior.pending_split;
+        if let Some(tile_id) = pending_remove {
             st.remove_panel(tile_id);
+        }
+        if let Some((tile_id, dir, type_name)) = pending_split {
+            st.split_panel(tile_id, dir, &type_name, reg, channels);
+        }
+    }
+
+    /// Re-attempt to resolve every panel's unknown channels against
+    /// newly-discovered MQTT topics. Cheap (hashmap lookups per unresolved
+    /// binding); call when the discovered-topic snapshot changes. This is what
+    /// lets a layout referencing a drop-created (dynamic) MQTT channel bind
+    /// after restart, once the broker republishes that topic.
+    pub fn refresh_bindings(
+        &mut self,
+        channels: &ChannelRegistry,
+        store: &dyn ChannelStore,
+        mqtt: Option<MqttDropCtx>,
+    ) {
+        let ctx = crate::viz::common::RebindCtx { channels, store, mqtt };
+        for st in self.screens.values_mut() {
+            for slot in &mut st.panels {
+                slot.panel.refresh_bindings(&ctx);
+            }
         }
     }
 
@@ -219,7 +316,13 @@ impl Workspace {
             .screens
             .get_mut(&self.active)
             .ok_or_else(|| anyhow!("no active screen"))?;
-        let panel = reg.build(entry, channels)?;
+        let panel = reg.build(entry, channels).unwrap_or_else(|e| {
+            Box::new(ErrorPanel {
+                title: format!("{} (unconfigured)", entry.panel_type),
+                msg: e.to_string(),
+                orig: entry.config.clone(),
+            })
+        });
         let idx = st.panels.len();
         st.panels.push(PanelSlot { type_name: entry.panel_type.clone(), panel });
         let pane = st.tree.tiles.insert_pane(idx);
@@ -241,8 +344,14 @@ impl Workspace {
 /// drop and splitting come free from egui_tiles.
 struct TreeBehavior<'a> {
     store: &'a dyn ChannelStore,
+    channels: &'a ChannelRegistry,
     panels: &'a mut Vec<PanelSlot>,
     pending_remove: Option<TileId>,
+    /// Requested split: (target pane, layout direction, new panel type).
+    pending_split: Option<(TileId, LinearDir, String)>,
+    /// Panel type names offered in the split submenus.
+    type_names: &'a [&'static str],
+    mqtt: Option<MqttDropCtx<'a>>,
 }
 
 impl egui_tiles::Behavior<usize> for TreeBehavior<'_> {
@@ -252,19 +361,75 @@ impl egui_tiles::Behavior<usize> for TreeBehavior<'_> {
         tile_id: TileId,
         pane: &mut usize,
     ) -> egui_tiles::UiResponse {
+        // Allocate the pane-wide interaction FIRST so the panel's own widgets
+        // (settings foldout, drag values, sliders) are registered afterwards and
+        // therefore sit on top in z-order. Interacting over `max_rect` after the
+        // content would instead cover it and swallow every click — leaving the
+        // "settings" header and all config widgets unresponsive.
+        let pane_rect = ui.max_rect();
+        let resp =
+            ui.interact(pane_rect, ui.id().with("pane_ctx"), egui::Sense::hover());
+
         if let Some(slot) = self.panels.get_mut(*pane) {
+            // Panel label, always shown above the content (the tab bar is not
+            // visible for single panes or grid layouts).
+            let title = slot.panel.title().to_string();
+            if !title.is_empty() {
+                ui.strong(title);
+            }
             egui::CollapsingHeader::new("settings")
                 .id_source((*pane, "panel-settings"))
                 .show(ui, |ui| slot.panel.config_ui(ui));
             slot.panel.render(ui, self.store);
         }
-        ui.interact(ui.max_rect(), ui.id().with("pane_ctx"), egui::Sense::hover())
-            .context_menu(|ui| {
-                if ui.button("Delete panel").clicked() {
-                    self.pending_remove = Some(tile_id);
-                    ui.close_menu();
+
+        // Highlight when a channel is dragged over this panel.
+        if resp.dnd_hover_payload::<String>().is_some() {
+            ui.painter().rect_stroke(
+                pane_rect,
+                2.0_f32,
+                egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(80, 140, 255)),
+            );
+        }
+
+        // Accept a dropped channel name or MQTT topic. Configured channels
+        // resolve directly; an unconfigured but discovered MQTT topic is
+        // registered on the fly (new store slot + routing). Drops that resolve
+        // to nothing are silently ignored.
+        if let Some(dropped) = resp.dnd_release_payload::<String>() {
+            let raw: &str = dropped.as_str();
+            if let Some(name) =
+                resolve_or_register_drop(raw, self.channels, self.store, self.mqtt)
+            {
+                if let Some(slot) = self.panels.get_mut(*pane) {
+                    slot.panel.drop_channel(&name, self.channels);
+                }
+            }
+        }
+
+        resp.context_menu(|ui| {
+            ui.menu_button("Split horizontal", |ui| {
+                for t in self.type_names {
+                    if ui.button(*t).clicked() {
+                        self.pending_split = Some((tile_id, LinearDir::Horizontal, t.to_string()));
+                        ui.close_menu();
+                    }
                 }
             });
+            ui.menu_button("Split vertical", |ui| {
+                for t in self.type_names {
+                    if ui.button(*t).clicked() {
+                        self.pending_split = Some((tile_id, LinearDir::Vertical, t.to_string()));
+                        ui.close_menu();
+                    }
+                }
+            });
+            ui.separator();
+            if ui.button("Delete panel").clicked() {
+                self.pending_remove = Some(tile_id);
+                ui.close_menu();
+            }
+        });
         egui_tiles::UiResponse::None
     }
 
@@ -363,6 +528,38 @@ channel = "demo.sine"
     }
 
     #[test]
+    fn panel_sizes_survive_round_trip() {
+        use egui_tiles::{Container, Tile};
+        let (ch, reg, mut ws) = build();
+        // Simulate a user resize by editing the grid's row/col shares.
+        let st = ws.screens.get_mut("main").unwrap();
+        let ids: Vec<_> = st.tree.tiles.iter().map(|(id, _)| *id).collect();
+        let mut set = false;
+        for id in ids {
+            if let Some(Tile::Container(Container::Grid(g))) = st.tree.tiles.get_mut(id) {
+                g.col_shares = vec![2.5];
+                g.row_shares = vec![4.0, 1.0];
+                set = true;
+            }
+        }
+        assert!(set, "main screen should have a grid container");
+
+        // Save → reload and confirm the shares (sizes) came back, i.e. the tree
+        // was NOT discarded and rebuilt as a default grid.
+        let cfg = ws.to_config();
+        let ws2 = Workspace::from_config(&cfg, &reg, &ch);
+        let mut found = false;
+        for (_, t) in ws2.screens["main"].tree.tiles.iter() {
+            if let Tile::Container(Container::Grid(g)) = t {
+                assert_eq!(g.col_shares, vec![2.5]);
+                assert_eq!(g.row_shares, vec![4.0, 1.0]);
+                found = true;
+            }
+        }
+        assert!(found, "grid with restored shares must exist after reload");
+    }
+
+    #[test]
     fn invalid_tiles_json_falls_back_to_grid() {
         let ch = channels();
         let reg = PanelRegistry::with_builtins();
@@ -408,14 +605,16 @@ setting = 42
         ws.add_panel(&entry, &reg, &ch).unwrap();
         assert_eq!(pane_count(&ws.screens["fresh"]), 2);
         assert_eq!(ws.screens["fresh"].panels.len(), 2);
-        // Unknown type propagates Err (interactive path — user sees it).
+        // Unknown type creates an ErrorPanel so the user sees it inline.
         let bad = PanelEntry { panel_type: "hologram".into(), config: toml::Table::new() };
-        assert!(ws.add_panel(&bad, &reg, &ch).is_err());
+        ws.add_panel(&bad, &reg, &ch).unwrap();
+        assert_eq!(pane_count(&ws.screens["fresh"]), 3);
+        assert_eq!(ws.screens["fresh"].panels.len(), 3);
     }
 
     #[test]
     fn ui_renders_headless_without_panic() {
-        let (ch, _, mut ws) = build();
+        let (ch, reg, mut ws) = build();
         let store = LiveStore::from_registry(&ch);
         store.write_numeric(ch.id("demo.sine").unwrap(), 1, NumericVal::Float(1.0));
         for screen in ["aux", "main"] {
@@ -423,9 +622,69 @@ setting = 42
             let ctx = egui::Context::default();
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    ws.ui(ui, &store);
+                    ws.ui(ui, &store, &ch, &reg, None);
                 });
             });
         }
     }
+
+    #[test]
+    fn split_panel_adds_pane_and_survives_round_trip() {
+        let (ch, reg, mut ws) = build();
+        let st = ws.screens.get_mut("main").unwrap();
+        assert_eq!(pane_count(st), 2);
+        // Split the tile holding pane index 0 into a vertical pair.
+        let target = st
+            .tree
+            .tiles
+            .iter()
+            .find_map(|(id, t)| matches!(t, Tile::Pane(0)).then_some(*id))
+            .unwrap();
+        st.split_panel(target, LinearDir::Vertical, "gauge", &reg, &ch);
+        assert_eq!(pane_count(st), 3);
+        assert_eq!(st.panels.len(), 3);
+        assert_eq!(st.panels[2].type_name, "gauge");
+        // Tree stays valid (panes are exactly {0,1,2}) so it round-trips.
+        assert!(tree_panes_valid(&st.tree, st.panels.len()));
+        let cfg = ws.to_config();
+        let ws2 = Workspace::from_config(&cfg, &reg, &ch);
+        assert_eq!(pane_count(&ws2.screens["main"]), 3);
+    }
+
+    #[test]
+    fn refresh_bindings_resolves_dynamic_mqtt_channel() {
+        use std::collections::HashMap;
+        use std::sync::RwLock;
+
+        let ch = channels();
+        let reg = PanelRegistry::with_builtins();
+        let store = LiveStore::from_registry(&ch);
+        // Layout references an MQTT topic absent from channels.toml — a
+        // drop-created dynamic channel that vanished on restart.
+        let cfg = LayoutConfig::from_toml_str(
+            r#"
+[[screens.main.panels]]
+type = "numeric"
+channel = "home/sensors/temp"
+"#,
+        )
+        .unwrap();
+        let mut ws = Workspace::from_config(&cfg, &reg, &ch);
+        assert!(ch.id("home/sensors/temp").is_none(), "unknown at load time");
+
+        // No snapshot: still unresolved.
+        ws.refresh_bindings(&ch, &store, None);
+        assert!(ch.id("home/sensors/temp").is_none());
+
+        // Broker republishes the topic → discovery re-registers it and the
+        // panel binds.
+        let topic_map: MqttTopicMap = RwLock::new(HashMap::new());
+        let mut snap = BTreeMap::new();
+        snap.insert("home/sensors/temp".to_string(), "21.5".to_string());
+        ws.refresh_bindings(&ch, &store, Some((&topic_map, &snap)));
+
+        assert!(ch.id("home/sensors/temp").is_some(), "resolved after discovery");
+        assert!(topic_map.read().unwrap().contains_key("home/sensors/temp"));
+    }
 }
+

@@ -5,7 +5,10 @@ use eframe::egui::{self, Align2, Color32, FontId};
 use crate::config::ChannelRegistry;
 use crate::store::ChannelStore;
 use crate::types::{ChannelSnapshot, SampleType, TimeWindow};
-use crate::viz::common::{bind, binding_error, opt_f64, req_str, Binding};
+use crate::viz::common::{
+    bind, binding_error, effective_window_s, label_config_row, opt_f64_opt, opt_label, opt_str,
+    refresh_binding, serialize_label, window_config_row, Binding, RebindCtx,
+};
 use crate::viz::VizPanel;
 
 pub const TYPE_NAME: &str = "state_graph";
@@ -29,15 +32,17 @@ fn color_for(value: i64) -> Color32 {
 /// contiguous run of equal values.
 pub struct StateGraphPanel {
     bound: Binding,
+    label: Option<String>,
     states: BTreeMap<i64, String>,
-    time_window_s: f64,
+    /// Visible span in seconds; `None` follows the global default.
+    time_window_s: Option<f64>,
 }
 
 pub fn ctor(
     cfg: &toml::Table,
     reg: &ChannelRegistry,
 ) -> anyhow::Result<Box<dyn VizPanel>> {
-    let name = req_str(cfg, "channel", TYPE_NAME)?;
+    let name = opt_str(cfg, "channel");
     let mut states = BTreeMap::new();
     if let Some(tbl) = cfg.get("states").and_then(|v| v.as_table()) {
         for (k, v) in tbl {
@@ -49,8 +54,9 @@ pub fn ctor(
     }
     Ok(Box::new(StateGraphPanel {
         bound: bind(&name, reg, ACCEPTED),
+        label: opt_label(cfg),
         states,
-        time_window_s: opt_f64(cfg, "time_window_s", 30.0),
+        time_window_s: opt_f64_opt(cfg, "time_window_s"),
     }))
 }
 
@@ -84,7 +90,7 @@ impl StateGraphPanel {
 
 impl VizPanel for StateGraphPanel {
     fn title(&self) -> &str {
-        &self.bound.name
+        self.label.as_deref().unwrap_or(&self.bound.name)
     }
 
     fn accepted_types(&self) -> &[SampleType] {
@@ -92,13 +98,17 @@ impl VizPanel for StateGraphPanel {
     }
 
     fn config_ui(&mut self, ui: &mut egui::Ui) {
+        label_config_row(ui, &mut self.label, &self.bound.name);
         ui.horizontal(|ui| {
-            ui.label("window [s]:");
-            ui.add(egui::Slider::new(&mut self.time_window_s, 1.0..=600.0).logarithmic(true));
+            window_config_row(ui, &mut self.time_window_s, 1.0..=600.0);
         });
     }
 
     fn render(&mut self, ui: &mut egui::Ui, store: &dyn ChannelStore) {
+        if self.bound.name.is_empty() {
+            ui.label(egui::RichText::new("Drop a channel here").weak());
+            return;
+        }
         if binding_error(ui, &self.bound, TYPE_NAME) {
             return;
         }
@@ -107,7 +117,7 @@ impl VizPanel for StateGraphPanel {
             ui.label("no data");
             return;
         };
-        let span = (self.time_window_s * 1e9) as i64;
+        let span = (effective_window_s(ui.ctx(), self.time_window_s) * 1e9) as i64;
         let t0 = end_ns - span;
         let snap = store.snapshot(id, TimeWindow { start_ns: t0, end_ns: end_ns + 1 });
         let (ts, vals): (Vec<i64>, Vec<i64>) = match &snap {
@@ -162,8 +172,19 @@ impl VizPanel for StateGraphPanel {
             }
             t.insert("states".to_string(), toml::Value::Table(tbl));
         }
-        t.insert("time_window_s".to_string(), toml::Value::Float(self.time_window_s));
+        if let Some(w) = self.time_window_s {
+            t.insert("time_window_s".to_string(), toml::Value::Float(w));
+        }
+        serialize_label(&mut t, &self.label);
         t
+    }
+
+    fn drop_channel(&mut self, name: &str, reg: &crate::config::ChannelRegistry) {
+        self.bound = bind(name, reg, ACCEPTED);
+    }
+
+    fn refresh_bindings(&mut self, ctx: &RebindCtx) {
+        refresh_binding(&mut self.bound, ACCEPTED, ctx);
     }
 }
 

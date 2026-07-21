@@ -3,7 +3,10 @@ use eframe::egui;
 use crate::config::ChannelRegistry;
 use crate::store::ChannelStore;
 use crate::types::{ChannelSnapshot, SampleType, TimeWindow};
-use crate::viz::common::{bind, binding_error, format_time_of_day, opt_i64, req_str_array, Binding};
+use crate::viz::common::{
+    bind, binding_error, format_time_of_day, label_config_row, opt_i64, opt_label, opt_str_array,
+    refresh_binding, serialize_label, Binding, RebindCtx,
+};
 use crate::viz::VizPanel;
 
 pub const TYPE_NAME: &str = "log";
@@ -13,6 +16,7 @@ const ACCEPTED: &[SampleType] = &[SampleType::Text];
 /// Scrolling, filterable, timestamped log merged from one or more text channels.
 pub struct LogPanel {
     title: String,
+    label: Option<String>,
     bound: Vec<Binding>,
     max_lines: usize,
     filter: String,
@@ -22,10 +26,11 @@ pub fn ctor(
     cfg: &toml::Table,
     reg: &ChannelRegistry,
 ) -> anyhow::Result<Box<dyn VizPanel>> {
-    let names = req_str_array(cfg, "channels", TYPE_NAME)?;
+    let names = opt_str_array(cfg, "channels");
     let bound = names.iter().map(|n| bind(n, reg, ACCEPTED)).collect();
     Ok(Box::new(LogPanel {
         title: names.join(", "),
+        label: opt_label(cfg),
         bound,
         max_lines: opt_i64(cfg, "max_lines", 500).max(1) as usize,
         filter: String::new(),
@@ -54,7 +59,9 @@ pub(crate) fn merge_filter(
 
 impl VizPanel for LogPanel {
     fn title(&self) -> &str {
-        &self.title
+        self.label
+            .as_deref()
+            .unwrap_or_else(|| self.bound.first().map(|b| b.name.as_str()).unwrap_or(""))
     }
 
     fn accepted_types(&self) -> &[SampleType] {
@@ -62,6 +69,8 @@ impl VizPanel for LogPanel {
     }
 
     fn config_ui(&mut self, ui: &mut egui::Ui) {
+        let default = self.bound.first().map(|b| b.name.clone()).unwrap_or_default();
+        label_config_row(ui, &mut self.label, &default);
         ui.horizontal(|ui| {
             ui.label("filter:");
             ui.text_edit_singleline(&mut self.filter);
@@ -73,6 +82,10 @@ impl VizPanel for LogPanel {
     }
 
     fn render(&mut self, ui: &mut egui::Ui, store: &dyn ChannelStore) {
+        if self.bound.is_empty() {
+            ui.label(egui::RichText::new("Drop channels here").weak());
+            return;
+        }
         let mut sets = Vec::new();
         for b in &self.bound {
             if binding_error(ui, b, TYPE_NAME) {
@@ -107,7 +120,22 @@ impl VizPanel for LogPanel {
             ),
         );
         t.insert("max_lines".to_string(), toml::Value::Integer(self.max_lines as i64));
+        serialize_label(&mut t, &self.label);
         t
+    }
+
+    fn drop_channel(&mut self, name: &str, reg: &crate::config::ChannelRegistry) {
+        if self.bound.iter().any(|b| b.name == name) {
+            return;
+        }
+        self.bound.push(bind(name, reg, ACCEPTED));
+        self.title = self.bound.iter().map(|b| b.name.as_str()).collect::<Vec<_>>().join(", ");
+    }
+
+    fn refresh_bindings(&mut self, ctx: &RebindCtx) {
+        for b in &mut self.bound {
+            refresh_binding(b, ACCEPTED, ctx);
+        }
     }
 }
 

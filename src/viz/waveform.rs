@@ -1,11 +1,13 @@
 use eframe::egui::{self, Color32};
-use egui_plot::{Legend, Line, Plot, PlotPoints, VLine};
+use egui_plot::{Legend, Line, MarkerShape, Plot, PlotPoints, Points, VLine};
 
 use crate::config::ChannelRegistry;
 use crate::store::ChannelStore;
 use crate::types::{SampleType, TimeWindow};
 use crate::viz::common::{
-    bind, binding_error, opt_bool, opt_f64, req_str_array, snapshot_to_f64, Binding,
+    bind, binding_color, binding_error, effective_window_s, label_config_row, opt_bool,
+    opt_f64_opt, opt_label, opt_str_array, refresh_binding, serialize_label, snapshot_to_f64,
+    window_config_row, Binding, RebindCtx,
 };
 use crate::viz::decimate::decimate_minmax;
 use crate::viz::measure::{stats, Stats};
@@ -21,9 +23,14 @@ const MAX_PLOT_BUCKETS: usize = 1000;
 /// Scrolling time-series plot with optional measurement cursors.
 pub struct WaveformPanel {
     title: String,
+    /// Custom tab label; `None` falls back to the first channel dropped in.
+    label: Option<String>,
     bound: Vec<Binding>,
-    time_window_s: f64,
+    /// Visible span in seconds; `None` follows the global default.
+    time_window_s: Option<f64>,
     cursors: bool,
+    /// Draw a marker on every actual sample, not just the connecting line.
+    dots: bool,
     /// Cursor positions in absolute ns so they stay put while the plot scrolls.
     cursor_a_ns: Option<i64>,
     cursor_b_ns: Option<i64>,
@@ -33,16 +40,37 @@ pub fn ctor(
     cfg: &toml::Table,
     reg: &ChannelRegistry,
 ) -> anyhow::Result<Box<dyn VizPanel>> {
-    let names = req_str_array(cfg, "channels", TYPE_NAME)?;
+    let names = opt_str_array(cfg, "channels");
     let bound: Vec<Binding> = names.iter().map(|n| bind(n, reg, ACCEPTED)).collect();
     Ok(Box::new(WaveformPanel {
         title: names.join(", "),
+        label: opt_label(cfg),
         bound,
-        time_window_s: opt_f64(cfg, "time_window_s", 5.0),
+        time_window_s: opt_f64_opt(cfg, "time_window_s"),
         cursors: opt_bool(cfg, "cursors", false),
+        dots: opt_bool(cfg, "dots", false),
         cursor_a_ns: None,
         cursor_b_ns: None,
     }))
+}
+
+/// Nearest actual sample timestamp to `ts` across all plotted channels, so
+/// measurement cursors snap onto real samples instead of floating between them.
+/// `None` only when nothing is plotted.
+pub(crate) fn nearest_sample_ts(snaps: &[(usize, Vec<i64>, Vec<f64>)], ts: i64) -> Option<i64> {
+    snaps
+        .iter()
+        .flat_map(|(_, tss, _)| tss.iter().copied())
+        .min_by_key(|&t| (t - ts).abs())
+}
+
+/// Nearest sample (timestamp, value) within a single channel to `target`, used
+/// to place a cursor marker directly on that channel's curve.
+pub(crate) fn nearest_point(ts: &[i64], vals: &[f64], target: i64) -> Option<(i64, f64)> {
+    ts.iter()
+        .zip(vals)
+        .min_by_key(|(&t, _)| (t - target).abs())
+        .map(|(&t, &v)| (t, v))
 }
 
 /// Stats over samples with lo <= ts <= hi (both cursors inclusive).
@@ -58,7 +86,9 @@ pub(crate) fn selection_stats(ts: &[i64], vals: &[f64], lo: i64, hi: i64) -> Opt
 
 impl VizPanel for WaveformPanel {
     fn title(&self) -> &str {
-        &self.title
+        self.label
+            .as_deref()
+            .unwrap_or_else(|| self.bound.first().map(|b| b.name.as_str()).unwrap_or(""))
     }
 
     fn accepted_types(&self) -> &[SampleType] {
@@ -66,10 +96,12 @@ impl VizPanel for WaveformPanel {
     }
 
     fn config_ui(&mut self, ui: &mut egui::Ui) {
+        let default = self.bound.first().map(|b| b.name.clone()).unwrap_or_default();
+        label_config_row(ui, &mut self.label, &default);
         ui.horizontal(|ui| {
-            ui.label("window [s]:");
-            ui.add(egui::Slider::new(&mut self.time_window_s, 0.1..=60.0).logarithmic(true));
+            window_config_row(ui, &mut self.time_window_s, 0.1..=60.0);
             ui.checkbox(&mut self.cursors, "cursors");
+            ui.checkbox(&mut self.dots, "dots");
             if ui.button("clear cursors").clicked() {
                 self.cursor_a_ns = None;
                 self.cursor_b_ns = None;
@@ -78,6 +110,10 @@ impl VizPanel for WaveformPanel {
     }
 
     fn render(&mut self, ui: &mut egui::Ui, store: &dyn ChannelStore) {
+        if self.bound.is_empty() {
+            ui.label(egui::RichText::new("Drop channels here").weak());
+            return;
+        }
         for b in &self.bound {
             binding_error(ui, b, TYPE_NAME);
         }
@@ -93,7 +129,8 @@ impl VizPanel for WaveformPanel {
             ui.label("no data");
             return;
         };
-        let span_ns = (self.time_window_s * 1e9) as i64;
+        let win_s = effective_window_s(ui.ctx(), self.time_window_s);
+        let span_ns = (win_s * 1e9) as i64;
         let t0 = end_ns - span_ns;
         let window = TimeWindow { start_ns: t0, end_ns: end_ns + 1 };
 
@@ -107,33 +144,60 @@ impl VizPanel for WaveformPanel {
             }
         }
 
+        // Plot fills available height by default, which pushes the readout and
+        // stats below it off the bottom of the pane. Reserve a strip so the
+        // footer labels stay visible.
+        let footer_h = if self.cursors { 120.0 } else { 24.0 };
         let plot = Plot::new(("waveform", &self.title))
             .legend(Legend::default())
             .include_x(0.0)
-            .include_x(self.time_window_s);
+            .include_x(win_s)
+            .height((ui.available_height() - footer_h).max(80.0));
         let inner = plot.show(ui, |plot_ui| {
             for (i, ts, vals) in &snaps {
                 let points = decimate_minmax(ts, vals, t0, MAX_PLOT_BUCKETS);
                 let b = &self.bound[*i];
-                plot_ui.line(
-                    Line::new(PlotPoints::from(points))
-                        .color(b.color)
-                        .name(&b.name),
-                );
+                let color = binding_color(b, *i);
+                plot_ui.line(Line::new(PlotPoints::from(points)).color(color).name(&b.name));
+                if self.dots {
+                    // Marker on each real sample in the window.
+                    let pts: Vec<[f64; 2]> = ts
+                        .iter()
+                        .zip(vals)
+                        .map(|(&t, &v)| [(t - t0) as f64 / 1e9, v])
+                        .collect();
+                    plot_ui.points(
+                        Points::new(pts).color(color).shape(MarkerShape::Circle).radius(3.0_f32),
+                    );
+                }
             }
             if self.cursors {
-                if let Some(a) = self.cursor_a_ns {
-                    plot_ui.vline(VLine::new((a - t0) as f64 / 1e9).color(Color32::YELLOW));
-                }
-                if let Some(b) = self.cursor_b_ns {
-                    plot_ui.vline(VLine::new((b - t0) as f64 / 1e9).color(Color32::LIGHT_BLUE));
+                for (cur, color) in [
+                    (self.cursor_a_ns, Color32::YELLOW),
+                    (self.cursor_b_ns, Color32::LIGHT_BLUE),
+                ] {
+                    let Some(c) = cur else { continue };
+                    plot_ui.vline(VLine::new((c - t0) as f64 / 1e9).color(color));
+                    // Dot on each curve at its sample nearest the cursor, so the
+                    // snap to real samples is visible instead of a bare line.
+                    for (_, ts, vals) in &snaps {
+                        if let Some((t, v)) = nearest_point(ts, vals, c) {
+                            plot_ui.points(
+                                Points::new(vec![[(t - t0) as f64 / 1e9, v]])
+                                    .color(color)
+                                    .shape(MarkerShape::Circle)
+                                    .radius(4.0_f32),
+                            );
+                        }
+                    }
                 }
             }
             plot_ui.pointer_coordinate()
         });
         if self.cursors && inner.response.clicked() {
             if let Some(p) = inner.inner {
-                let ts = t0 + (p.x * 1e9) as i64;
+                let raw_ts = t0 + (p.x * 1e9) as i64;
+                let ts = nearest_sample_ts(&snaps, raw_ts).unwrap_or(raw_ts);
                 let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
                 if ctrl {
                     self.cursor_b_ns = Some(ts);
@@ -141,6 +205,19 @@ impl VizPanel for WaveformPanel {
                     self.cursor_a_ns = Some(ts);
                 }
             }
+        }
+
+        // Readout of the placed cursors' coordinates: the snapped sample time
+        // and, per channel, the value at that sample.
+        for (cur, name) in [(self.cursor_a_ns, "A"), (self.cursor_b_ns, "B")] {
+            let Some(c) = cur else { continue };
+            let mut line = format!("cursor {name}: t = {:.4} s", (c - t0) as f64 / 1e9);
+            for (i, ts, vals) in &snaps {
+                if let Some((_, v)) = nearest_point(ts, vals, c) {
+                    line.push_str(&format!("  {} = {:.4}", self.bound[*i].name, v));
+                }
+            }
+            ui.label(line);
         }
 
         if self.cursors {
@@ -182,9 +259,27 @@ impl VizPanel for WaveformPanel {
                     .collect(),
             ),
         );
-        t.insert("time_window_s".to_string(), toml::Value::Float(self.time_window_s));
+        if let Some(w) = self.time_window_s {
+            t.insert("time_window_s".to_string(), toml::Value::Float(w));
+        }
         t.insert("cursors".to_string(), toml::Value::Boolean(self.cursors));
+        t.insert("dots".to_string(), toml::Value::Boolean(self.dots));
+        serialize_label(&mut t, &self.label);
         t
+    }
+
+    fn drop_channel(&mut self, name: &str, reg: &crate::config::ChannelRegistry) {
+        if self.bound.iter().any(|b| b.name == name) {
+            return;
+        }
+        self.bound.push(bind(name, reg, ACCEPTED));
+        self.title = self.bound.iter().map(|b| b.name.as_str()).collect::<Vec<_>>().join(", ");
+    }
+
+    fn refresh_bindings(&mut self, ctx: &RebindCtx) {
+        for b in &mut self.bound {
+            refresh_binding(b, ACCEPTED, ctx);
+        }
     }
 }
 
@@ -231,7 +326,8 @@ type = "text"
             r#"type = "waveform"
 channels = ["demo.sine"]
 time_window_s = 5.0
-cursors = true"#,
+cursors = true
+dots = true"#,
         );
         let p = reg.build(&e, &channels).unwrap();
         assert_eq!(p.title(), "demo.sine");
@@ -239,11 +335,12 @@ cursors = true"#,
     }
 
     #[test]
-    fn missing_channels_key_is_err() {
+    fn missing_channels_key_builds_empty_panel() {
         let channels = registry();
         let reg = PanelRegistry::with_builtins();
         let e = entry(r#"type = "waveform""#);
-        assert!(reg.build(&e, &channels).is_err());
+        let p = reg.build(&e, &channels).unwrap();
+        assert_eq!(p.title(), "");
     }
 
     #[test]
@@ -256,8 +353,10 @@ channels = ["demo.sine"]"#,
         );
         let p = reg.build(&e, &channels).unwrap();
         let cfg = p.serialize();
-        assert_eq!(cfg["time_window_s"], toml::Value::Float(5.0));
+        // No explicit window → key omitted so the panel follows the global default.
+        assert!(!cfg.contains_key("time_window_s"));
         assert_eq!(cfg["cursors"], toml::Value::Boolean(false));
+        assert_eq!(cfg["dots"], toml::Value::Boolean(false));
     }
 
     #[test]
@@ -269,6 +368,31 @@ channels = ["demo.sine"]"#,
         assert_eq!(s.max, 4.0);
         assert_eq!(s.count, 3); // ts 10, 20, 30 inclusive
         assert!(selection_stats(&ts, &vals, 100, 200).is_none());
+    }
+
+    #[test]
+    fn cursor_snaps_to_nearest_sample() {
+        let snaps = vec![
+            (0usize, vec![0i64, 100, 200], vec![0.0, 1.0, 2.0]),
+            (1usize, vec![50i64, 250], vec![9.0, 9.0]),
+        ];
+        // Between samples → snaps to the closest across all channels.
+        assert_eq!(nearest_sample_ts(&snaps, 120), Some(100));
+        assert_eq!(nearest_sample_ts(&snaps, 40), Some(50));
+        assert_eq!(nearest_sample_ts(&snaps, 240), Some(250));
+        // Exact hit stays put; empty input yields None.
+        assert_eq!(nearest_sample_ts(&snaps, 200), Some(200));
+        assert_eq!(nearest_sample_ts(&[], 10), None);
+    }
+
+    #[test]
+    fn nearest_point_picks_closest_sample() {
+        let ts = [0i64, 100, 200];
+        let vals = [10.0, 11.0, 12.0];
+        assert_eq!(nearest_point(&ts, &vals, 120), Some((100, 11.0)));
+        assert_eq!(nearest_point(&ts, &vals, 190), Some((200, 12.0)));
+        assert_eq!(nearest_point(&ts, &vals, 200), Some((200, 12.0)));
+        assert_eq!(nearest_point(&[], &[], 5), None);
     }
 
     #[test]

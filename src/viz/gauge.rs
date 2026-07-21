@@ -3,7 +3,10 @@ use eframe::egui::{self, Align2, Color32, FontId};
 use crate::config::ChannelRegistry;
 use crate::store::ChannelStore;
 use crate::types::SampleType;
-use crate::viz::common::{bind, binding_error, opt_f64, req_str, sample_as_f64, Binding};
+use crate::viz::common::{
+    bind, binding_error, label_config_row, opt_f64, opt_label, opt_str, refresh_binding,
+    sample_as_f64, serialize_label, Binding, RebindCtx,
+};
 use crate::viz::VizPanel;
 
 pub const TYPE_NAME: &str = "gauge";
@@ -13,6 +16,7 @@ const ACCEPTED: &[SampleType] = &[SampleType::Float, SampleType::Int];
 /// Horizontal bar gauge showing the latest value within [min, max].
 pub struct GaugePanel {
     bound: Binding,
+    label: Option<String>,
     min: f64,
     max: f64,
 }
@@ -21,13 +25,13 @@ pub fn ctor(
     cfg: &toml::Table,
     reg: &ChannelRegistry,
 ) -> anyhow::Result<Box<dyn VizPanel>> {
-    let name = req_str(cfg, "channel", TYPE_NAME)?;
+    let name = opt_str(cfg, "channel");
     let min = opt_f64(cfg, "min", 0.0);
     let max = opt_f64(cfg, "max", 100.0);
     if max <= min {
         anyhow::bail!("{TYPE_NAME} panel: max ({max}) must be greater than min ({min})");
     }
-    Ok(Box::new(GaugePanel { bound: bind(&name, reg, ACCEPTED), min, max }))
+    Ok(Box::new(GaugePanel { bound: bind(&name, reg, ACCEPTED), label: opt_label(cfg), min, max }))
 }
 
 pub(crate) fn fraction(v: f64, min: f64, max: f64) -> f32 {
@@ -36,7 +40,7 @@ pub(crate) fn fraction(v: f64, min: f64, max: f64) -> f32 {
 
 impl VizPanel for GaugePanel {
     fn title(&self) -> &str {
-        &self.bound.name
+        self.label.as_deref().unwrap_or(&self.bound.name)
     }
 
     fn accepted_types(&self) -> &[SampleType] {
@@ -44,6 +48,7 @@ impl VizPanel for GaugePanel {
     }
 
     fn config_ui(&mut self, ui: &mut egui::Ui) {
+        label_config_row(ui, &mut self.label, &self.bound.name);
         ui.horizontal(|ui| {
             ui.label("min:");
             ui.add(egui::DragValue::new(&mut self.min).speed(0.1));
@@ -56,6 +61,10 @@ impl VizPanel for GaugePanel {
     }
 
     fn render(&mut self, ui: &mut egui::Ui, store: &dyn ChannelStore) {
+        if self.bound.name.is_empty() {
+            ui.label(egui::RichText::new("Drop a channel here").weak());
+            return;
+        }
         if binding_error(ui, &self.bound, TYPE_NAME) {
             return;
         }
@@ -69,7 +78,7 @@ impl VizPanel for GaugePanel {
             Some(v) => {
                 let mut fill = rect;
                 fill.set_width(rect.width() * fraction(v, self.min, self.max));
-                painter.rect_filled(fill, 4.0, self.bound.color);
+                painter.rect_filled(fill, 4.0, crate::viz::common::binding_color(&self.bound, 0));
                 format!("{v:.3} {}", self.bound.unit)
             }
             None => "—".to_string(),
@@ -94,7 +103,16 @@ impl VizPanel for GaugePanel {
         t.insert("channel".to_string(), toml::Value::String(self.bound.name.clone()));
         t.insert("min".to_string(), toml::Value::Float(self.min));
         t.insert("max".to_string(), toml::Value::Float(self.max));
+        serialize_label(&mut t, &self.label);
         t
+    }
+
+    fn drop_channel(&mut self, name: &str, reg: &crate::config::ChannelRegistry) {
+        self.bound = bind(name, reg, ACCEPTED);
+    }
+
+    fn refresh_bindings(&mut self, ctx: &RebindCtx) {
+        refresh_binding(&mut self.bound, ACCEPTED, ctx);
     }
 }
 
