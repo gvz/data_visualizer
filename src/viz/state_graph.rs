@@ -113,10 +113,13 @@ impl VizPanel for StateGraphPanel {
             return;
         }
         let id = self.bound.id.expect("checked by binding_error");
-        let Some((end_ns, _)) = store.latest(id) else {
+        if store.latest(id).is_none() {
             ui.label("no data");
             return;
-        };
+        }
+        // Anchor the window on the store's clock so the live scrub slider (and
+        // replay position) move the view rather than pinning to the newest sample.
+        let end_ns = store.now_ns();
         let span = (effective_window_s(ui.ctx(), self.time_window_s) * 1e9) as i64;
         let t0 = end_ns - span;
         let snap = store.snapshot(id, TimeWindow { start_ns: t0, end_ns: end_ns + 1 });

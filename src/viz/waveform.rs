@@ -123,18 +123,20 @@ impl VizPanel for WaveformPanel {
         for b in &self.bound {
             binding_error(ui, b, TYPE_NAME);
         }
-        let end_ns = self
+        let has_data = self
             .bound
             .iter()
             .filter(|b| b.type_ok)
             .filter_map(|b| b.id)
-            .filter_map(|id| store.latest(id))
-            .map(|(t, _)| t)
-            .max();
-        let Some(end_ns) = end_ns else {
+            .any(|id| store.latest(id).is_some());
+        if !has_data {
             ui.label("no data");
             return;
-        };
+        }
+        // Anchor the window's right edge on the store clock so the live scrub
+        // slider (and replay position) drive the view instead of pinning to the
+        // newest sample.
+        let end_ns = store.now_ns();
         let win_s = effective_window_s(ui.ctx(), self.time_window_s);
         let span_ns = (win_s * 1e9) as i64;
         let t0 = end_ns - span_ns;

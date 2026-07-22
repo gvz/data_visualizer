@@ -122,10 +122,13 @@ impl VizPanel for SpectrumPanel {
             return;
         }
         let id = self.bound.id.expect("checked by binding_error");
-        let Some((end_ns, _)) = store.latest(id) else {
+        if store.latest(id).is_none() {
             ui.label("no data");
             return;
-        };
+        }
+        // Anchor on the store clock so the live scrub slider / replay position
+        // select which window is analyzed, not always the newest sample.
+        let end_ns = store.now_ns();
         let snap = store.snapshot(id, TimeWindow { start_ns: i64::MIN, end_ns: end_ns + 1 });
         let Some((ts, vals)) = snapshot_to_f64(&snap) else {
             return;

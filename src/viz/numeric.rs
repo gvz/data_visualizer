@@ -72,7 +72,7 @@ impl VizPanel for NumericPanel {
             );
             return;
         }
-        let text = match store.latest(id) {
+        let text = match store.latest_at(id, store.now_ns()) {
             Some((_, Sample::Float(v))) => format!("{v:.3}"),
             Some((_, Sample::Int(v))) => v.to_string(),
             Some((_, Sample::Bool(b))) => if b { "ON" } else { "OFF" }.to_string(),

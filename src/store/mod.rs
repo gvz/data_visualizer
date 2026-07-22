@@ -17,9 +17,40 @@ pub trait ChannelStore: Send + Sync {
     fn snapshot(&self, channel: ChannelId, window: TimeWindow) -> ChannelSnapshot;
     fn latest(&self, channel: ChannelId) -> Option<(i64, Sample)>;
     fn channel_meta(&self, channel: ChannelId) -> &ChannelMeta;
+    /// Append a runtime-registered channel slot. The new slot's index must
+    /// equal the ChannelId the registry assigned it. Live-only; the default
+    /// is a no-op (replay has a fixed channel set).
+    fn add_channel(&self, _meta: ChannelMeta) {}
     /// Wall clock by default; PlaybackStore overrides to return playback position.
     fn now_ns(&self) -> i64 {
         crate::types::now_ns()
+    }
+
+    /// Newest sample at or before `end_ns`. When panels pass `now_ns()`, this
+    /// honors the live scrub slider (and replay position) instead of always
+    /// returning the very latest sample.
+    fn latest_at(&self, channel: ChannelId, end_ns: i64) -> Option<(i64, Sample)> {
+        match self.latest(channel) {
+            None => None,
+            Some((t, s)) if t <= end_ns => Some((t, s)),
+            // Scrubbed into the past: pull the last sample within the window.
+            Some(_) => snapshot_last(&self.snapshot(
+                channel,
+                TimeWindow { start_ns: i64::MIN, end_ns: end_ns + 1 },
+            )),
+        }
+    }
+}
+
+/// Last (newest) sample of a snapshot, if any.
+fn snapshot_last(snap: &ChannelSnapshot) -> Option<(i64, Sample)> {
+    match snap {
+        ChannelSnapshot::Float { ts, vals } => Some((*ts.last()?, Sample::Float(*vals.last()?))),
+        ChannelSnapshot::Int { ts, vals } => Some((*ts.last()?, Sample::Int(*vals.last()?))),
+        ChannelSnapshot::Bool { ts, vals } => Some((*ts.last()?, Sample::Bool(*vals.last()? != 0))),
+        ChannelSnapshot::Text { lines } => {
+            lines.last().map(|(t, l)| (*t, Sample::Text(l.clone())))
+        }
     }
 }
 

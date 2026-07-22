@@ -69,7 +69,7 @@ impl VizPanel for GaugePanel {
             return;
         }
         let id = self.bound.id.expect("checked by binding_error");
-        let value = store.latest(id).and_then(|(_, s)| sample_as_f64(&s));
+        let value = store.latest_at(id, store.now_ns()).and_then(|(_, s)| sample_as_f64(&s));
         let desired = egui::vec2(ui.available_width().max(80.0), 32.0);
         let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
         let painter = ui.painter();

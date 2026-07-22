@@ -77,13 +77,13 @@ impl VizPanel for XyScatterPanel {
             return;
         }
         let (xid, yid) = (self.x.id.unwrap(), self.y.id.unwrap());
-        let end_ns = match (store.latest(xid), store.latest(yid)) {
-            (Some((a, _)), Some((b, _))) => a.min(b),
-            _ => {
-                ui.label("no data");
-                return;
-            }
-        };
+        if store.latest(xid).is_none() || store.latest(yid).is_none() {
+            ui.label("no data");
+            return;
+        }
+        // Anchor on the store clock so the live scrub slider / replay position
+        // pick which window is paired, not always the newest samples.
+        let end_ns = store.now_ns();
         let span = (effective_window_s(ui.ctx(), self.time_window_s) * 1e9) as i64;
         let window = TimeWindow { start_ns: end_ns - span, end_ns: end_ns + 1 };
         let xs = store.snapshot(xid, window);
