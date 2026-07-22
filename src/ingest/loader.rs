@@ -73,6 +73,34 @@ impl ProtoSchema {
         Ok(Self { pool, schema_bytes })
     }
 
+    /// Build a schema pool by merging multiple encoded FileDescriptorSets (e.g.
+    /// the per-channel schemas embedded in an MCAP file). Files with duplicate
+    /// names are skipped (prost-reflect dedups). Self-contained files (no imports)
+    /// may be added in any order. An individual set that fails to decode or add is
+    /// logged and skipped, so one malformed channel schema does not make the
+    /// recording unopenable.
+    pub fn from_descriptor_sets(sets: &[&[u8]]) -> Self {
+        use prost_reflect::prost::Message as _;
+        let mut pool = DescriptorPool::new();
+        for bytes in sets {
+            match prost_types::FileDescriptorSet::decode(*bytes) {
+                Ok(fds) => {
+                    if let Err(e) = pool.add_file_descriptor_set(fds) {
+                        eprintln!("replay: skipping embedded schema: {e}");
+                    }
+                }
+                Err(e) => eprintln!("replay: skipping undecodable embedded schema: {e}"),
+            }
+        }
+        let schema_bytes = pool.encode_to_vec();
+        Self { pool, schema_bytes }
+    }
+
+    /// Look up a message descriptor by fully-qualified name.
+    pub fn message_by_name(&self, name: &str) -> Option<MessageDescriptor> {
+        self.pool.get_message_by_name(name)
+    }
+
     #[cfg(test)]
     pub fn pool_for_test(&self) -> &DescriptorPool {
         &self.pool
@@ -190,5 +218,38 @@ message Ping { int64 t_ns = 1; float v = 2; }
         // Must decode back to a valid FileDescriptorSet.
         let fds = prost_types::FileDescriptorSet::decode(bytes).unwrap();
         assert!(!fds.file.is_empty());
+    }
+
+    #[test]
+    fn from_descriptor_sets_merges_and_resolves() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let pa = dir.path().join("a.proto");
+        let pb = dir.path().join("b.proto");
+        write!(std::fs::File::create(&pa).unwrap(),
+            "syntax = \"proto3\";\nmessage MsgA {{ int64 t = 1; double v = 2; }}\n").unwrap();
+        write!(std::fs::File::create(&pb).unwrap(),
+            "syntax = \"proto3\";\nmessage MsgB {{ int64 t = 1; bool v = 2; }}\n").unwrap();
+        let sa = ProtoSchema::from_path(&pa).unwrap();
+        let sb = ProtoSchema::from_path(&pb).unwrap();
+
+        let merged = ProtoSchema::from_descriptor_sets(&[sa.schema_bytes(), sb.schema_bytes()]);
+        assert!(merged.message_by_name("MsgA").is_some());
+        assert!(merged.message_by_name("MsgB").is_some());
+        assert!(merged.message_by_name("MsgC").is_none());
+    }
+
+    #[test]
+    fn from_descriptor_sets_skips_garbage() {
+        // A garbage set is skipped; a valid one still resolves.
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let pa = dir.path().join("a.proto");
+        write!(std::fs::File::create(&pa).unwrap(),
+            "syntax = \"proto3\";\nmessage MsgA {{ int64 t = 1; double v = 2; }}\n").unwrap();
+        let sa = ProtoSchema::from_path(&pa).unwrap();
+        let garbage: &[u8] = b"not a descriptor set";
+        let merged = ProtoSchema::from_descriptor_sets(&[garbage, sa.schema_bytes()]);
+        assert!(merged.message_by_name("MsgA").is_some());
     }
 }
