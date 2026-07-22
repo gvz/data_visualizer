@@ -461,9 +461,6 @@ impl DataVisApp {
                         }
                         self.add_panel.selected.clear();
                     }
-                    if !self.add_panel.selected.is_empty() && ui.button("Clear").clicked() {
-                        self.add_panel.selected.clear();
-                    }
                 });
             });
     }
