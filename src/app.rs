@@ -232,18 +232,7 @@ impl DataVisApp {
             return;
         };
 
-        if self.ingest_schema_bytes.is_empty() {
-            self.status = "Replay not available in demo mode (no proto schema)".to_string();
-            return;
-        }
-        let schema = match crate::ingest::loader::ProtoSchema::from_bytes(&self.ingest_schema_bytes) {
-            Ok(s) => s,
-            Err(e) => {
-                self.status = format!("Failed to reconstruct schema: {e}");
-                return;
-            }
-        };
-        match PlaybackStore::load(&path, &self.channels, &schema) {
+        match PlaybackStore::load(&path, &self.channels) {
             Ok(playback) => {
                 self.store = playback.clone();
                 self.mode = AppMode::Replay(ReplayState {

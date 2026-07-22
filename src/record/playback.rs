@@ -1,17 +1,52 @@
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
+use prost_reflect::{Kind, MessageDescriptor};
 
 use crate::config::ChannelRegistry;
 use crate::ingest::decode::decode_batch;
 use crate::ingest::loader::ProtoSchema;
-use crate::ingest::router::TopicRouter;
+use crate::ingest::router::{ChannelBinding, TopicRouter};
 use crate::store::ChannelStore;
 use crate::types::{
     ChannelId, ChannelMeta, ChannelSnapshot, NumericVal, Sample, SampleType, TimeWindow,
 };
+
+/// The fully-qualified name of the single message defined by an embedded schema,
+/// e.g. "mqtt.HomeSensorsTemperature". None if the set defines no message.
+fn first_message_name(schema_bytes: &[u8]) -> Option<String> {
+    use prost_reflect::prost::Message as _;
+    let fds = prost_types::FileDescriptorSet::decode(schema_bytes).ok()?;
+    for file in &fds.file {
+        if let Some(msg) = file.message_type.first() {
+            // prost-types 0.13 exposes these as plain Option<String> fields
+            // (no name()/package() accessor methods).
+            let name = msg.name.as_deref().unwrap_or_default();
+            return match file.package.as_deref() {
+                None | Some("") => Some(name.to_string()),
+                Some(pkg) => Some(format!("{pkg}.{name}")),
+            };
+        }
+    }
+    None
+}
+
+/// Map the generated `value` field's protobuf kind to a SampleType.
+fn value_sample_type(desc: &MessageDescriptor) -> Option<SampleType> {
+    let field = desc.get_field_by_name("value")?;
+    Some(match field.kind() {
+        Kind::Double | Kind::Float => SampleType::Float,
+        Kind::Int64 | Kind::Int32 | Kind::Uint64 | Kind::Uint32
+        | Kind::Sint64 | Kind::Sint32 | Kind::Fixed64 | Kind::Fixed32
+        | Kind::Sfixed64 | Kind::Sfixed32 => SampleType::Int,
+        Kind::Bool => SampleType::Bool,
+        Kind::String => SampleType::Text,
+        _ => return None,
+    })
+}
 
 enum PlaybackChannel {
     Float { ts: Vec<i64>, vals: Vec<f64> },
@@ -112,21 +147,70 @@ impl PlaybackStore {
         }
     }
 
-    pub fn load(
-        path: &Path,
-        registry: &ChannelRegistry,
-        schema: &ProtoSchema,
-    ) -> anyhow::Result<Arc<Self>> {
-        let router = TopicRouter::build(registry, schema);
-        let mut store = Self::new(registry);
-
+    pub fn load(path: &Path, registry: &ChannelRegistry) -> anyhow::Result<Arc<Self>> {
         let bytes = std::fs::read(path)
             .with_context(|| format!("reading MCAP file {}", path.display()))?;
+
+        // Pass 1: collect one embedded schema per topic.
+        let mut topic_schemas: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         for message in mcap::MessageStream::new(&bytes)
             .context("opening MCAP message stream")?
         {
             let msg = message.context("reading MCAP message")?;
-            let bindings = router.bindings_for(&msg.channel.topic);
+            if let Some(schema) = &msg.channel.schema {
+                topic_schemas
+                    .entry(msg.channel.topic.clone())
+                    .or_insert_with(|| schema.data.to_vec());
+            }
+        }
+
+        // Merge all embedded schemas into one pool; route known ZMQ topics.
+        let set_refs: Vec<&[u8]> = topic_schemas.values().map(Vec::as_slice).collect();
+        let merged = ProtoSchema::from_descriptor_sets(&set_refs);
+        let router = TopicRouter::build(registry, &merged);
+
+        // Reconstruct topics with no registry binding (MQTT / generated messages).
+        let mut reconstructed: HashMap<String, Vec<ChannelBinding>> = HashMap::new();
+        for (topic, schema_bytes) in &topic_schemas {
+            if !router.bindings_for(topic).is_empty() {
+                continue;
+            }
+            let Some(full) = first_message_name(schema_bytes) else { continue };
+            let Some(desc) = merged.message_by_name(&full) else { continue };
+            if desc.get_field_by_name("t_ns").is_none() {
+                continue;
+            }
+            let Some(sample_type) = value_sample_type(&desc) else { continue };
+            let id = registry.add_dynamic(topic, topic, sample_type);
+            reconstructed.insert(
+                topic.clone(),
+                vec![ChannelBinding {
+                    id,
+                    msg_desc: desc,
+                    val_path: vec!["value".to_string()],
+                    ts_path: vec!["t_ns".to_string()],
+                    eu_scale: 1.0,
+                    eu_offset: 0.0,
+                    sample_type,
+                }],
+            );
+        }
+
+        // Build the store AFTER add_dynamic so reconstructed channels are included.
+        let mut store = Self::new(registry);
+
+        // Pass 2: decode every message into the store.
+        for message in mcap::MessageStream::new(&bytes)
+            .context("opening MCAP message stream")?
+        {
+            let msg = message.context("reading MCAP message")?;
+            let topic = msg.channel.topic.as_str();
+            let zmq = router.bindings_for(topic);
+            let bindings: &[ChannelBinding] = if zmq.is_empty() {
+                reconstructed.get(topic).map(Vec::as_slice).unwrap_or(&[])
+            } else {
+                zmq
+            };
             decode_batch(&msg.data, bindings, &store);
         }
 
@@ -286,7 +370,7 @@ type = "float"
         let mcap_schema = Arc::new(mcap::Schema {
             name: "protobuf".to_string(),
             encoding: "protobuf".to_string(),
-            data: Cow::Borrowed(&[]),
+            data: Cow::Owned(schema.schema_bytes().to_vec()),
         });
         let channel = Arc::new(mcap::Channel {
             topic: "accel".to_string(),
@@ -327,7 +411,7 @@ type = "float"
             (2_000_000_000, 2.0),
             (3_000_000_000, 3.0),
         ]);
-        let store = PlaybackStore::load(&path, &registry, &schema).unwrap();
+        let store = PlaybackStore::load(&path, &registry).unwrap();
         let id = registry.id("accel.x").unwrap();
         let window = TimeWindow { start_ns: 1_000_000_000, end_ns: 3_000_000_000 };
         let snap = store.snapshot(id, window);
@@ -350,7 +434,7 @@ type = "float"
         let dir2 = tempfile::tempdir().unwrap();
         let path = dir2.path().join("test.mcap");
         write_test_mcap(&path, &schema, &[(1_000_000_000, 1.0)]);
-        let store = PlaybackStore::load(&path, &registry, &schema).unwrap();
+        let store = PlaybackStore::load(&path, &registry).unwrap();
         let expected_pos = 42_999_999_999i64;
         store.position_ns.store(expected_pos, Ordering::Relaxed);
         assert_eq!(store.now_ns(), expected_pos);
@@ -365,7 +449,7 @@ type = "float"
             (1_000_000_000, 1.0),
             (3_000_000_000, 3.0),
         ]);
-        let store = PlaybackStore::load(&path, &registry, &schema).unwrap();
+        let store = PlaybackStore::load(&path, &registry).unwrap();
         let id = registry.id("accel.x").unwrap();
 
         // Position before any sample → None
@@ -397,8 +481,180 @@ type = "float"
             (1_000_000_000, 1.0),
             (4_000_000_000, 4.0),
         ]);
-        let store = PlaybackStore::load(&path, &registry, &schema).unwrap();
+        let store = PlaybackStore::load(&path, &registry).unwrap();
         assert_eq!(store.start_ns, 1_000_000_000);
         assert_eq!(store.duration_ns, 3_000_000_000);
+    }
+
+    /// Write a single-message MCAP for one MQTT topic using the recorder's own
+    /// schema generator, so the embedded schema matches production exactly.
+    fn write_mqtt_mcap(path: &std::path::Path, topic: &str, payloads: &[(i64, &str)]) {
+        use crate::record::mqtt_schema::DynamicProtoRegistry;
+        use std::borrow::Cow;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let mut reg = DynamicProtoRegistry::new();
+        let file = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+        let mut writer = mcap::Writer::new(file).unwrap();
+        let mut channel: Option<Arc<mcap::Channel>> = None;
+        for (ts, payload) in payloads {
+            let (schema_bytes, data) = reg.record_frame(topic, *ts, payload).unwrap();
+            let ch = channel.get_or_insert_with(|| {
+                Arc::new(mcap::Channel {
+                    topic: topic.to_string(),
+                    schema: Some(Arc::new(mcap::Schema {
+                        name: topic.to_string(),
+                        encoding: "protobuf".to_string(),
+                        data: Cow::Owned(schema_bytes.to_vec()),
+                    })),
+                    message_encoding: "protobuf".to_string(),
+                    metadata: BTreeMap::new(),
+                })
+            });
+            writer.write(&mcap::Message {
+                channel: ch.clone(),
+                sequence: 0,
+                log_time: *ts as u64,
+                publish_time: *ts as u64,
+                data: Cow::Owned(data),
+            }).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn mqtt_topic_reconstructed_from_embedded_schema() {
+        // Registry does NOT contain the MQTT topic.
+        let registry = ChannelRegistry::from_toml_str(r#"
+[channels."accel.x"]
+topic = "accel"
+proto_path = "AccelBatch.samples.x"
+ts_path = "AccelBatch.samples.t_ns"
+type = "float"
+"#).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mqtt.mcap");
+        write_mqtt_mcap(&path, "home/temp", &[(1_000_000_000, "21.5"), (2_000_000_000, "22.0")]);
+
+        let store = PlaybackStore::load(&path, &registry).unwrap();
+        let id = registry.id("home/temp").expect("reconstructed channel registered");
+        assert_eq!(registry.meta(id).sample_type, SampleType::Float);
+
+        let window = TimeWindow { start_ns: i64::MIN, end_ns: i64::MAX };
+        match store.snapshot(id, window) {
+            ChannelSnapshot::Float { ts, vals } => {
+                assert_eq!(ts, vec![1_000_000_000, 2_000_000_000]);
+                assert!((vals[0] - 21.5).abs() < 1e-4);
+                assert!((vals[1] - 22.0).abs() < 1e-4);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mixed_zmq_and_mqtt_topics_both_decode() {
+        use prost_reflect::prost::Message as _;
+        use prost_reflect::{DynamicMessage, Value};
+        use crate::record::mqtt_schema::DynamicProtoRegistry;
+        use std::borrow::Cow;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let (schema, _dir, registry) = make_proto_and_registry(); // registers "accel.x" on topic "accel"
+        let dir2 = tempfile::tempdir().unwrap();
+        let path = dir2.path().join("mixed.mcap");
+
+        // ZMQ channel (embedded AccelBatch schema).
+        let pool = schema.pool_for_test();
+        let batch_desc = pool.get_message_by_name("AccelBatch").unwrap();
+        let sample_desc = pool.get_message_by_name("AccelBatch.Sample").unwrap();
+        let t_field = sample_desc.get_field_by_name("t_ns").unwrap();
+        let x_field = sample_desc.get_field_by_name("x").unwrap();
+        let samples_field = batch_desc.get_field_by_name("samples").unwrap();
+        let accel_channel = Arc::new(mcap::Channel {
+            topic: "accel".to_string(),
+            schema: Some(Arc::new(mcap::Schema {
+                name: "protobuf".to_string(),
+                encoding: "protobuf".to_string(),
+                data: Cow::Owned(schema.schema_bytes().to_vec()),
+            })),
+            message_encoding: "protobuf".to_string(),
+            metadata: BTreeMap::new(),
+        });
+
+        // MQTT channel (generated schema).
+        let mut reg = DynamicProtoRegistry::new();
+        let (mqtt_schema_bytes, mqtt_data) = reg.record_frame("home/temp", 1_500_000_000, "30.0").unwrap();
+        let mqtt_channel = Arc::new(mcap::Channel {
+            topic: "home/temp".to_string(),
+            schema: Some(Arc::new(mcap::Schema {
+                name: "home/temp".to_string(),
+                encoding: "protobuf".to_string(),
+                data: Cow::Owned(mqtt_schema_bytes.to_vec()),
+            })),
+            message_encoding: "protobuf".to_string(),
+            metadata: BTreeMap::new(),
+        });
+
+        let file = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+        let mut writer = mcap::Writer::new(file).unwrap();
+        // one accel batch sample
+        let list = vec![{
+            let mut s = DynamicMessage::new(sample_desc.clone());
+            s.set_field(&t_field, Value::I64(1_000_000_000));
+            s.set_field(&x_field, Value::F32(1.0));
+            Value::Message(s)
+        }];
+        let mut batch = DynamicMessage::new(batch_desc.clone());
+        batch.set_field(&samples_field, Value::List(list));
+        writer.write(&mcap::Message {
+            channel: accel_channel, sequence: 0,
+            log_time: 1_000_000_000, publish_time: 1_000_000_000,
+            data: Cow::Owned(batch.encode_to_vec()),
+        }).unwrap();
+        writer.write(&mcap::Message {
+            channel: mqtt_channel, sequence: 0,
+            log_time: 1_500_000_000, publish_time: 1_500_000_000,
+            data: Cow::Owned(mqtt_data),
+        }).unwrap();
+        writer.finish().unwrap();
+
+        let store = PlaybackStore::load(&path, &registry).unwrap();
+        let all = TimeWindow { start_ns: i64::MIN, end_ns: i64::MAX };
+
+        let accel_id = registry.id("accel.x").unwrap();
+        match store.snapshot(accel_id, all) {
+            ChannelSnapshot::Float { ts, .. } => assert_eq!(ts, vec![1_000_000_000]),
+            other => panic!("accel wrong variant: {other:?}"),
+        }
+        let mqtt_id = registry.id("home/temp").unwrap();
+        match store.snapshot(mqtt_id, all) {
+            ChannelSnapshot::Float { ts, vals } => {
+                assert_eq!(ts, vec![1_500_000_000]);
+                assert!((vals[0] - 30.0).abs() < 1e-4);
+            }
+            other => panic!("mqtt wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn value_sample_type_maps_kinds() {
+        use crate::record::mqtt_schema::DynamicProtoRegistry;
+        let mut reg = DynamicProtoRegistry::new();
+        // Each first payload locks a distinct type; grab the generated descriptor
+        // back out via the merged pool and check value_sample_type.
+        for (topic, payload, expected) in [
+            ("t/f", "3.14", SampleType::Float),
+            ("t/i", "7", SampleType::Int),
+            ("t/b", "true", SampleType::Bool),
+            ("t/s", "hello", SampleType::Text),
+        ] {
+            let (schema_bytes, _data) = reg.record_frame(topic, 1, payload).unwrap();
+            let full = first_message_name(&schema_bytes).unwrap();
+            let merged = ProtoSchema::from_descriptor_sets(&[&schema_bytes]);
+            let desc = merged.message_by_name(&full).unwrap();
+            assert_eq!(value_sample_type(&desc), Some(expected), "topic {topic}");
+        }
     }
 }
