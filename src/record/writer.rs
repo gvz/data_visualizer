@@ -14,7 +14,10 @@ use crate::record::queue::RecordMsg;
 
 struct McapRecorder {
     writer: mcap::Writer<'static, BufWriter<File>>,
+    /// ZMQ/Proto channels: pre-seeded from the ChannelRegistry at startup.
     channel_ids: HashMap<String, u16>,
+    /// DynamicProto (MQTT) channels: registered on first sight, separate namespace.
+    dynamic_channel_ids: HashMap<String, u16>,
     last_flush: Instant,
     sequence: u32,
 }
@@ -52,16 +55,15 @@ impl McapRecorder {
         Ok(Self {
             writer,
             channel_ids,
+            dynamic_channel_ids: HashMap::new(),
             last_flush: Instant::now(),
             sequence: 0,
         })
     }
 
-    fn write_msg(&mut self, topic: &str, data: &[u8], log_time_ns: i64) -> anyhow::Result<()> {
-        let Some(&channel_id) = self.channel_ids.get(topic) else {
-            return Ok(()); // unknown topic, skip
-        };
-
+    /// Write raw bytes to a known channel id, incrementing the sequence counter
+    /// and flushing periodically.
+    fn write_to_channel(&mut self, channel_id: u16, data: &[u8], log_time_ns: i64) -> anyhow::Result<()> {
         let seq = self.sequence;
         self.sequence = self.sequence.wrapping_add(1);
 
@@ -83,8 +85,16 @@ impl McapRecorder {
         Ok(())
     }
 
+    fn write_msg(&mut self, topic: &str, data: &[u8], log_time_ns: i64) -> anyhow::Result<()> {
+        let Some(&channel_id) = self.channel_ids.get(topic) else {
+            return Ok(()); // unknown topic, skip
+        };
+        self.write_to_channel(channel_id, data, log_time_ns)
+    }
+
     /// Write a message whose protobuf schema is supplied inline. Registers a new
     /// MCAP channel (with its own schema) the first time a topic is seen.
+    /// Uses `dynamic_channel_ids` exclusively — never shares namespace with `channel_ids`.
     fn write_dynamic(
         &mut self,
         topic: &str,
@@ -92,7 +102,7 @@ impl McapRecorder {
         data: &[u8],
         log_time_ns: i64,
     ) -> anyhow::Result<()> {
-        if !self.channel_ids.contains_key(topic) {
+        if !self.dynamic_channel_ids.contains_key(topic) {
             let schema = Arc::new(mcap::Schema {
                 name: topic.to_string(),
                 encoding: "protobuf".to_string(),
@@ -105,9 +115,10 @@ impl McapRecorder {
                 metadata: BTreeMap::new(),
             };
             let channel_id = self.writer.add_channel(&channel)?;
-            self.channel_ids.insert(topic.to_string(), channel_id);
+            self.dynamic_channel_ids.insert(topic.to_string(), channel_id);
         }
-        self.write_msg(topic, data, log_time_ns)
+        let &channel_id = self.dynamic_channel_ids.get(topic).unwrap();
+        self.write_to_channel(channel_id, data, log_time_ns)
     }
 
     fn finish(mut self) -> anyhow::Result<()> {
@@ -329,6 +340,51 @@ type = "float"
         // The repeated topic reused the first channel.
         let temp_count = messages.iter().filter(|m| m.channel.topic == "home/temp").count();
         assert_eq!(temp_count, 2);
+    }
+
+    #[test]
+    fn dynamic_proto_topic_colliding_with_registry_gets_own_schema() {
+        // Registry pre-seeds ZMQ topic "accel" with the shared (empty) schema.
+        // A DynamicProto message on the same topic string must be recorded under
+        // its OWN schema, not the pre-seeded ZMQ schema.
+        let dir = tempfile::tempdir().unwrap();
+        let registry = minimal_registry();
+        let (tx, rx) = record_channel();
+        let handle = start_recording(dir.path(), &registry, vec![], rx).unwrap();
+
+        let mqtt_schema: &[u8] = b"mqtt_schema_for_accel";
+        tx.try_send(RecordMsg::DynamicProto {
+            topic: Arc::from("accel"),
+            schema: Arc::from(mqtt_schema),
+            data: vec![0xDE, 0xAD],
+            ts: 1_000_000,
+        })
+        .unwrap();
+
+        drop(tx);
+        drop(handle);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|x| x == "mcap").unwrap_or(false))
+            .collect();
+        assert_eq!(entries.len(), 1);
+
+        let bytes = std::fs::read(entries[0].path()).unwrap();
+        let messages: Vec<_> = mcap::MessageStream::new(&bytes)
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        // Exactly one message was written (the DynamicProto one; no ZMQ "accel" messages sent).
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].channel.topic, "accel");
+        assert_eq!(messages[0].data.as_ref(), &[0xDE_u8, 0xAD]);
+        // The channel must carry the MQTT schema, not the empty shared ZMQ schema.
+        let schema_data = messages[0].channel.schema.as_ref().unwrap().data.as_ref();
+        assert_eq!(schema_data, mqtt_schema, "DynamicProto message was recorded under the wrong schema");
     }
 }
 
