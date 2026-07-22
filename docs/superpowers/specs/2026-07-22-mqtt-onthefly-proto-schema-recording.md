@@ -117,18 +117,23 @@ identifier.
 - If the result is empty or starts with a digit, prefix `T`.
 - If the name is already in `used_names`, append `_2`, `_3`, … until unique.
 
-**Type inference keywords** (Bool): the true set is
-`"1" | "true" | "True" | "TRUE" | "on" | "ON" | "yes" | "YES"`; the false set is
-`"0" | "false" | "False" | "FALSE" | "off" | "OFF" | "no" | "NO"`. A payload that
-matches either set infers `Bool`. (Reuses the existing live-path truthy list and
-adds the symmetric falsy list so a first sample of `"0"` does not infer Int.)
+**Bool token sets** (used by both inference and encoding):
+
+- true set: `"1" | "true" | "True" | "TRUE" | "on" | "ON" | "yes" | "YES"`
+- false set: `"0" | "false" | "False" | "FALSE" | "off" | "OFF" | "no" | "NO"`
+
+**Inference order** (`infer_type`): try `i64` → Int; else `f64` → Float; else a
+**textual** bool token (the true/false sets minus `"1"` and `"0"`) → Bool; else
+Text. Numeric `"1"`/`"0"` therefore infer Int, not Bool — a value alone cannot
+distinguish a boolean from an integer, and i64-first is the deterministic choice.
 
 **Encoding parse rules** (must match the locked type, else `None`):
 
 - Float: `payload.parse::<f64>()`
 - Int: `payload.parse::<i64>()`
 - Bool: payload in the true set → `true`; in the false set → `false`; otherwise
-  `None`
+  `None` (the encode-time bool sets include `"1"`/`"0"`, so a topic locked to Bool
+  by a textual first sample still records later numeric `1`/`0`)
 - Text: always `Some(payload.to_string())`
 
 ### 2. `RecordMsg` becomes an enum (`src/record/queue.rs`)
