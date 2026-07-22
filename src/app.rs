@@ -113,6 +113,11 @@ pub struct DataVisApp {
     live_view_ns: Arc<AtomicI64>,
     live_view_offset_ns: i64,
     live_history_s: f64,
+    /// When true the live view is frozen at `live_pause_ns` (absolute wall-clock
+    /// ns). The store keeps ingesting; resuming returns to live and shows the
+    /// data buffered during the pause.
+    live_paused: bool,
+    live_pause_ns: i64,
     /// App-wide default visible time span (seconds); panels without an explicit
     /// override follow it. Published to egui ctx data each frame.
     default_window_s: f64,
@@ -166,6 +171,8 @@ impl DataVisApp {
             live_view_ns,
             live_view_offset_ns: 0,
             live_history_s,
+            live_paused: false,
+            live_pause_ns: 0,
             default_window_s,
         }
     }
@@ -272,6 +279,7 @@ impl DataVisApp {
         self.store = self.live_store.clone();
         self.mode = AppMode::Live;
         self.live_view_offset_ns = 0;
+        self.live_paused = false;
         self.status = "Replay closed".to_string();
     }
 
@@ -547,7 +555,9 @@ impl eframe::App for DataVisApp {
         // Keep the live store's view_override in sync with the scrub offset.
         // 0 means "use wall clock"; non-zero freezes the view at that ns value.
         if matches!(self.mode, AppMode::Live) {
-            let v = if self.live_view_offset_ns != 0 {
+            let v = if self.live_paused {
+                self.live_pause_ns
+            } else if self.live_view_offset_ns != 0 {
                 crate::types::now_ns() + self.live_view_offset_ns
             } else {
                 0
@@ -577,17 +587,36 @@ impl eframe::App for DataVisApp {
         if let AppMode::Live = self.mode {
             egui::TopBottomPanel::bottom("live_timeline").show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    let pause_label = if self.live_paused { "Resume" } else { "Pause" };
+                    if ui.button(pause_label).clicked() {
+                        if self.live_paused {
+                            self.live_paused = false;
+                        } else {
+                            // Freeze whatever is on screen: the scrubbed instant
+                            // if scrolled back, otherwise the current wall clock.
+                            self.live_pause_ns = if self.live_view_offset_ns != 0 {
+                                crate::types::now_ns() + self.live_view_offset_ns
+                            } else {
+                                crate::types::now_ns()
+                            };
+                            self.live_paused = true;
+                        }
+                    }
                     let right_reserved = 70.0;
                     let slider_w = (ui.available_width() - right_reserved).max(60.0);
                     let mut offset_secs = self.live_view_offset_ns as f64 / 1e9;
-                    if ui
-                        .add_sized(
-                            [slider_w, ui.spacing().interact_size.y],
-                            egui::Slider::new(&mut offset_secs, -self.live_history_s..=0.0)
-                                .show_value(false),
-                        )
-                        .changed()
-                    {
+                    // Scrubbing is disabled while paused (the view is frozen).
+                    let mut changed = false;
+                    ui.add_enabled_ui(!self.live_paused, |ui| {
+                        changed = ui
+                            .add_sized(
+                                [slider_w, ui.spacing().interact_size.y],
+                                egui::Slider::new(&mut offset_secs, -self.live_history_s..=0.0)
+                                    .show_value(false),
+                            )
+                            .changed();
+                    });
+                    if changed {
                         // Snap to live within 100 ms of the right edge.
                         self.live_view_offset_ns = if offset_secs > -0.1 {
                             0
@@ -595,7 +624,9 @@ impl eframe::App for DataVisApp {
                             (offset_secs * 1e9) as i64
                         };
                     }
-                    if self.live_view_offset_ns == 0 {
+                    if self.live_paused {
+                        ui.colored_label(egui::Color32::YELLOW, "PAUSED");
+                    } else if self.live_view_offset_ns == 0 {
                         ui.colored_label(egui::Color32::LIGHT_GREEN, "LIVE");
                     } else {
                         ui.label(format!("{:.1}s", self.live_view_offset_ns as f64 / 1e9));
