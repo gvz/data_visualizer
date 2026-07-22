@@ -659,8 +659,15 @@ Add to the `tests` module in `src/ingest/mqtt.rs`:
     fn record_publish_noop_when_no_sender() {
         use crate::record::mqtt_schema::DynamicProtoRegistry;
         let mut reg = DynamicProtoRegistry::new();
-        // No sender installed → must not panic, nothing to assert beyond that.
-        record_publish(&mut reg, &None, "x/y", "1", 0);
+        // No sender → returns before touching the registry, so no type is locked.
+        record_publish(&mut reg, &None, "x/y", "hello", 0);
+        // A later Int sample therefore still infers Int (would be Text if the
+        // earlier "hello" had locked the topic).
+        let (schema, data) = reg.record_frame("x/y", 1, "5").unwrap();
+        let pool = prost_reflect::DescriptorPool::decode(schema.as_ref()).unwrap();
+        let desc = pool.get_message_by_name("mqtt.XY").unwrap();
+        let msg = prost_reflect::DynamicMessage::decode(desc, data.as_ref()).unwrap();
+        assert_eq!(msg.get_field_by_name("value").unwrap().as_i64(), Some(5));
     }
 ```
 
