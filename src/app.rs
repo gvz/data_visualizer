@@ -1,11 +1,12 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use crate::channel_tree::ChannelTree;
+use crate::channel_tree::{render_topic_list, ChannelTree};
 use crate::config::{ChannelRegistry, LayoutConfig, PanelEntry};
 use crate::record::playback::PlaybackStore;
 use crate::record::{start_recording, RecordHandle};
@@ -81,15 +82,27 @@ pub struct DataVisApp {
     mode: AppMode,
     // Recording state
     record_handle: Option<RecordHandle>,
-    record_sender_slot: Option<Arc<Mutex<Option<crossbeam_channel::Sender<crate::record::RecordMsg>>>>>,
+    record_sender_slots: Vec<Arc<Mutex<Option<crossbeam_channel::Sender<crate::record::RecordMsg>>>>>,
     ingest_schema_bytes: Vec<u8>,
     // Channel picker sidebar
     channel_tree: ChannelTree,
     sidebar_visible: bool,
+    /// MQTT discovered topics — populated by the MQTT ingest thread via `#`.
+    mqtt_topics: Option<Arc<Mutex<BTreeMap<String, String>>>>,
+    /// Shared topic→channel routing table; extended when an MQTT topic is
+    /// dropped onto a panel so the ingest thread starts routing it.
+    mqtt_topic_map: Option<Arc<crate::dynamic_channel::MqttTopicMap>>,
+    /// Snapshot of mqtt_topics updated at 1 Hz so the UI doesn't lock every frame.
+    mqtt_snapshot: BTreeMap<String, String>,
+    mqtt_snapshot_at: Instant,
+    dark_mode: bool,
     // Live scrub
     live_view_ns: Arc<AtomicI64>,
     live_view_offset_ns: i64,
     live_history_s: f64,
+    /// App-wide default visible time span (seconds); panels without an explicit
+    /// override follow it. Published to egui ctx data each frame.
+    default_window_s: f64,
 }
 
 impl DataVisApp {
@@ -100,10 +113,13 @@ impl DataVisApp {
         workspace: Workspace,
         layout_path: PathBuf,
         conn_state: Option<Arc<std::sync::atomic::AtomicU8>>,
-        record_sender_slot: Option<Arc<Mutex<Option<crossbeam_channel::Sender<crate::record::RecordMsg>>>>>,
+        record_sender_slots: Vec<Arc<Mutex<Option<crossbeam_channel::Sender<crate::record::RecordMsg>>>>>,
         ingest_schema_bytes: Vec<u8>,
         live_view_ns: Arc<AtomicI64>,
         live_history_s: f64,
+        mqtt_topics: Option<Arc<Mutex<BTreeMap<String, String>>>>,
+        mqtt_topic_map: Option<Arc<crate::dynamic_channel::MqttTopicMap>>,
+        default_window_s: f64,
     ) -> Self {
         let panel_type = registry
             .type_names()
@@ -124,18 +140,31 @@ impl DataVisApp {
             conn_state,
             mode: AppMode::Live,
             record_handle: None,
-            record_sender_slot,
+            record_sender_slots,
             ingest_schema_bytes,
             channel_tree,
             sidebar_visible: true,
+            mqtt_topics,
+            mqtt_topic_map,
+            mqtt_snapshot: BTreeMap::new(),
+            mqtt_snapshot_at: Instant::now() - Duration::from_secs(2),
+            dark_mode: false,
             live_view_ns,
             live_view_offset_ns: 0,
             live_history_s,
+            default_window_s,
         }
     }
 
+    /// Current layout including the app-wide window default.
+    fn current_layout(&self) -> LayoutConfig {
+        let mut cfg = self.workspace.to_config();
+        cfg.default_window_s = self.default_window_s;
+        cfg
+    }
+
     fn save_layout(&mut self) {
-        self.status = match self.workspace.to_config().save(&self.layout_path) {
+        self.status = match self.current_layout().save(&self.layout_path) {
             Ok(()) => format!("layout saved to {}", self.layout_path.display()),
             Err(e) => format!("layout save failed: {e}"),
         };
@@ -144,6 +173,7 @@ impl DataVisApp {
     fn load_layout(&mut self) {
         match LayoutConfig::load(&self.layout_path) {
             Ok(cfg) => {
+                self.default_window_s = cfg.default_window_s;
                 self.workspace = Workspace::from_config(&cfg, &self.registry, &self.channels);
                 self.status = format!("layout loaded from {}", self.layout_path.display());
             }
@@ -152,14 +182,14 @@ impl DataVisApp {
     }
 
     fn start_recording(&mut self) {
-        if self.record_sender_slot.is_none() {
-            self.status = "Recording not available in demo mode".to_string();
+        if self.record_sender_slots.is_empty() {
+            self.status = "Recording unavailable (no ingest source)".to_string();
             return;
         }
         let (tx, rx) = crate::record::record_channel();
-        // Install sender so the ingest thread starts queuing messages.
-        if let Some(slot) = &self.record_sender_slot {
-            *slot.lock().unwrap() = Some(tx);
+        // Install the sender into every active ingest source (mpmc queue).
+        for slot in &self.record_sender_slots {
+            *slot.lock().unwrap() = Some(tx.clone());
         }
         match start_recording(
             Path::new("."),
@@ -172,8 +202,8 @@ impl DataVisApp {
                 self.status = "Recording started".to_string();
             }
             Err(e) => {
-                // Remove sender since the recorder won't consume it.
-                if let Some(slot) = &self.record_sender_slot {
+                // Remove senders since the recorder won't consume them.
+                for slot in &self.record_sender_slots {
                     *slot.lock().unwrap() = None;
                 }
                 self.status = format!("Record failed: {e}");
@@ -182,8 +212,8 @@ impl DataVisApp {
     }
 
     fn stop_recording(&mut self) {
-        // Remove sender first so ingest stops queuing, then drop handle to signal recorder.
-        if let Some(slot) = &self.record_sender_slot {
+        // Remove senders first so ingest stops queuing, then drop handle to signal recorder.
+        for slot in &self.record_sender_slots {
             *slot.lock().unwrap() = None;
         }
         self.record_handle = None;
@@ -289,6 +319,25 @@ impl DataVisApp {
                     self.sidebar_visible = !self.sidebar_visible;
                 }
                 ui.separator();
+                ui.label("window [s]:");
+                ui.add(
+                    egui::DragValue::new(&mut self.default_window_s)
+                        .speed(0.1)
+                        .range(0.1..=3600.0),
+                )
+                .on_hover_text("Default visible time span for time-based panels");
+                ui.separator();
+                let theme_label = if self.dark_mode { "Light" } else { "Dark" };
+                if ui.button(theme_label).clicked() {
+                    self.dark_mode = !self.dark_mode;
+                    let visuals = if self.dark_mode {
+                        egui::Visuals::dark()
+                    } else {
+                        egui::Visuals::light()
+                    };
+                    ctx.set_visuals(visuals);
+                }
+                ui.separator();
 
                 match &self.mode {
                     AppMode::Live => {
@@ -356,6 +405,17 @@ impl DataVisApp {
                     .max_height((avail_h - 90.0).max(60.0))
                     .show(ui, |ui| {
                         self.channel_tree.ui(ui, &mut self.add_panel.selected);
+
+                        // Snapshot is refreshed at the top of `update`; here we
+                        // just render whatever topics have been discovered.
+                        if self.mqtt_topics.is_some() && !self.mqtt_snapshot.is_empty() {
+                            ui.separator();
+                            egui::CollapsingHeader::new("MQTT (#)")
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    render_topic_list(ui, &self.mqtt_snapshot);
+                                });
+                        }
                     });
 
                 ui.separator();
@@ -380,16 +440,18 @@ impl DataVisApp {
                     let entry = build_panel_entry(
                         &self.add_panel.panel_type,
                         &self.add_panel.selected,
-                    );
-                    if ui.add_enabled(entry.is_some(), egui::Button::new("Add")).clicked() {
-                        if let Some(e) = entry {
-                            if let Err(err) =
-                                self.workspace.add_panel(&e, &self.registry, &self.channels)
-                            {
-                                self.status = format!("add panel failed: {err}");
-                            }
-                            self.add_panel.selected.clear();
+                    )
+                    .unwrap_or_else(|| crate::config::PanelEntry {
+                        panel_type: self.add_panel.panel_type.clone(),
+                        config: toml::Table::new(),
+                    });
+                    if ui.button("Add").clicked() {
+                        if let Err(err) =
+                            self.workspace.add_panel(&entry, &self.registry, &self.channels)
+                        {
+                            self.status = format!("add panel failed: {err}");
                         }
+                        self.add_panel.selected.clear();
                     }
                     if !self.add_panel.selected.is_empty() && ui.button("Clear").clicked() {
                         self.add_panel.selected.clear();
@@ -458,6 +520,9 @@ impl eframe::App for DataVisApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint();
 
+        // Publish the app-wide default window so panels can read it this frame.
+        crate::viz::common::set_global_window_s(ctx, self.default_window_s);
+
         // Advance playback clock before any rendering.
         if let AppMode::Replay(ref mut rs) = self.mode {
             if rs.playing {
@@ -483,6 +548,21 @@ impl eframe::App for DataVisApp {
                 0
             };
             self.live_view_ns.store(v, Ordering::Relaxed);
+        }
+
+        // Refresh the discovered-MQTT-topic snapshot (throttled) and let panels
+        // re-bind channels that were unknown at layout-load time — e.g. a
+        // drop-created (dynamic) MQTT channel whose topic has just reappeared
+        // after a restart. Runs regardless of sidebar visibility.
+        if self.mqtt_topics.is_some() && self.mqtt_snapshot_at.elapsed() >= Duration::from_secs(1) {
+            if let Some(arc) = &self.mqtt_topics {
+                self.mqtt_snapshot = arc.lock().unwrap().clone();
+            }
+            self.mqtt_snapshot_at = Instant::now();
+            if matches!(self.mode, AppMode::Live) {
+                let mqtt_ctx = self.mqtt_topic_map.as_deref().map(|tm| (tm, &self.mqtt_snapshot));
+                self.workspace.refresh_bindings(&self.channels, self.store.as_ref(), mqtt_ctx);
+            }
         }
 
         self.menu_bar(ctx);
@@ -580,12 +660,22 @@ impl eframe::App for DataVisApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            self.workspace.ui(ui, self.store.as_ref());
+            // Dynamic MQTT-topic binding is only offered in Live mode, where
+            // `self.store` is the growable LiveStore.
+            let mqtt_ctx = if matches!(self.mode, AppMode::Live) {
+                self.mqtt_topic_map
+                    .as_deref()
+                    .map(|tm| (tm, &self.mqtt_snapshot))
+            } else {
+                None
+            };
+            self.workspace
+                .ui(ui, self.store.as_ref(), &self.channels, &self.registry, mqtt_ctx);
         });
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        let _ = self.workspace.to_config().save(&self.layout_path);
+        let _ = self.current_layout().save(&self.layout_path);
     }
 }
 
@@ -633,5 +723,23 @@ mod tests {
         assert_eq!(e.config["y_channel"], toml::Value::String("y".into()));
         assert!(build_panel_entry("xy_scatter", &["x".into()]).is_none());
         assert!(build_panel_entry("xy_scatter", &["a".into(), "b".into(), "c".into()]).is_none());
+    }
+
+    #[test]
+    fn record_sender_slots_install_and_clear() {
+        use std::sync::{Arc, Mutex};
+        let (tx, _rx) = crate::record::record_channel();
+        let slots: Vec<Arc<Mutex<Option<crossbeam_channel::Sender<crate::record::RecordMsg>>>>> =
+            vec![Arc::new(Mutex::new(None)), Arc::new(Mutex::new(None))];
+        // Install into all.
+        for slot in &slots {
+            *slot.lock().unwrap() = Some(tx.clone());
+        }
+        assert!(slots.iter().all(|s| s.lock().unwrap().is_some()));
+        // Clear all.
+        for slot in &slots {
+            *slot.lock().unwrap() = None;
+        }
+        assert!(slots.iter().all(|s| s.lock().unwrap().is_none()));
     }
 }
