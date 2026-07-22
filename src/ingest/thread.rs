@@ -63,7 +63,11 @@ fn connect_and_recv(
                     if let Some(tx) = guard.as_ref() {
                         let log_time_ns = crate::types::now_ns();
                         let topic_arc: Arc<str> = topic.into();
-                        let _ = tx.try_send((topic_arc, parts[1].clone(), log_time_ns));
+                        let _ = tx.try_send(crate::record::RecordMsg::Proto {
+                            topic: topic_arc,
+                            data: parts[1].clone(),
+                            ts: log_time_ns,
+                        });
                     }
                 }
             }

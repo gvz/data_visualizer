@@ -34,7 +34,9 @@ impl McapRecorder {
         let mut seen: HashSet<String> = HashSet::new();
 
         for id in registry.iter_ids() {
-            let topic = registry.config(id).topic.clone();
+            let Some(topic) = registry.config(id).topic.clone() else {
+                continue; // MQTT-only channel; not recorded via ZMQ path
+            };
             if seen.insert(topic.clone()) {
                 let channel = mcap::Channel {
                     topic: topic.clone(),
@@ -81,6 +83,33 @@ impl McapRecorder {
         Ok(())
     }
 
+    /// Write a message whose protobuf schema is supplied inline. Registers a new
+    /// MCAP channel (with its own schema) the first time a topic is seen.
+    fn write_dynamic(
+        &mut self,
+        topic: &str,
+        schema_bytes: &[u8],
+        data: &[u8],
+        log_time_ns: i64,
+    ) -> anyhow::Result<()> {
+        if !self.channel_ids.contains_key(topic) {
+            let schema = Arc::new(mcap::Schema {
+                name: topic.to_string(),
+                encoding: "protobuf".to_string(),
+                data: Cow::Owned(schema_bytes.to_vec()),
+            });
+            let channel = mcap::Channel {
+                topic: topic.to_string(),
+                schema: Some(schema),
+                message_encoding: "protobuf".to_string(),
+                metadata: BTreeMap::new(),
+            };
+            let channel_id = self.writer.add_channel(&channel)?;
+            self.channel_ids.insert(topic.to_string(), channel_id);
+        }
+        self.write_msg(topic, data, log_time_ns)
+    }
+
     fn finish(mut self) -> anyhow::Result<()> {
         self.writer.flush()?;
         self.writer.finish()?;
@@ -108,17 +137,27 @@ fn recorder_loop(
     loop {
         crossbeam_channel::select! {
             recv(record_rx) -> result => match result {
-                Ok((topic, data, ts)) => recorder.write_msg(&topic, &data, ts)?,
+                Ok(msg) => write_record(&mut recorder, msg)?,
                 Err(_) => break,
             },
             recv(stop_rx) -> _ => break,
         }
     }
     // Drain any messages that arrived before stop.
-    while let Ok((topic, data, ts)) = record_rx.try_recv() {
-        recorder.write_msg(&topic, &data, ts)?;
+    while let Ok(msg) = record_rx.try_recv() {
+        write_record(&mut recorder, msg)?;
     }
     recorder.finish()
+}
+
+/// Dispatch a queued frame to the recorder based on its variant.
+fn write_record(recorder: &mut McapRecorder, msg: RecordMsg) -> anyhow::Result<()> {
+    match msg {
+        RecordMsg::Proto { topic, data, ts } => recorder.write_msg(&topic, &data, ts),
+        RecordMsg::DynamicProto { topic, schema, data, ts } => {
+            recorder.write_dynamic(&topic, &schema, &data, ts)
+        }
+    }
 }
 
 /// Called from `src/record/mod.rs::start_recording`.
@@ -173,9 +212,9 @@ type = "float"
         let (tx, rx) = record_channel();
         let handle = start_recording(dir.path(), &registry, schema_bytes, rx).unwrap();
 
-        tx.try_send((Arc::from("accel"), vec![0x01, 0x02], 1_000_000_000))
+        tx.try_send(RecordMsg::Proto { topic: Arc::from("accel"), data: vec![0x01, 0x02], ts: 1_000_000_000 })
             .unwrap();
-        tx.try_send((Arc::from("accel"), vec![0x03, 0x04], 2_000_000_000))
+        tx.try_send(RecordMsg::Proto { topic: Arc::from("accel"), data: vec![0x03, 0x04], ts: 2_000_000_000 })
             .unwrap();
 
         // Drop sender and handle to stop recording and flush file.
@@ -216,8 +255,8 @@ type = "float"
         let handle = start_recording(dir.path(), &registry, vec![], rx).unwrap();
 
         // "gyro" is not in the registry — should be silently dropped
-        tx.try_send((Arc::from("gyro"), vec![0xFF], 1_000)).unwrap();
-        tx.try_send((Arc::from("accel"), vec![0x01], 2_000)).unwrap();
+        tx.try_send(RecordMsg::Proto { topic: Arc::from("gyro"), data: vec![0xFF], ts: 1_000 }).unwrap();
+        tx.try_send(RecordMsg::Proto { topic: Arc::from("accel"), data: vec![0x01], ts: 2_000 }).unwrap();
         drop(tx);
         drop(handle);
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -234,6 +273,62 @@ type = "float"
             .unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].channel.topic, "accel");
+    }
+
+    #[test]
+    fn dynamic_proto_registers_per_topic_schemas() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = minimal_registry();
+        let (tx, rx) = record_channel();
+        // Shared schema empty: MQTT topics carry their own.
+        let handle = start_recording(dir.path(), &registry, vec![], rx).unwrap();
+
+        tx.try_send(RecordMsg::DynamicProto {
+            topic: Arc::from("home/temp"),
+            schema: Arc::from(b"schema_A".as_slice()),
+            data: vec![0x0A],
+            ts: 1_000,
+        })
+        .unwrap();
+        tx.try_send(RecordMsg::DynamicProto {
+            topic: Arc::from("home/door"),
+            schema: Arc::from(b"schema_B".as_slice()),
+            data: vec![0x0B],
+            ts: 2_000,
+        })
+        .unwrap();
+        // Same topic again must NOT register a second channel/schema.
+        tx.try_send(RecordMsg::DynamicProto {
+            topic: Arc::from("home/temp"),
+            schema: Arc::from(b"schema_A".as_slice()),
+            data: vec![0x0C],
+            ts: 3_000,
+        })
+        .unwrap();
+        drop(tx);
+        drop(handle);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|x| x == "mcap").unwrap_or(false))
+            .collect();
+        let bytes = std::fs::read(entries[0].path()).unwrap();
+        let messages: Vec<_> = mcap::MessageStream::new(&bytes)
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        assert_eq!(messages.len(), 3);
+        // Two distinct topics → two distinct channels, each with its own schema.
+        let temp = messages.iter().find(|m| m.channel.topic == "home/temp").unwrap();
+        let door = messages.iter().find(|m| m.channel.topic == "home/door").unwrap();
+        assert_eq!(temp.channel.schema.as_ref().unwrap().data.as_ref(), b"schema_A");
+        assert_eq!(door.channel.schema.as_ref().unwrap().data.as_ref(), b"schema_B");
+        // The repeated topic reused the first channel.
+        let temp_count = messages.iter().filter(|m| m.channel.topic == "home/temp").count();
+        assert_eq!(temp_count, 2);
     }
 }
 

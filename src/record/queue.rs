@@ -1,7 +1,26 @@
 use std::sync::Arc;
 use crossbeam_channel::{Receiver, Sender};
 
-pub type RecordMsg = (Arc<str>, Vec<u8>, i64);
+/// A frame queued for the MCAP recorder.
+///
+/// `Proto` carries a message encoded against the shared schema registered when
+/// recording starts (the ZMQ ingest path). `DynamicProto` carries its own
+/// self-contained protobuf schema (the MQTT path, where schemas are generated
+/// per topic at runtime).
+#[derive(Debug, Clone)]
+pub enum RecordMsg {
+    Proto {
+        topic: Arc<str>,
+        data: Vec<u8>,
+        ts: i64,
+    },
+    DynamicProto {
+        topic: Arc<str>,
+        schema: Arc<[u8]>,
+        data: Vec<u8>,
+        ts: i64,
+    },
+}
 
 pub const QUEUE_CAP: usize = 8192;
 
@@ -18,19 +37,27 @@ mod tests {
         let (tx, rx) = record_channel();
         let topic: Arc<str> = Arc::from("accel");
         let data = vec![1u8, 2, 3];
-        tx.try_send((topic.clone(), data.clone(), 42_000_000)).unwrap();
-        let (t, d, n) = rx.try_recv().unwrap();
-        assert_eq!(t.as_ref(), "accel");
-        assert_eq!(d, data);
-        assert_eq!(n, 42_000_000);
+        tx.try_send(RecordMsg::Proto { topic: topic.clone(), data: data.clone(), ts: 42_000_000 })
+            .unwrap();
+        match rx.try_recv().unwrap() {
+            RecordMsg::Proto { topic: t, data: d, ts } => {
+                assert_eq!(t.as_ref(), "accel");
+                assert_eq!(d, data);
+                assert_eq!(ts, 42_000_000);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 
     #[test]
     fn queue_full_returns_err_does_not_block() {
         let (tx, _rx) = record_channel();
         for i in 0..QUEUE_CAP {
-            tx.try_send((Arc::from("t"), vec![i as u8], i as i64)).unwrap();
+            tx.try_send(RecordMsg::Proto { topic: Arc::from("t"), data: vec![i as u8], ts: i as i64 })
+                .unwrap();
         }
-        assert!(tx.try_send((Arc::from("t"), vec![], 0)).is_err());
+        assert!(tx
+            .try_send(RecordMsg::Proto { topic: Arc::from("t"), data: vec![], ts: 0 })
+            .is_err());
     }
 }
