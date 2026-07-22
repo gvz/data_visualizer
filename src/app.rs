@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use crate::channel_tree::{render_topic_list, ChannelTree};
+use crate::channel_tree::ChannelTree;
 use crate::config::{ChannelRegistry, LayoutConfig, PanelEntry};
 use crate::record::playback::PlaybackStore;
 use crate::record::{start_recording, RecordHandle};
@@ -24,6 +24,17 @@ struct AddPanelDialog {
 }
 
 /// Channel-count rules per panel type. None = invalid selection for that type.
+/// Compact one-line rendering of a channel's latest value for the sidebar tree.
+fn fmt_sample(sample: &crate::types::Sample) -> String {
+    use crate::types::Sample;
+    match sample {
+        Sample::Float(v) => format!("{v:.3}"),
+        Sample::Int(v) => v.to_string(),
+        Sample::Bool(b) => if *b { "ON" } else { "OFF" }.to_string(),
+        Sample::Text(s) => s.clone(),
+    }
+}
+
 pub fn build_panel_entry(panel_type: &str, selected: &[String]) -> Option<PanelEntry> {
     let mut cfg = toml::Table::new();
     match panel_type {
@@ -397,22 +408,22 @@ impl DataVisApp {
                 ui.separator();
 
                 let avail_h = ui.available_height();
+                // One drag-only tree for every channel. Registry (ZMQ + dropped
+                // MQTT) channels get their live value from the store; discovered
+                // MQTT topics not yet in the registry come from the snapshot
+                // (refreshed at the top of `update`).
+                let store = self.store.clone();
+                let now = store.now_ns();
+                let channels = &self.channels;
                 egui::ScrollArea::vertical()
                     .id_source("ch_tree_scroll")
                     .max_height((avail_h - 90.0).max(60.0))
                     .show(ui, |ui| {
-                        self.channel_tree.ui(ui, &mut self.add_panel.selected);
-
-                        // Snapshot is refreshed at the top of `update`; here we
-                        // just render whatever topics have been discovered.
-                        if self.mqtt_topics.is_some() && !self.mqtt_snapshot.is_empty() {
-                            ui.separator();
-                            egui::CollapsingHeader::new("MQTT (#)")
-                                .default_open(true)
-                                .show(ui, |ui| {
-                                    render_topic_list(ui, &self.mqtt_snapshot);
-                                });
-                        }
+                        self.channel_tree.ui(ui, &self.mqtt_snapshot, |name| {
+                            let id = channels.id(name)?;
+                            let (_, sample) = store.latest_at(id, now)?;
+                            Some(fmt_sample(&sample))
+                        });
                     });
 
                 ui.separator();

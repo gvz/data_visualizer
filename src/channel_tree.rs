@@ -14,9 +14,13 @@ enum Node {
 ///
 /// "sensor/imu/accel_x" → Group("sensor") → Group("imu") → Leaf("accel_x")
 /// "demo.sine"          → Leaf("demo.sine")  (no '/' → flat leaf)
+///
+/// Holds the registry channel names; the node hierarchy (and each leaf's live
+/// value) is assembled at render time, so ZMQ and MQTT channels share one
+/// drag-only tree.
 #[derive(Clone)]
 pub struct ChannelTree {
-    roots: Vec<Node>,
+    names: Vec<String>,
 }
 
 fn insert_path(nodes: &mut Vec<Node>, parts: &[&str], full_name: &str, value: Option<String>) {
@@ -45,34 +49,48 @@ fn insert_path(nodes: &mut Vec<Node>, parts: &[&str], full_name: &str, value: Op
 
 impl ChannelTree {
     pub fn build(registry: &ChannelRegistry) -> Self {
+        let names = registry
+            .iter_ids()
+            .map(|id| registry.meta(id).name.clone())
+            .collect();
+        Self { names }
+    }
+
+    /// Assemble the node hierarchy for rendering: every registry channel (value
+    /// looked up via `value_of`) plus any `extra` topics not already in the
+    /// registry (e.g. discovered-but-undropped MQTT topics, value from `extra`).
+    fn assemble(
+        &self,
+        extra: &BTreeMap<String, String>,
+        value_of: &impl Fn(&str) -> Option<String>,
+    ) -> Vec<Node> {
         let mut roots: Vec<Node> = Vec::new();
-        for id in registry.iter_ids() {
-            let name = &registry.meta(id).name;
+        for name in &self.names {
             let parts: Vec<&str> = name.split('/').collect();
-            insert_path(&mut roots, &parts, name, None);
+            insert_path(&mut roots, &parts, name, value_of(name));
         }
-        Self { roots }
+        for (topic, value) in extra {
+            if self.names.iter().any(|n| n == topic) {
+                continue;
+            }
+            let parts: Vec<&str> = topic.split('/').collect();
+            insert_path(&mut roots, &parts, topic, Some(value.clone()));
+        }
+        roots
     }
 
-    /// Render the tree with checkboxes. `selected` is the shared selection list.
-    pub fn ui(&self, ui: &mut egui::Ui, selected: &mut Vec<String>) {
-        for node in &self.roots {
-            render_node(ui, node, selected);
+    /// Render one drag-only "/" tree. Every leaf is a drag source and shows its
+    /// live value dimmed on the right. `extra` are discovered MQTT topics not yet
+    /// in the registry; the workspace resolves which drops can actually bind.
+    pub fn ui(
+        &self,
+        ui: &mut egui::Ui,
+        extra: &BTreeMap<String, String>,
+        value_of: impl Fn(&str) -> Option<String>,
+    ) {
+        for node in &self.assemble(extra, &value_of) {
+            render_topic_node(ui, node);
         }
-    }
-}
-
-/// Render a `BTreeMap<topic, last_value>` as a collapsible "/" tree.
-/// Each leaf shows the topic's last received value dimmed on the right.
-/// All leaves are draggable; the workspace resolves which can actually bind.
-pub fn render_topic_list(ui: &mut egui::Ui, topics: &BTreeMap<String, String>) {
-    let mut roots: Vec<Node> = Vec::new();
-    for (topic, value) in topics {
-        let parts: Vec<&str> = topic.split('/').collect();
-        insert_path(&mut roots, &parts, topic, Some(value.clone()));
-    }
-    for node in &roots {
-        render_topic_node(ui, node);
     }
 }
 
@@ -101,37 +119,6 @@ fn render_topic_node(ui: &mut egui::Ui, node: &Node) {
                             };
                             ui.label(egui::RichText::new(display).small().weak());
                         }
-                    });
-                });
-            });
-        }
-    }
-}
-
-fn render_node(ui: &mut egui::Ui, node: &Node, selected: &mut Vec<String>) {
-    match node {
-        Node::Group { label, children } => {
-            egui::CollapsingHeader::new(label)
-                .default_open(true)
-                .show(ui, |ui| {
-                    for child in children {
-                        render_node(ui, child, selected);
-                    }
-                });
-        }
-        Node::Leaf { label, full_name, .. } => {
-            ui.push_id(full_name.as_str(), |ui| {
-                ui.horizontal(|ui| {
-                    let mut checked = selected.contains(full_name);
-                    if ui.checkbox(&mut checked, "").changed() {
-                        if checked {
-                            selected.push(full_name.clone());
-                        } else {
-                            selected.retain(|n| n != full_name);
-                        }
-                    }
-                    ui.dnd_drag_source(ui.id().with("drag"), full_name.clone(), |ui| {
-                        ui.label(label);
                     });
                 });
             });
@@ -175,23 +162,27 @@ mod tests {
         }
     }
 
+    fn nodes(tree: &ChannelTree) -> Vec<Node> {
+        tree.assemble(&BTreeMap::new(), &|_| None)
+    }
+
     #[test]
     fn flat_channels_become_root_leaves() {
         let r = reg(&[("alpha", "float"), ("beta", "int")]);
-        let tree = ChannelTree::build(&r);
-        assert_eq!(tree.roots.len(), 2);
-        assert!(!is_group(&tree.roots[0]));
-        assert!(!is_group(&tree.roots[1]));
-        assert_eq!(node_label(&tree.roots[0]), "alpha");
-        assert_eq!(node_label(&tree.roots[1]), "beta");
+        let roots = nodes(&ChannelTree::build(&r));
+        assert_eq!(roots.len(), 2);
+        assert!(!is_group(&roots[0]));
+        assert!(!is_group(&roots[1]));
+        assert_eq!(node_label(&roots[0]), "alpha");
+        assert_eq!(node_label(&roots[1]), "beta");
     }
 
     #[test]
     fn slash_groups_siblings_under_one_group() {
         let r = reg(&[("sensors/x", "float"), ("sensors/y", "float")]);
-        let tree = ChannelTree::build(&r);
-        assert_eq!(tree.roots.len(), 1);
-        let group = &tree.roots[0];
+        let roots = nodes(&ChannelTree::build(&r));
+        assert_eq!(roots.len(), 1);
+        let group = &roots[0];
         assert!(is_group(group));
         assert_eq!(node_label(group), "sensors");
         let kids = children(group);
@@ -203,9 +194,9 @@ mod tests {
     #[test]
     fn deep_nesting() {
         let r = reg(&[("a/b/c", "float")]);
-        let tree = ChannelTree::build(&r);
-        assert_eq!(tree.roots.len(), 1);
-        let a = &tree.roots[0];
+        let roots = nodes(&ChannelTree::build(&r));
+        assert_eq!(roots.len(), 1);
+        let a = &roots[0];
         assert!(is_group(a));
         assert_eq!(node_label(a), "a");
         let b = &children(a)[0];
@@ -220,18 +211,44 @@ mod tests {
     fn mixed_grouped_and_flat() {
         // BTreeMap order: "control/mode" < "temperature"
         let r = reg(&[("control/mode", "int"), ("temperature", "float")]);
-        let tree = ChannelTree::build(&r);
-        assert_eq!(tree.roots.len(), 2);
-        assert!(is_group(&tree.roots[0]));
-        assert_eq!(node_label(&tree.roots[0]), "control");
-        assert!(!is_group(&tree.roots[1]));
-        assert_eq!(node_label(&tree.roots[1]), "temperature");
+        let roots = nodes(&ChannelTree::build(&r));
+        assert_eq!(roots.len(), 2);
+        assert!(is_group(&roots[0]));
+        assert_eq!(node_label(&roots[0]), "control");
+        assert!(!is_group(&roots[1]));
+        assert_eq!(node_label(&roots[1]), "temperature");
     }
 
     #[test]
     fn no_channels_gives_empty_tree() {
         let r = reg(&[]);
+        assert!(nodes(&ChannelTree::build(&r)).is_empty());
+    }
+
+    #[test]
+    fn extra_topics_merge_and_dedup_registry() {
+        // "sensors/x" also in registry → not duplicated; "mqtt/temp" is new.
+        let r = reg(&[("sensors/x", "float")]);
         let tree = ChannelTree::build(&r);
-        assert!(tree.roots.is_empty());
+        let mut extra = BTreeMap::new();
+        extra.insert("sensors/x".to_string(), "9".to_string());
+        extra.insert("mqtt/temp".to_string(), "21.5".to_string());
+        let roots = tree.assemble(&extra, &|_| None);
+        // "sensors" group (with single x leaf) + "mqtt" group. x not duplicated.
+        assert_eq!(roots.len(), 2);
+        let sensors = roots.iter().find(|n| node_label(n) == "sensors").unwrap();
+        assert_eq!(children(sensors).len(), 1);
+    }
+
+    #[test]
+    fn leaf_shows_value_from_value_of() {
+        let r = reg(&[("alpha", "float")]);
+        let roots = ChannelTree::build(&r).assemble(&BTreeMap::new(), &|n| {
+            (n == "alpha").then(|| "42".to_string())
+        });
+        match &roots[0] {
+            Node::Leaf { value, .. } => assert_eq!(value.as_deref(), Some("42")),
+            _ => panic!("expected leaf"),
+        }
     }
 }
