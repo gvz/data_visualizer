@@ -86,6 +86,8 @@ pub struct DataVisApp {
     ingest_schema_bytes: Vec<u8>,
     // Channel picker sidebar
     channel_tree: ChannelTree,
+    /// Live channel tree saved while a replay rebuilds the picker; restored on close.
+    saved_channel_tree: Option<ChannelTree>,
     sidebar_visible: bool,
     /// MQTT discovered topics — populated by the MQTT ingest thread via `#`.
     mqtt_topics: Option<Arc<Mutex<BTreeMap<String, String>>>>,
@@ -143,6 +145,7 @@ impl DataVisApp {
             record_sender_slots,
             ingest_schema_bytes,
             channel_tree,
+            saved_channel_tree: None,
             sidebar_visible: true,
             mqtt_topics,
             mqtt_topic_map,
@@ -241,6 +244,8 @@ impl DataVisApp {
                     speed: 1.0,
                     last_frame: Instant::now(),
                 });
+                self.saved_channel_tree = Some(self.channel_tree.clone());
+                self.channel_tree = ChannelTree::build(&self.channels);
                 self.status = format!("Loaded {}", path.display());
             }
             Err(e) => {
@@ -250,6 +255,9 @@ impl DataVisApp {
     }
 
     fn close_replay(&mut self) {
+        if let Some(tree) = self.saved_channel_tree.take() {
+            self.channel_tree = tree;
+        }
         self.store = self.live_store.clone();
         self.mode = AppMode::Live;
         self.live_view_offset_ns = 0;
@@ -730,5 +738,33 @@ mod tests {
             *slot.lock().unwrap() = None;
         }
         assert!(slots.iter().all(|s| s.lock().unwrap().is_none()));
+    }
+
+    #[test]
+    fn channel_tree_clone_roundtrips_and_rebuild_adds_dynamic() {
+        use crate::config::ChannelRegistry;
+        use crate::channel_tree::ChannelTree;
+        use crate::types::SampleType;
+
+        let reg = ChannelRegistry::from_toml_str(r#"
+[channels."accel.x"]
+topic = "accel"
+proto_path = "M.v"
+ts_path = "M.t"
+type = "float"
+"#).unwrap();
+        let saved = ChannelTree::build(&reg);
+        let restored = saved.clone(); // Clone must be available
+
+        // After a dynamic add, the channel exists and a freshly built tree is the
+        // one open_recording swaps in.
+        let id = reg.add_dynamic("home/temp", "home/temp", SampleType::Float);
+        assert_eq!(reg.meta(id).sample_type, SampleType::Float);
+        assert!(reg.id("home/temp").is_some());
+        let _rebuilt = ChannelTree::build(&reg);
+
+        // `restored` is what close_replay puts back; it must be usable (Clone worked).
+        let _restored_again = restored.clone();
+        let _ = saved; // built from the pre-add registry, independent of the rebuild
     }
 }

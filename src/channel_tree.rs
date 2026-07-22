@@ -1,23 +1,31 @@
+use std::collections::BTreeMap;
+
 use eframe::egui;
 
 use crate::config::ChannelRegistry;
 
+#[derive(Clone)]
 enum Node {
     Group { label: String, children: Vec<Node> },
-    Leaf  { label: String, full_name: String },
+    Leaf  { label: String, full_name: String, value: Option<String> },
 }
 
 /// Channel name tree, split on '/' separators.
 ///
 /// "sensor/imu/accel_x" → Group("sensor") → Group("imu") → Leaf("accel_x")
 /// "demo.sine"          → Leaf("demo.sine")  (no '/' → flat leaf)
+#[derive(Clone)]
 pub struct ChannelTree {
     roots: Vec<Node>,
 }
 
-fn insert_path(nodes: &mut Vec<Node>, parts: &[&str], full_name: &str) {
+fn insert_path(nodes: &mut Vec<Node>, parts: &[&str], full_name: &str, value: Option<String>) {
     if parts.len() == 1 {
-        nodes.push(Node::Leaf { label: parts[0].to_string(), full_name: full_name.to_string() });
+        nodes.push(Node::Leaf {
+            label: parts[0].to_string(),
+            full_name: full_name.to_string(),
+            value,
+        });
         return;
     }
     let group_label = parts[0];
@@ -26,11 +34,11 @@ fn insert_path(nodes: &mut Vec<Node>, parts: &[&str], full_name: &str) {
         .position(|n| matches!(n, Node::Group { label, .. } if label == group_label))
     {
         if let Node::Group { children, .. } = &mut nodes[pos] {
-            insert_path(children, &parts[1..], full_name);
+            insert_path(children, &parts[1..], full_name, value);
         }
     } else {
         let mut children = Vec::new();
-        insert_path(&mut children, &parts[1..], full_name);
+        insert_path(&mut children, &parts[1..], full_name, value);
         nodes.push(Node::Group { label: group_label.to_string(), children });
     }
 }
@@ -41,7 +49,7 @@ impl ChannelTree {
         for id in registry.iter_ids() {
             let name = &registry.meta(id).name;
             let parts: Vec<&str> = name.split('/').collect();
-            insert_path(&mut roots, &parts, name);
+            insert_path(&mut roots, &parts, name, None);
         }
         Self { roots }
     }
@@ -50,6 +58,52 @@ impl ChannelTree {
     pub fn ui(&self, ui: &mut egui::Ui, selected: &mut Vec<String>) {
         for node in &self.roots {
             render_node(ui, node, selected);
+        }
+    }
+}
+
+/// Render a `BTreeMap<topic, last_value>` as a collapsible "/" tree.
+/// Each leaf shows the topic's last received value dimmed on the right.
+/// All leaves are draggable; the workspace resolves which can actually bind.
+pub fn render_topic_list(ui: &mut egui::Ui, topics: &BTreeMap<String, String>) {
+    let mut roots: Vec<Node> = Vec::new();
+    for (topic, value) in topics {
+        let parts: Vec<&str> = topic.split('/').collect();
+        insert_path(&mut roots, &parts, topic, Some(value.clone()));
+    }
+    for node in &roots {
+        render_topic_node(ui, node);
+    }
+}
+
+fn render_topic_node(ui: &mut egui::Ui, node: &Node) {
+    match node {
+        Node::Group { label, children } => {
+            egui::CollapsingHeader::new(label)
+                .default_open(true)
+                .show(ui, |ui| {
+                    for child in children {
+                        render_topic_node(ui, child);
+                    }
+                });
+        }
+        Node::Leaf { label, full_name, value } => {
+            ui.push_id(full_name.as_str(), |ui| {
+                ui.dnd_drag_source(ui.id().with("drag"), full_name.clone(), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(label);
+                        if let Some(v) = value {
+                            let display = if v.chars().count() > 10 {
+                                let s: String = v.chars().take(10).collect();
+                                format!("{}…", s)
+                            } else {
+                                v.clone()
+                            };
+                            ui.label(egui::RichText::new(display).small().weak());
+                        }
+                    });
+                });
+            });
         }
     }
 }
@@ -65,15 +119,22 @@ fn render_node(ui: &mut egui::Ui, node: &Node, selected: &mut Vec<String>) {
                     }
                 });
         }
-        Node::Leaf { label, full_name } => {
-            let mut checked = selected.contains(full_name);
-            if ui.checkbox(&mut checked, label).changed() {
-                if checked {
-                    selected.push(full_name.clone());
-                } else {
-                    selected.retain(|n| n != full_name);
-                }
-            }
+        Node::Leaf { label, full_name, .. } => {
+            ui.push_id(full_name.as_str(), |ui| {
+                ui.horizontal(|ui| {
+                    let mut checked = selected.contains(full_name);
+                    if ui.checkbox(&mut checked, "").changed() {
+                        if checked {
+                            selected.push(full_name.clone());
+                        } else {
+                            selected.retain(|n| n != full_name);
+                        }
+                    }
+                    ui.dnd_drag_source(ui.id().with("drag"), full_name.clone(), |ui| {
+                        ui.label(label);
+                    });
+                });
+            });
         }
     }
 }
