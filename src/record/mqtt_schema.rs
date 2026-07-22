@@ -94,11 +94,12 @@ impl DynamicProtoRegistry {
             topic.to_string(),
             TopicEntry { sample_type, descriptor, schema_bytes },
         );
+        self.used_names.insert(msg_name);
         Some(())
     }
 
     /// A unique, valid protobuf message identifier derived from the topic.
-    fn unique_name(&mut self, topic: &str) -> String {
+    fn unique_name(&self, topic: &str) -> String {
         let base = sanitize(topic);
         let mut name = base.clone();
         let mut n = 2;
@@ -106,7 +107,6 @@ impl DynamicProtoRegistry {
             name = format!("{base}_{n}");
             n += 1;
         }
-        self.used_names.insert(name.clone());
         name
     }
 }
