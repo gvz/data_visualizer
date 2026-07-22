@@ -182,6 +182,15 @@ impl PlaybackStore {
             }
             let Some(sample_type) = value_sample_type(&desc) else { continue };
             let id = registry.add_dynamic(topic, topic, sample_type);
+            if registry.meta(id).sample_type != sample_type {
+                eprintln!(
+                    "replay: topic {:?} already registered as {:?}, but this file records it as {:?}; skipping",
+                    topic,
+                    registry.meta(id).sample_type,
+                    sample_type
+                );
+                continue;
+            }
             reconstructed.insert(
                 topic.clone(),
                 vec![ChannelBinding {
@@ -655,6 +664,61 @@ type = "float"
             let merged = ProtoSchema::from_descriptor_sets(&[&schema_bytes]);
             let desc = merged.message_by_name(&full).unwrap();
             assert_eq!(value_sample_type(&desc), Some(expected), "topic {topic}");
+        }
+    }
+
+    #[test]
+    fn reopen_with_conflicting_type_skips_not_corrupts() {
+        // Registry with an unrelated ZMQ channel only — no "home/temp" pre-registered.
+        let registry = ChannelRegistry::from_toml_str(r#"
+[channels."accel.x"]
+topic = "accel"
+proto_path = "AccelBatch.samples.x"
+ts_path = "AccelBatch.samples.t_ns"
+type = "float"
+"#).unwrap();
+
+        // File A: "home/temp" recorded as Float.
+        let dir_a = tempfile::tempdir().unwrap();
+        let path_a = dir_a.path().join("file_a.mcap");
+        write_mqtt_mcap(&path_a, "home/temp", &[(1_000_000_000, "21.5")]);
+
+        let _store_a = PlaybackStore::load(&path_a, &registry).unwrap();
+        let id = registry.id("home/temp").expect("channel registered from file A");
+        assert_eq!(
+            registry.meta(id).sample_type,
+            SampleType::Float,
+            "file A should register home/temp as Float"
+        );
+
+        // File B: same topic "home/temp" but written with a Bool payload.
+        // write_mqtt_mcap uses a fresh DynamicProtoRegistry per call, so the
+        // embedded schema will type the value field as Bool.
+        let dir_b = tempfile::tempdir().unwrap();
+        let path_b = dir_b.path().join("file_b.mcap");
+        write_mqtt_mcap(&path_b, "home/temp", &[(2_000_000_000, "true")]);
+
+        // Must not panic, must not corrupt the existing Float registration.
+        let store_b = PlaybackStore::load(&path_b, &registry).unwrap();
+
+        // The channel type must remain Float — add_dynamic is idempotent by name.
+        assert_eq!(
+            registry.meta(id).sample_type,
+            SampleType::Float,
+            "reopening with conflicting type must not mutate the existing channel meta"
+        );
+
+        // The conflicting Bool samples must have been silently skipped: the
+        // Float snapshot over the full window should be empty.
+        let all = TimeWindow { start_ns: i64::MIN, end_ns: i64::MAX };
+        match store_b.snapshot(id, all) {
+            ChannelSnapshot::Float { ts, vals } => {
+                assert!(
+                    ts.is_empty() && vals.is_empty(),
+                    "conflicting Bool samples must not appear in the Float channel"
+                );
+            }
+            other => panic!("expected Float snapshot, got {other:?}"),
         }
     }
 }
