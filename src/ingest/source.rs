@@ -1,12 +1,14 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::AtomicU8;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crossbeam_channel::Sender;
 
+use crate::config::ChannelRegistry;
 use crate::dynamic_channel::MqttTopicMap;
 use crate::record::RecordMsg;
 use crate::store::ChannelStore;
+use crate::types::{ChannelId, SampleType};
 
 /// A live data input. Constructed with its own config + the channel registry,
 /// then spawned against the shared store; returns one uniform handle.
@@ -39,6 +41,18 @@ pub struct Discovery {
     pub discovered: Arc<Mutex<BTreeMap<String, String>>>,
     /// topic → (id, type); extended when a topic is dropped onto a panel.
     pub topic_map: Arc<MqttTopicMap>,
+}
+
+/// Seed a topic map from the registry's `mqtt_topic` channels. Shared by the
+/// discovery-shaped sources (MQTT, WebSocket) so a dropped/known topic routes.
+pub fn topic_map_from_registry(registry: &ChannelRegistry) -> Arc<MqttTopicMap> {
+    let mut initial: HashMap<String, (ChannelId, SampleType)> = HashMap::new();
+    for id in registry.iter_ids() {
+        if let Some(mqtt_topic) = &registry.config(id).mqtt_topic {
+            initial.insert(mqtt_topic.clone(), (id, registry.meta(id).sample_type));
+        }
+    }
+    Arc::new(RwLock::new(initial))
 }
 
 #[cfg(test)]

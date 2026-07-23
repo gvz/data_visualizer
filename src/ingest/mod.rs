@@ -14,9 +14,11 @@ pub mod router;
 pub mod scalar;
 pub mod source;
 pub mod thread;
+pub mod websocket;
 
 pub use mqtt::{MqttConfig, MqttSource};
 pub use source::{DataSource, Discovery, SourceHandle};
+pub use websocket::{WsConfig, WsSource};
 
 pub const CONNECTING: u8 = 0;
 pub const LIVE: u8 = 1;

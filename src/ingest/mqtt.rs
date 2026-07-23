@@ -1,6 +1,6 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::atomic::AtomicU8;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rumqttc::{Client, Event, MqttOptions, Packet, QoS};
@@ -11,7 +11,7 @@ use crate::ingest::source::{DataSource, Discovery, SourceHandle};
 use crate::ingest::{CONNECTING, LIVE};
 use crate::record::RecordMsg;
 use crate::store::ChannelStore;
-use crate::types::{ChannelId, SampleType};
+use crate::types::SampleType;
 
 pub struct MqttConfig {
     /// Broker address as "host:port" or "host" (defaults to port 1883).
@@ -26,13 +26,7 @@ pub struct MqttSource {
 
 impl MqttSource {
     pub fn new(config: MqttConfig, registry: &ChannelRegistry) -> Self {
-        let mut initial: HashMap<String, (ChannelId, SampleType)> = HashMap::new();
-        for id in registry.iter_ids() {
-            if let Some(mqtt_topic) = &registry.config(id).mqtt_topic {
-                initial.insert(mqtt_topic.clone(), (id, registry.meta(id).sample_type));
-            }
-        }
-        Self { config, topic_map: Arc::new(RwLock::new(initial)) }
+        Self { config, topic_map: crate::ingest::source::topic_map_from_registry(registry) }
     }
 }
 
