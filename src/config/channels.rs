@@ -30,10 +30,10 @@ pub struct ChannelConfig {
     pub unit: String,
     #[serde(default = "default_color")]
     pub color: String,
-    #[serde(default = "default_max_rate")]
-    pub max_rate: u32,
-    #[serde(default = "default_history_s")]
-    pub history_s: f64,
+    #[serde(default)]
+    pub max_rate: Option<u32>,
+    #[serde(default)]
+    pub history_s: Option<f64>,
     #[serde(default = "default_eu_scale")]
     pub eu_scale: f64,
     #[serde(default)]
@@ -45,12 +45,6 @@ pub struct ChannelConfig {
 fn default_color() -> String {
     "#cccccc".to_string()
 }
-fn default_max_rate() -> u32 {
-    1000
-}
-fn default_history_s() -> f64 {
-    10.0
-}
 fn default_eu_scale() -> f64 {
     1.0
 }
@@ -58,9 +52,29 @@ fn default_max_lines() -> usize {
     500
 }
 
+/// Resolve a static channel's max_rate: channel value, else [defaults], else 1000.
+fn resolve_static_rate(cfg: Option<u32>, def: Option<u32>) -> u32 {
+    cfg.or(def).unwrap_or(1000)
+}
+/// Resolve a static channel's history_s: channel value, else [defaults], else 10.0.
+fn resolve_static_history(cfg: Option<f64>, def: Option<f64>) -> f64 {
+    cfg.or(def).unwrap_or(10.0)
+}
+
+/// Global fallbacks for channels that omit `max_rate`/`history_s`. Optional in
+/// channels.toml; precedence is per-channel value → these → hardcoded.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ChannelDefaults {
+    max_rate: Option<u32>,
+    history_s: Option<f64>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ChannelsFile {
+    #[serde(default)]
+    defaults: ChannelDefaults,
     // BTreeMap: sorted names → deterministic ChannelId assignment.
     channels: BTreeMap<String, ChannelConfig>,
 }
@@ -75,15 +89,25 @@ pub struct ChannelRegistry {
     ids: HashMap<String, ChannelId>,
     configs: Vec<ChannelConfig>,
     metas: Vec<ChannelMeta>,
+    /// Parsed [defaults]; applied to runtime-registered dynamic channels.
+    defaults: ChannelDefaults,
     /// Runtime-added name → id. Written only from the UI thread on drop.
     dyn_ids: RwLock<HashMap<String, ChannelId>>,
     dyn_configs: boxcar::Vec<ChannelConfig>,
     dyn_metas: boxcar::Vec<ChannelMeta>,
 }
 
-/// Defaults for a runtime-registered MQTT channel. MQTT is low-rate, so the
-/// ring is sized modestly.
-fn dynamic_channel(name: String, mqtt_topic: String, sample_type: SampleType) -> (ChannelConfig, ChannelMeta) {
+/// Defaults for a runtime-registered MQTT channel. Rate/history come from the
+/// file's [defaults] when present, else the hardcoded dynamic fallbacks
+/// (100 Hz / 30 s — MQTT is low-rate).
+fn dynamic_channel(
+    name: String,
+    mqtt_topic: String,
+    sample_type: SampleType,
+    defaults: &ChannelDefaults,
+) -> (ChannelConfig, ChannelMeta) {
+    let max_rate = defaults.max_rate.unwrap_or(100);
+    let history_s = defaults.history_s.unwrap_or(30.0);
     let cfg = ChannelConfig {
         topic: None,
         proto_path: None,
@@ -92,8 +116,8 @@ fn dynamic_channel(name: String, mqtt_topic: String, sample_type: SampleType) ->
         sample_type,
         unit: String::new(),
         color: default_color(),
-        max_rate: 100,
-        history_s: 30.0,
+        max_rate: None,
+        history_s: None,
         eu_scale: 1.0,
         eu_offset: 0.0,
         max_lines: default_max_lines(),
@@ -103,8 +127,8 @@ fn dynamic_channel(name: String, mqtt_topic: String, sample_type: SampleType) ->
         sample_type,
         unit: String::new(),
         color: default_color(),
-        max_rate: cfg.max_rate,
-        history_s: cfg.history_s,
+        max_rate,
+        history_s,
         max_lines: cfg.max_lines,
     };
     (cfg, meta)
@@ -113,6 +137,7 @@ fn dynamic_channel(name: String, mqtt_topic: String, sample_type: SampleType) ->
 impl ChannelRegistry {
     pub fn from_toml_str(s: &str) -> anyhow::Result<Self> {
         let file: ChannelsFile = toml::from_str(s).context("parsing channels.toml")?;
+        let defaults = file.defaults;
         let mut ids = HashMap::new();
         let mut configs = Vec::new();
         let mut metas = Vec::new();
@@ -123,8 +148,8 @@ impl ChannelRegistry {
                 sample_type: cfg.sample_type,
                 unit: cfg.unit.clone(),
                 color: cfg.color.clone(),
-                max_rate: cfg.max_rate,
-                history_s: cfg.history_s,
+                max_rate: resolve_static_rate(cfg.max_rate, defaults.max_rate),
+                history_s: resolve_static_history(cfg.history_s, defaults.history_s),
                 max_lines: cfg.max_lines,
             });
             configs.push(cfg);
@@ -133,6 +158,7 @@ impl ChannelRegistry {
             ids,
             configs,
             metas,
+            defaults,
             dyn_ids: RwLock::new(HashMap::new()),
             dyn_configs: boxcar::Vec::new(),
             dyn_metas: boxcar::Vec::new(),
@@ -163,7 +189,8 @@ impl ChannelRegistry {
         if let Some(&id) = dyn_ids.get(name) {
             return id;
         }
-        let (cfg, meta) = dynamic_channel(name.to_string(), mqtt_topic.to_string(), sample_type);
+        let (cfg, meta) =
+            dynamic_channel(name.to_string(), mqtt_topic.to_string(), sample_type, &self.defaults);
         // Push config first, then meta: `len()`/`iter_ids()` count metas, so a
         // channel becomes visible only once its config is already in place.
         self.dyn_configs.push(cfg);
@@ -355,5 +382,129 @@ type = "float"
 typo_field = 1
 "#;
         assert!(ChannelRegistry::from_toml_str(bad).is_err());
+    }
+
+    #[test]
+    fn defaults_apply_when_channel_omits_fields() {
+        let reg = ChannelRegistry::from_toml_str(
+            r#"
+[defaults]
+max_rate = 100000
+history_s = 5.0
+
+[channels."x"]
+mqtt_topic = "t"
+type = "float"
+"#,
+        )
+        .unwrap();
+        let id = reg.id("x").unwrap();
+        assert_eq!(reg.meta(id).max_rate, 100_000);
+        assert_eq!(reg.meta(id).history_s, 5.0);
+    }
+
+    #[test]
+    fn per_channel_value_overrides_defaults() {
+        let reg = ChannelRegistry::from_toml_str(
+            r#"
+[defaults]
+max_rate = 100000
+history_s = 5.0
+
+[channels."y"]
+mqtt_topic = "t"
+type = "float"
+max_rate = 1000
+"#,
+        )
+        .unwrap();
+        let id = reg.id("y").unwrap();
+        assert_eq!(reg.meta(id).max_rate, 1000);
+        // history_s not set on the channel → inherits [defaults]
+        assert_eq!(reg.meta(id).history_s, 5.0);
+    }
+
+    #[test]
+    fn no_defaults_table_keeps_static_hardcoded() {
+        let reg = ChannelRegistry::from_toml_str(
+            r#"
+[channels."z"]
+mqtt_topic = "t"
+type = "float"
+"#,
+        )
+        .unwrap();
+        let id = reg.id("z").unwrap();
+        assert_eq!(reg.meta(id).max_rate, 1000);
+        assert_eq!(reg.meta(id).history_s, 10.0);
+    }
+
+    #[test]
+    fn partial_defaults_falls_back_per_field() {
+        let reg = ChannelRegistry::from_toml_str(
+            r#"
+[defaults]
+max_rate = 50000
+
+[channels."x"]
+mqtt_topic = "t"
+type = "float"
+"#,
+        )
+        .unwrap();
+        let id = reg.id("x").unwrap();
+        assert_eq!(reg.meta(id).max_rate, 50_000);
+        // history_s absent everywhere → static hardcoded 10.0
+        assert_eq!(reg.meta(id).history_s, 10.0);
+    }
+
+    #[test]
+    fn defaults_govern_dynamic_channel() {
+        let reg = ChannelRegistry::from_toml_str(
+            r#"
+[defaults]
+max_rate = 100000
+history_s = 5.0
+
+[channels."x"]
+mqtt_topic = "t"
+type = "float"
+"#,
+        )
+        .unwrap();
+        let id = reg.add_dynamic("dyn/topic", "dyn/topic", SampleType::Float);
+        assert_eq!(reg.meta(id).max_rate, 100_000);
+        assert_eq!(reg.meta(id).history_s, 5.0);
+    }
+
+    #[test]
+    fn dynamic_channel_hardcoded_when_no_defaults() {
+        let reg = ChannelRegistry::from_toml_str(
+            r#"
+[channels."x"]
+mqtt_topic = "t"
+type = "float"
+"#,
+        )
+        .unwrap();
+        let id = reg.add_dynamic("dyn/topic", "dyn/topic", SampleType::Float);
+        assert_eq!(reg.meta(id).max_rate, 100);
+        assert_eq!(reg.meta(id).history_s, 30.0);
+    }
+
+    #[test]
+    fn unknown_field_in_defaults_is_rejected() {
+        let err = ChannelRegistry::from_toml_str(
+            r#"
+[defaults]
+max_rate = 100000
+bogus = 1
+
+[channels."x"]
+mqtt_topic = "t"
+type = "float"
+"#,
+        );
+        assert!(err.is_err(), "unknown [defaults] key must be rejected");
     }
 }
