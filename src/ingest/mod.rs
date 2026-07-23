@@ -7,6 +7,7 @@ use crate::record::RecordMsg;
 use crate::store::ChannelStore;
 
 pub mod decode;
+pub mod lineproto;
 pub mod loader;
 pub mod mqtt;
 pub mod router;
