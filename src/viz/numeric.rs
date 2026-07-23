@@ -17,7 +17,21 @@ pub struct NumericPanel {
     label: Option<String>,
     channel: Option<ChannelId>,
     type_ok: bool,
+    /// Unit from the channel's metadata; shown when no override is set.
     unit: String,
+    /// Per-panel unit suffix override; when non-empty it replaces `unit`.
+    unit_override: String,
+}
+
+impl NumericPanel {
+    /// The suffix shown after the value: the override if set, else channel meta.
+    fn effective_unit(&self) -> &str {
+        if self.unit_override.is_empty() {
+            &self.unit
+        } else {
+            &self.unit_override
+        }
+    }
 }
 
 pub fn ctor(
@@ -33,7 +47,14 @@ pub fn ctor(
         }
         None => (true, String::new()),
     };
-    Ok(Box::new(NumericPanel { channel_name, label: opt_label(cfg), channel, type_ok, unit }))
+    Ok(Box::new(NumericPanel {
+        channel_name,
+        label: opt_label(cfg),
+        channel,
+        type_ok,
+        unit,
+        unit_override: opt_str(cfg, "unit"),
+    }))
 }
 
 impl VizPanel for NumericPanel {
@@ -48,6 +69,15 @@ impl VizPanel for NumericPanel {
     fn config_ui(&mut self, ui: &mut egui::Ui) {
         ui.label(format!("channel: {}", self.channel_name));
         label_config_row(ui, &mut self.label, &self.channel_name);
+        ui.horizontal(|ui| {
+            ui.label("unit:");
+            let hint = if self.unit.is_empty() { "e.g. V" } else { &self.unit };
+            ui.add(
+                egui::TextEdit::singleline(&mut self.unit_override)
+                    .desired_width(80.0)
+                    .hint_text(hint),
+            );
+        });
     }
 
     fn render(&mut self, ui: &mut egui::Ui, store: &dyn ChannelStore) {
@@ -78,7 +108,7 @@ impl VizPanel for NumericPanel {
             Some((_, Sample::Bool(b))) => if b { "ON" } else { "OFF" }.to_string(),
             Some((_, Sample::Text(_))) | None => "\u{2014}".to_string(),
         };
-        ui.label(egui::RichText::new(format!("{text} {}", self.unit)).size(32.0));
+        ui.label(egui::RichText::new(format!("{text} {}", self.effective_unit())).size(32.0));
     }
 
     fn serialize(&self) -> toml::Table {
@@ -88,6 +118,9 @@ impl VizPanel for NumericPanel {
             toml::Value::String(self.channel_name.clone()),
         );
         serialize_label(&mut t, &self.label);
+        if !self.unit_override.is_empty() {
+            t.insert("unit".to_string(), toml::Value::String(self.unit_override.clone()));
+        }
         t
     }
 
@@ -114,5 +147,56 @@ impl VizPanel for NumericPanel {
         {
             self.drop_channel(&name, ctx.channels);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn panel(unit: &str, unit_override: &str) -> NumericPanel {
+        NumericPanel {
+            channel_name: "x".into(),
+            label: None,
+            channel: None,
+            type_ok: true,
+            unit: unit.into(),
+            unit_override: unit_override.into(),
+        }
+    }
+
+    #[test]
+    fn override_takes_precedence_over_meta_unit() {
+        assert_eq!(panel("V", "kV").effective_unit(), "kV");
+    }
+
+    #[test]
+    fn empty_override_falls_back_to_meta_unit() {
+        assert_eq!(panel("V", "").effective_unit(), "V");
+    }
+
+    #[test]
+    fn unit_override_round_trips_through_config() {
+        let reg = ChannelRegistry::from_toml_str(
+            "[channels.\"x\"]\nmqtt_topic = \"t\"\ntype = \"float\"\n",
+        )
+        .unwrap();
+        let mut cfg = toml::Table::new();
+        cfg.insert("channel".into(), toml::Value::String("x".into()));
+        cfg.insert("unit".into(), toml::Value::String("psi".into()));
+        let out = ctor(&cfg, &reg).unwrap().serialize();
+        assert_eq!(out.get("unit").and_then(|v| v.as_str()), Some("psi"));
+    }
+
+    #[test]
+    fn no_override_is_not_serialized() {
+        let reg = ChannelRegistry::from_toml_str(
+            "[channels.\"x\"]\nmqtt_topic = \"t\"\ntype = \"float\"\n",
+        )
+        .unwrap();
+        let mut cfg = toml::Table::new();
+        cfg.insert("channel".into(), toml::Value::String("x".into()));
+        let out = ctor(&cfg, &reg).unwrap().serialize();
+        assert!(out.get("unit").is_none());
     }
 }

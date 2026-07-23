@@ -79,11 +79,13 @@ pub(crate) enum AppMode {
     Replay(ReplayState),
 }
 
-/// Ingest-derived fields collapsed from the running sources. `conn_state`,
-/// `mqtt_topics`, `mqtt_topic_map` and `ingest_schema_bytes` take the first
-/// source that provides each — today at most one source provides any given one.
+/// Ingest-derived fields collapsed from the running sources. `mqtt_topics`,
+/// `mqtt_topic_map` and `ingest_schema_bytes` take the first source that
+/// provides each (today at most one does). `conn_states` keeps EVERY source's
+/// state so the status indicator can aggregate — showing LIVE when any source
+/// is live rather than following one arbitrary source that may have no data.
 pub(crate) struct DerivedIngest {
-    pub conn_state: Option<Arc<std::sync::atomic::AtomicU8>>,
+    pub conn_states: Vec<Arc<std::sync::atomic::AtomicU8>>,
     pub record_sender_slots:
         Vec<Arc<Mutex<Option<crossbeam_channel::Sender<crate::record::RecordMsg>>>>>,
     pub ingest_schema_bytes: Vec<u8>,
@@ -93,16 +95,14 @@ pub(crate) struct DerivedIngest {
 
 impl DerivedIngest {
     pub(crate) fn from_handles(handles: Vec<crate::ingest::SourceHandle>) -> Self {
-        let mut conn_state = None;
+        let mut conn_states = Vec::new();
         let mut record_sender_slots = Vec::new();
         let mut ingest_schema_bytes = Vec::new();
         let mut mqtt_topics = None;
         let mut mqtt_topic_map = None;
         for h in handles {
             record_sender_slots.push(h.record_sender);
-            if conn_state.is_none() {
-                conn_state = Some(h.conn_state);
-            }
+            conn_states.push(h.conn_state);
             if let Some(bytes) = h.schema_bytes {
                 if ingest_schema_bytes.is_empty() {
                     ingest_schema_bytes = bytes;
@@ -115,8 +115,28 @@ impl DerivedIngest {
                 }
             }
         }
-        Self { conn_state, record_sender_slots, ingest_schema_bytes, mqtt_topics, mqtt_topic_map }
+        Self { conn_states, record_sender_slots, ingest_schema_bytes, mqtt_topics, mqtt_topic_map }
     }
+}
+
+/// Coarse connection status across all sources for the live indicator. `LIVE`
+/// wins if any source is live (we are receiving data); otherwise `CONNECTING`
+/// while any source is still trying, else `TIMEOUT`. `None` means no sources
+/// (e.g. demo) — treated as live. Priority: LIVE > CONNECTING > TIMEOUT.
+fn aggregate_conn_state(states: &[Arc<std::sync::atomic::AtomicU8>]) -> Option<u8> {
+    use std::sync::atomic::Ordering;
+    if states.is_empty() {
+        return None;
+    }
+    let mut best = crate::ingest::TIMEOUT;
+    for s in states {
+        match s.load(Ordering::Relaxed) {
+            crate::ingest::LIVE => return Some(crate::ingest::LIVE),
+            crate::ingest::CONNECTING => best = crate::ingest::CONNECTING,
+            _ => {}
+        }
+    }
+    Some(best)
 }
 
 /// Top-level eframe app: menu bar, screen tabs, tiled workspace, dialogs.
@@ -130,7 +150,7 @@ pub struct DataVisApp {
     add_panel: AddPanelDialog,
     new_screen_name: String,
     status: String,
-    conn_state: Option<Arc<std::sync::atomic::AtomicU8>>,
+    conn_states: Vec<Arc<std::sync::atomic::AtomicU8>>,
     mode: AppMode,
     // Recording state
     record_handle: Option<RecordHandle>,
@@ -177,7 +197,7 @@ impl DataVisApp {
         default_window_s: f64,
     ) -> Self {
         let DerivedIngest {
-            conn_state,
+            conn_states,
             record_sender_slots,
             ingest_schema_bytes,
             mqtt_topics,
@@ -199,7 +219,7 @@ impl DataVisApp {
             add_panel: AddPanelDialog { panel_type, ..Default::default() },
             new_screen_name: String::new(),
             status: String::new(),
-            conn_state,
+            conn_states,
             mode: AppMode::Live,
             record_handle: None,
             record_sender_slots,
@@ -414,18 +434,31 @@ impl DataVisApp {
 
                 match &self.mode {
                     AppMode::Live => {
-                        // Connection state indicator
-                        let (label, color) = if self.live_paused {
-                            ("PAUSED", egui::Color32::YELLOW)
+                        // Connection state indicator. Light mode needs darker,
+                        // saturated colors — LIGHT_GREEN/YELLOW wash out on white.
+                        let dark = ui.visuals().dark_mode;
+                        let green = if dark {
+                            egui::Color32::LIGHT_GREEN
                         } else {
-                            match self
-                                .conn_state
-                                .as_ref()
-                                .map(|s| s.load(std::sync::atomic::Ordering::Relaxed))
-                            {
-                                None | Some(crate::ingest::LIVE) => ("LIVE", egui::Color32::LIGHT_GREEN),
-                                Some(crate::ingest::CONNECTING) => ("CONNECTING", egui::Color32::YELLOW),
-                                Some(crate::ingest::TIMEOUT) => ("TIMEOUT", egui::Color32::RED),
+                            egui::Color32::from_rgb(0x1a, 0x7f, 0x37)
+                        };
+                        let amber = if dark {
+                            egui::Color32::YELLOW
+                        } else {
+                            egui::Color32::from_rgb(0xb0, 0x6a, 0x00)
+                        };
+                        let red = if dark {
+                            egui::Color32::RED
+                        } else {
+                            egui::Color32::from_rgb(0xc0, 0x28, 0x28)
+                        };
+                        let (label, color) = if self.live_paused {
+                            ("PAUSED", amber)
+                        } else {
+                            match aggregate_conn_state(&self.conn_states) {
+                                None | Some(crate::ingest::LIVE) => ("LIVE", green),
+                                Some(crate::ingest::CONNECTING) => ("CONNECTING", amber),
+                                Some(crate::ingest::TIMEOUT) => ("TIMEOUT", red),
                                 Some(_) => ("?", egui::Color32::GRAY),
                             }
                         };
@@ -890,7 +923,27 @@ mod tests {
         assert_eq!(d.ingest_schema_bytes, vec![1, 2, 3]);
         assert!(d.mqtt_topics.is_some());
         assert!(d.mqtt_topic_map.is_some());
-        assert!(d.conn_state.is_some());
+        // Every source's conn_state is kept (mqtt CONNECTING=0, zmq LIVE=1).
+        assert_eq!(d.conn_states.len(), 2);
+    }
+
+    #[test]
+    fn aggregate_conn_state_prefers_live() {
+        use crate::ingest::{CONNECTING, LIVE, TIMEOUT};
+        use std::sync::atomic::AtomicU8;
+
+        // No sources → None (treated as live, e.g. demo).
+        assert_eq!(aggregate_conn_state(&[]), None);
+        // Any source LIVE wins, even if another is stuck CONNECTING — this is the
+        // MQTT-live-while-ZMQ-has-no-publisher case.
+        let connecting = Arc::new(AtomicU8::new(CONNECTING));
+        let live = Arc::new(AtomicU8::new(LIVE));
+        assert_eq!(aggregate_conn_state(&[connecting.clone(), live]), Some(LIVE));
+        // None live: CONNECTING outranks TIMEOUT.
+        let timeout = Arc::new(AtomicU8::new(TIMEOUT));
+        assert_eq!(aggregate_conn_state(&[timeout.clone(), connecting]), Some(CONNECTING));
+        // All timed out.
+        assert_eq!(aggregate_conn_state(&[timeout]), Some(TIMEOUT));
     }
 
     #[test]

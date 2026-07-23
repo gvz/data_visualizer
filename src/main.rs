@@ -30,11 +30,9 @@ fn main() -> anyhow::Result<()> {
         .map(|id| channels.meta(id).history_s)
         .fold(5.0_f64, f64::max);
 
-    // ZMQ is pushed before MQTT so the connection-status indicator follows the
-    // ZMQ link: `DerivedIngest::from_handles` takes the first handle that reports
-    // a conn_state, and ZMQ is the source that drives it meaningfully (MQTT only
-    // reaches LIVE on broker ConnAck). MQTT discovery is picked regardless of
-    // order, since it is the only discovery-capable source.
+    // The status indicator aggregates every source's conn_state (LIVE if any
+    // source is live), so push order does not affect it. Schema/discovery are
+    // each provided by a single source, so order is irrelevant there too.
     let mut sources: Vec<datavis::ingest::SourceHandle> = Vec::new();
 
     if demo {
