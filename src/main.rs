@@ -87,7 +87,7 @@ fn main() -> anyhow::Result<()> {
 
     eframe::run_native(
         "datavis",
-        eframe::NativeOptions::default(),
+        eframe::NativeOptions { vsync: false, ..Default::default() },
         Box::new(|cc| {
             cc.egui_ctx.set_visuals(eframe::egui::Visuals::light());
             let mut fonts = eframe::egui::FontDefinitions::default();

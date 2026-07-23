@@ -557,7 +557,7 @@ impl DataVisApp {
 
 impl eframe::App for DataVisApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint();
+        ctx.request_repaint_after(Duration::from_millis(16));
 
         // Publish the app-wide default window so panels can read it this frame.
         crate::viz::common::set_global_window_s(ctx, self.default_window_s);
