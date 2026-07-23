@@ -6,10 +6,24 @@ use serde::{Deserialize, Serialize};
 
 /// layout.toml — screens with panel lists. Panel-specific settings stay an
 /// opaque toml::Table here; the viz PanelRegistry interprets them.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+fn default_window_s() -> f64 {
+    10.0
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LayoutConfig {
+    /// App-wide default visible time span (seconds) for time-based panels.
+    /// Declared before `screens`: TOML scalars must serialize before tables.
+    #[serde(default = "default_window_s")]
+    pub default_window_s: f64,
     #[serde(default)]
     pub screens: BTreeMap<String, ScreenConfig>,
+}
+
+impl Default for LayoutConfig {
+    fn default() -> Self {
+        Self { default_window_s: default_window_s(), screens: BTreeMap::new() }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]

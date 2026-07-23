@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use egui_phosphor::regular as icon;
 
 use crate::channel_tree::ChannelTree;
 use crate::config::{ChannelRegistry, LayoutConfig, PanelEntry};
@@ -287,16 +288,16 @@ impl DataVisApp {
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    if ui.button("Save layout").clicked() {
+                    if ui.button(format!("{} Save layout", icon::FLOPPY_DISK)).clicked() {
                         self.save_layout();
                         ui.close_menu();
                     }
-                    if ui.button("Load layout").clicked() {
+                    if ui.button(format!("{} Load layout", icon::FOLDER_OPEN)).clicked() {
                         self.load_layout();
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button("Quit").clicked() {
+                    if ui.button(format!("{} Quit", icon::SIGN_OUT)).clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
@@ -320,18 +321,30 @@ impl DataVisApp {
                 if selected != self.workspace.active {
                     self.workspace.active = selected;
                 }
-                ui.menu_button("+ screen", |ui| {
+                ui.menu_button(format!("{} screen", icon::MONITOR), |ui| {
                     ui.text_edit_singleline(&mut self.new_screen_name);
-                    if ui.button("Create").clicked() && !self.new_screen_name.is_empty() {
+                    if ui
+                        .button(format!("{} Create", icon::CHECK))
+                        .clicked()
+                        && !self.new_screen_name.is_empty()
+                    {
                         let name = std::mem::take(&mut self.new_screen_name);
                         self.workspace.add_screen(&name);
                         ui.close_menu();
                     }
                 });
-                if ui.button("+ panel").clicked() {
+                if ui
+                    .button(icon::PLUS_SQUARE)
+                    .on_hover_text("Add panel")
+                    .clicked()
+                {
                     self.add_panel.open = true;
                 }
-                if ui.selectable_label(self.sidebar_visible, "Channels").clicked() {
+                if ui
+                    .selectable_label(self.sidebar_visible, icon::SIDEBAR_SIMPLE)
+                    .on_hover_text("Toggle channel sidebar")
+                    .clicked()
+                {
                     self.sidebar_visible = !self.sidebar_visible;
                 }
                 ui.separator();
@@ -343,8 +356,9 @@ impl DataVisApp {
                 )
                 .on_hover_text("Default visible time span for time-based panels");
                 ui.separator();
-                let theme_label = if self.dark_mode { "Light" } else { "Dark" };
-                if ui.button(theme_label).clicked() {
+                let (theme_icon, theme_hint) =
+                    if self.dark_mode { (icon::SUN, "Light mode") } else { (icon::MOON, "Dark mode") };
+                if ui.button(theme_icon).on_hover_text(theme_hint).clicked() {
                     self.dark_mode = !self.dark_mode;
                     let visuals = if self.dark_mode {
                         egui::Visuals::dark()
@@ -358,29 +372,41 @@ impl DataVisApp {
                 match &self.mode {
                     AppMode::Live => {
                         // Connection state indicator
-                        let (label, color) = match self
-                            .conn_state
-                            .as_ref()
-                            .map(|s| s.load(std::sync::atomic::Ordering::Relaxed))
-                        {
-                            None | Some(crate::ingest::LIVE) => ("LIVE", egui::Color32::LIGHT_GREEN),
-                            Some(crate::ingest::CONNECTING) => ("CONNECTING", egui::Color32::YELLOW),
-                            Some(crate::ingest::TIMEOUT) => ("TIMEOUT", egui::Color32::RED),
-                            Some(_) => ("?", egui::Color32::GRAY),
+                        let (label, color) = if self.live_paused {
+                            ("PAUSED", egui::Color32::YELLOW)
+                        } else {
+                            match self
+                                .conn_state
+                                .as_ref()
+                                .map(|s| s.load(std::sync::atomic::Ordering::Relaxed))
+                            {
+                                None | Some(crate::ingest::LIVE) => ("LIVE", egui::Color32::LIGHT_GREEN),
+                                Some(crate::ingest::CONNECTING) => ("CONNECTING", egui::Color32::YELLOW),
+                                Some(crate::ingest::TIMEOUT) => ("TIMEOUT", egui::Color32::RED),
+                                Some(_) => ("?", egui::Color32::GRAY),
+                            }
                         };
                         ui.colored_label(color, label);
                         ui.separator();
 
                         // Record controls
                         if self.record_handle.is_none() {
-                            if ui.button("Rec").clicked() {
+                            if ui
+                                .button(egui::RichText::new(icon::RECORD).color(egui::Color32::RED))
+                                .on_hover_text("Record")
+                                .clicked()
+                            {
                                 self.start_recording();
                             }
-                            if ui.button("Open recording").clicked() {
+                            if ui
+                                .button(icon::FOLDER_OPEN)
+                                .on_hover_text("Open recording")
+                                .clicked()
+                            {
                                 self.open_recording();
                             }
                         } else {
-                            if ui.button("Stop Rec").clicked() {
+                            if ui.button(icon::STOP).on_hover_text("Stop recording").clicked() {
                                 self.stop_recording();
                             }
                             if let Some(handle) = &self.record_handle {
@@ -461,7 +487,7 @@ impl DataVisApp {
                         panel_type: self.add_panel.panel_type.clone(),
                         config: toml::Table::new(),
                     });
-                    if ui.button("Add").clicked() {
+                    if ui.button(format!("{} Add", icon::PLUS)).clicked() {
                         if let Err(err) =
                             self.workspace.add_panel(&entry, &self.registry, &self.channels)
                         {
@@ -587,8 +613,9 @@ impl eframe::App for DataVisApp {
         if let AppMode::Live = self.mode {
             egui::TopBottomPanel::bottom("live_timeline").show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    let pause_label = if self.live_paused { "Resume" } else { "Pause" };
-                    if ui.button(pause_label).clicked() {
+                    let (pause_icon, pause_hint) =
+                        if self.live_paused { (icon::PLAY, "Resume") } else { (icon::PAUSE, "Pause") };
+                    if ui.button(pause_icon).on_hover_text(pause_hint).clicked() {
                         if self.live_paused {
                             self.live_paused = false;
                         } else {
@@ -679,7 +706,7 @@ impl eframe::App for DataVisApp {
                     let dur_secs = dur as f64 / 1e9;
                     ui.label(format!("{:.1}s / {:.1}s", t_secs, dur_secs));
 
-                    if ui.button("Close").clicked() {
+                    if ui.button(icon::X).on_hover_text("Close recording").clicked() {
                         close_replay = true;
                     }
                 });

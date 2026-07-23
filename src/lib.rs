@@ -2,6 +2,7 @@ pub mod app;
 pub mod channel_tree;
 pub mod config;
 pub mod demo;
+pub mod dynamic_channel;
 pub mod ingest;
 pub mod record;
 pub mod store;

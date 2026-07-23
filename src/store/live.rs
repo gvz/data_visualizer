@@ -19,34 +19,37 @@ struct ChannelSlot {
     data: ChannelData,
 }
 
-/// Live store: one typed slot per configured channel, indexed by ChannelId.
+/// Live store: one typed slot per channel, indexed by ChannelId. The slot
+/// list is append-only (`boxcar::Vec`) so runtime channels can be added with
+/// `&self` while ingest writes to existing slots; existing `&`-borrows stay
+/// valid across a push.
 pub struct LiveStore {
-    channels: Vec<ChannelSlot>,
+    channels: boxcar::Vec<ChannelSlot>,
     type_errors: AtomicU64,
     /// When non-zero, `now_ns()` returns this value instead of the wall clock.
     /// Set by the app to implement live scrubbing without entering replay mode.
     pub view_override: Arc<AtomicI64>,
 }
 
+/// Build a typed ring slot from a channel's meta. 1.2× headroom so the ring's
+/// cap/8 reader guard margin never cuts into the configured history depth.
+fn slot_from_meta(meta: ChannelMeta) -> ChannelSlot {
+    let cap = (meta.max_rate as f64 * meta.history_s * 1.2).ceil() as usize;
+    let data = match meta.sample_type {
+        SampleType::Float => ChannelData::Float(SoaRing::new(cap)),
+        SampleType::Int => ChannelData::Int(SoaRing::new(cap)),
+        SampleType::Bool => ChannelData::Bool(SoaRing::new(cap)),
+        SampleType::Text => ChannelData::Text(TextBuf::new(meta.max_lines)),
+    };
+    ChannelSlot { meta, data }
+}
+
 impl LiveStore {
     pub fn from_registry(reg: &ChannelRegistry) -> Self {
-        let channels = reg
-            .iter_ids()
-            .map(|id| {
-                let meta = reg.meta(id).clone();
-                let cfg = reg.config(id);
-                // 1.2× headroom so the ring's cap/8 reader guard margin
-                // never cuts into the configured history depth.
-                let cap = (cfg.max_rate as f64 * cfg.history_s * 1.2).ceil() as usize;
-                let data = match meta.sample_type {
-                    SampleType::Float => ChannelData::Float(SoaRing::new(cap)),
-                    SampleType::Int => ChannelData::Int(SoaRing::new(cap)),
-                    SampleType::Bool => ChannelData::Bool(SoaRing::new(cap)),
-                    SampleType::Text => ChannelData::Text(TextBuf::new(cfg.max_lines)),
-                };
-                ChannelSlot { meta, data }
-            })
-            .collect();
+        let channels = boxcar::Vec::new();
+        for id in reg.iter_ids() {
+            channels.push(slot_from_meta(reg.meta(id).clone()));
+        }
         Self { channels, type_errors: AtomicU64::new(0), view_override: Arc::new(AtomicI64::new(0)) }
     }
 
@@ -56,7 +59,7 @@ impl LiveStore {
     }
 
     fn slot(&self, id: ChannelId) -> &ChannelSlot {
-        &self.channels[id.0 as usize]
+        self.channels.get(id.0 as usize).expect("channel id out of range")
     }
 
     fn count_type_error(&self) {
@@ -118,6 +121,10 @@ impl ChannelStore for LiveStore {
 
     fn channel_meta(&self, channel: ChannelId) -> &ChannelMeta {
         &self.slot(channel).meta
+    }
+
+    fn add_channel(&self, meta: ChannelMeta) {
+        self.channels.push(slot_from_meta(meta));
     }
 }
 
@@ -202,6 +209,25 @@ max_lines = 10
         assert_eq!(store.latest(ib), Some((2, Sample::Int(-7))));
         assert_eq!(store.latest(bc), Some((3, Sample::Bool(true))));
         assert_eq!(store.channel_meta(fa).sample_type, SampleType::Float);
+    }
+
+    #[test]
+    fn add_channel_appends_writable_slot() {
+        let reg = registry();
+        let store = LiveStore::from_registry(&reg);
+        let new_id = crate::types::ChannelId(reg.len() as u32);
+        store.add_channel(ChannelMeta {
+            name: "home/temp".into(),
+            sample_type: SampleType::Float,
+            unit: String::new(),
+            color: "#cccccc".into(),
+            max_rate: 100,
+            history_s: 30.0,
+            max_lines: 500,
+        });
+        store.write_numeric(new_id, 5, NumericVal::Float(21.5));
+        assert_eq!(store.latest(new_id), Some((5, Sample::Float(21.5))));
+        assert_eq!(store.channel_meta(new_id).name, "home/temp");
     }
 
     #[test]

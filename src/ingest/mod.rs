@@ -8,8 +8,11 @@ use crate::store::ChannelStore;
 
 pub mod decode;
 pub mod loader;
+pub mod mqtt;
 pub mod router;
 pub mod thread;
+
+pub use mqtt::{spawn_mqtt_ingest, MqttConfig, MqttHandles};
 
 pub const CONNECTING: u8 = 0;
 pub const LIVE: u8 = 1;

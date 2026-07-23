@@ -1,5 +1,6 @@
 use eframe::egui::{self, Color32};
-use egui_plot::{Legend, Line, MarkerShape, Plot, PlotPoints, Points, VLine};
+use egui_phosphor::regular as icon;
+use egui_plot::{Line, MarkerShape, Plot, PlotPoints, Points, VLine};
 
 use crate::config::ChannelRegistry;
 use crate::store::ChannelStore;
@@ -39,6 +40,8 @@ pub struct WaveformPanel {
     /// lines anchored to absolute time (they scroll with the data) while still
     /// fitting the samples' small offsets in f64 without precision loss.
     epoch_ns: Option<i64>,
+    /// Channel names toggled off via the legend (left-click). In-memory only.
+    hidden: std::collections::HashSet<String>,
 }
 
 pub fn ctor(
@@ -57,6 +60,7 @@ pub fn ctor(
         cursor_a_ns: None,
         cursor_b_ns: None,
         epoch_ns: None,
+        hidden: std::collections::HashSet::new(),
     }))
 }
 
@@ -123,6 +127,48 @@ impl VizPanel for WaveformPanel {
         for b in &self.bound {
             binding_error(ui, b, TYPE_NAME);
         }
+
+        // Custom legend: left-click an entry toggles its visibility, right-click
+        // opens a menu to remove the channel from the panel. (egui_plot's built-in
+        // legend exposes no per-item right-click, so we draw our own.)
+        let mut toggle: Option<String> = None;
+        let mut remove_idx: Option<usize> = None;
+        ui.horizontal_wrapped(|ui| {
+            for (i, b) in self.bound.iter().enumerate() {
+                let color = binding_color(b, i);
+                let hidden = self.hidden.contains(&b.name);
+                let swatch = if hidden { Color32::GRAY } else { color };
+                let text = egui::RichText::new(&b.name).color(swatch);
+                let resp = ui
+                    .add(egui::Button::new(text).small().frame(false))
+                    .on_hover_text("click: show/hide — right-click: remove");
+                if resp.clicked() {
+                    toggle = Some(b.name.clone());
+                }
+                resp.context_menu(|ui| {
+                    if ui.button(format!("{} Remove channel", icon::TRASH)).clicked() {
+                        remove_idx = Some(i);
+                        ui.close_menu();
+                    }
+                });
+            }
+        });
+        if let Some(name) = toggle {
+            if !self.hidden.remove(&name) {
+                self.hidden.insert(name);
+            }
+        }
+        if let Some(i) = remove_idx {
+            let b = self.bound.remove(i);
+            self.hidden.remove(&b.name);
+            self.title =
+                self.bound.iter().map(|b| b.name.as_str()).collect::<Vec<_>>().join(", ");
+        }
+        if self.bound.is_empty() {
+            ui.label(egui::RichText::new("Drop channels here").weak());
+            return;
+        }
+
         let has_data = self
             .bound
             .iter()
@@ -165,7 +211,6 @@ impl VizPanel for WaveformPanel {
         // footer labels stay visible.
         let footer_h = if self.cursors { 120.0 } else { 24.0 };
         let plot = Plot::new(("waveform", &self.title))
-            .legend(Legend::default())
             .include_x(x_of(t0))
             .include_x(x_of(end_ns))
             // X is plotted relative to the fixed anchor; label the ticks with the
@@ -184,8 +229,11 @@ impl VizPanel for WaveformPanel {
             .height((ui.available_height() - footer_h).max(80.0));
         let inner = plot.show(ui, |plot_ui| {
             for (i, ts, vals) in &snaps {
-                let points = decimate_minmax(ts, vals, anchor, MAX_PLOT_BUCKETS);
                 let b = &self.bound[*i];
+                if self.hidden.contains(&b.name) {
+                    continue;
+                }
+                let points = decimate_minmax(ts, vals, anchor, MAX_PLOT_BUCKETS);
                 let color = binding_color(b, *i);
                 plot_ui.line(Line::new(PlotPoints::from(points)).color(color).name(&b.name));
                 if self.dots {

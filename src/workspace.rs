@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use anyhow::anyhow;
 use eframe::egui;
+use egui_phosphor::regular as icon;
 use egui_tiles::{Container, LinearDir, Tile, TileId, Tree};
 
 use crate::config::{ChannelRegistry, LayoutConfig, PanelEntry, ScreenConfig};
@@ -408,7 +409,7 @@ impl egui_tiles::Behavior<usize> for TreeBehavior<'_> {
         }
 
         resp.context_menu(|ui| {
-            ui.menu_button("Split horizontal", |ui| {
+            ui.menu_button(format!("{} Split horizontal", icon::COLUMNS), |ui| {
                 for t in self.type_names {
                     if ui.button(*t).clicked() {
                         self.pending_split = Some((tile_id, LinearDir::Horizontal, t.to_string()));
@@ -416,7 +417,7 @@ impl egui_tiles::Behavior<usize> for TreeBehavior<'_> {
                     }
                 }
             });
-            ui.menu_button("Split vertical", |ui| {
+            ui.menu_button(format!("{} Split vertical", icon::ROWS), |ui| {
                 for t in self.type_names {
                     if ui.button(*t).clicked() {
                         self.pending_split = Some((tile_id, LinearDir::Vertical, t.to_string()));
@@ -425,7 +426,7 @@ impl egui_tiles::Behavior<usize> for TreeBehavior<'_> {
                 }
             });
             ui.separator();
-            if ui.button("Delete panel").clicked() {
+            if ui.button(format!("{} Delete panel", icon::TRASH)).clicked() {
                 self.pending_remove = Some(tile_id);
                 ui.close_menu();
             }
@@ -439,6 +440,20 @@ impl egui_tiles::Behavior<usize> for TreeBehavior<'_> {
             .map(|s| s.panel.title().to_string())
             .unwrap_or_default()
             .into()
+    }
+
+    /// Pick grid columns from the child count alone, ignoring the available
+    /// rect. The default heuristic recomputes columns from the window's
+    /// aspect ratio every frame, so resizing the window reflows the grid and
+    /// panels jump to new cells. A rect-independent count keeps the
+    /// arrangement fixed, so panels simply resize to fill the new width.
+    fn grid_auto_column_count(
+        &self,
+        num_visible_children: usize,
+        _rect: egui::Rect,
+        _gap: f32,
+    ) -> usize {
+        (num_visible_children as f32).sqrt().ceil().max(1.0) as usize
     }
 }
 

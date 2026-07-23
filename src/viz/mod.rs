@@ -29,6 +29,13 @@ pub trait VizPanel {
     /// Panel-specific config keys for layout.toml. Must NOT include "type" —
     /// PanelEntry carries that.
     fn serialize(&self) -> toml::Table;
+    /// Called when a channel name is dragged and dropped onto this panel.
+    /// Single-channel panels replace their channel; multi-channel panels append.
+    fn drop_channel(&mut self, _name: &str, _reg: &crate::config::ChannelRegistry) {}
+    /// Re-attempt to resolve any currently-unknown channels. Called when new
+    /// MQTT topics are discovered, so a panel loaded from a layout before its
+    /// (dynamic) MQTT topic reappeared can bind once it does. Default no-op.
+    fn refresh_bindings(&mut self, _ctx: &common::RebindCtx) {}
 }
 
 /// Constructor: panel-specific toml table + channel registry (for resolving

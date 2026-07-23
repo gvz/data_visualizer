@@ -26,7 +26,12 @@ impl TopicRouter {
         for id in registry.iter_ids() {
             let cfg = registry.config(id);
             let meta = registry.meta(id);
-            match schema.resolve(&cfg.proto_path, &cfg.ts_path) {
+            let (Some(topic), Some(proto_path), Some(ts_path)) =
+                (&cfg.topic, &cfg.proto_path, &cfg.ts_path)
+            else {
+                continue; // MQTT-only channel; no ZMQ binding
+            };
+            match schema.resolve(proto_path, ts_path) {
                 Ok(desc) => {
                     let binding = ChannelBinding {
                         id,
@@ -37,7 +42,7 @@ impl TopicRouter {
                         eu_offset: cfg.eu_offset,
                         sample_type: meta.sample_type,
                     };
-                    map.entry(cfg.topic.clone()).or_default().push(binding);
+                    map.entry(topic.clone()).or_default().push(binding);
                 }
                 Err(e) => {
                     eprintln!("ingest: skipping channel {:?}: {e}", meta.name);

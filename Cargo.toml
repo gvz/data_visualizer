@@ -19,6 +19,9 @@ mcap = "0.8"
 rfd = "0.14"
 crossbeam-channel = "0.5"
 prost-types = "0.13"
+rumqttc = "0.24"
+boxcar = "0.2.14"
+egui-phosphor = "0.6"
 
 [dev-dependencies]
 tempfile = "3"
