@@ -168,4 +168,36 @@ type = "float"
         ingest.on_message("a/b", "hello", 0);
         assert_eq!(discovered.lock().unwrap().get("a/b").map(String::as_str), Some("hello"));
     }
+
+    #[test]
+    fn no_sender_does_not_lock_topic_proto_type() {
+        // With no recorder installed, on_message must not touch the dynamic proto
+        // registry — so a topic's type stays uninferred and a later payload (once
+        // recording starts) can still determine it. A text-looking payload seen
+        // while not recording must not lock "a/b" as Text.
+        let reg = registry();
+        let store: Arc<dyn ChannelStore> = Arc::new(LiveStore::from_registry(&reg));
+        let topic_map = Arc::new(RwLock::new(HashMap::new()));
+        let discovered = Arc::new(Mutex::new(BTreeMap::new()));
+        let (tx, rx) = record_channel();
+        // Start with no sender, feed a text-looking payload, then install a sender.
+        let record_sender = Arc::new(Mutex::new(None));
+        let mut ingest =
+            ScalarIngest::new(discovered, topic_map, store, record_sender.clone());
+        ingest.on_message("a/b", "hello", 0);
+        *record_sender.lock().unwrap() = Some(tx);
+
+        // A numeric payload now must still infer Int (would decode as Text if the
+        // earlier "hello" had locked the topic).
+        ingest.on_message("a/b", "5", 1);
+        match rx.try_recv().unwrap() {
+            RecordMsg::DynamicProto { schema, data, .. } => {
+                let pool = prost_reflect::DescriptorPool::decode(schema.as_ref()).unwrap();
+                let desc = pool.get_message_by_name("mqtt.AB").unwrap();
+                let msg = prost_reflect::DynamicMessage::decode(desc, data.as_ref()).unwrap();
+                assert_eq!(msg.get_field_by_name("value").unwrap().as_i64(), Some(5));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
 }
