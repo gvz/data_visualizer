@@ -5,7 +5,7 @@ use anyhow::anyhow;
 
 use datavis::app::DataVisApp;
 use datavis::config::{ChannelRegistry, LayoutConfig};
-use datavis::ingest::{IngestConfig, MqttConfig};
+use datavis::ingest::{DataSource, IngestConfig, MqttConfig, MqttSource, ZmqSource};
 use datavis::store::{ChannelStore, LiveStore};
 use datavis::viz::PanelRegistry;
 use datavis::workspace::Workspace;
@@ -30,41 +30,28 @@ fn main() -> anyhow::Result<()> {
         .map(|id| channels.meta(id).history_s)
         .fold(5.0_f64, f64::max);
 
-    let mqtt_handles = mqtt_endpoint.map(|broker| {
-        datavis::ingest::spawn_mqtt_ingest(
+    let mut sources: Vec<datavis::ingest::SourceHandle> = Vec::new();
+
+    if let Some(broker) = mqtt_endpoint {
+        let src = MqttSource::new(
             MqttConfig { broker_url: broker, client_id: "datavis".to_string() },
             &channels,
-            store.clone(),
-        )
-    });
-    let (mqtt_topics, mqtt_topic_map, mqtt_record_sender) = match mqtt_handles {
-        Some(h) => (Some(h.discovered), Some(h.topic_map), Some(h.record_sender)),
-        None => (None, None, None),
-    };
+        );
+        sources.push(Box::new(src).spawn(store.clone()));
+    }
 
-    let (conn_state, zmq_record_sender, ingest_schema_bytes) = if demo {
+    if demo {
         datavis::demo::spawn_demo(store.clone(), &channels);
-        (None, None, vec![])
     } else {
         let config = IngestConfig {
             endpoint,
             proto_path: PathBuf::from(&schema_path),
         };
-        match datavis::ingest::spawn_ingest(config, &channels, store.clone()) {
-            Ok(handle) => {
-                let schema_bytes = handle.schema_bytes.clone();
-                (Some(handle.conn_state), Some(handle.record_sender), schema_bytes)
-            }
-            Err(e) => {
-                eprintln!("ingest: failed to start ({e}); running without live data");
-                (None, None, vec![])
-            }
+        match ZmqSource::build(config, &channels) {
+            Ok(src) => sources.push(Box::new(src).spawn(store.clone())),
+            Err(e) => eprintln!("ingest: failed to start ({e}); running without live data"),
         }
-    };
-
-    // Recording targets every active ingest source (ZMQ and/or MQTT).
-    let record_sender_slots: Vec<_> =
-        [zmq_record_sender, mqtt_record_sender].into_iter().flatten().collect();
+    }
 
     let registry = PanelRegistry::with_builtins();
     let workspace = Workspace::from_config(&layout, &registry, &channels);
@@ -75,13 +62,9 @@ fn main() -> anyhow::Result<()> {
         registry,
         workspace,
         layout_path,
-        conn_state,
-        record_sender_slots,
-        ingest_schema_bytes,
+        sources,
         live_view_ns,
         live_history_s,
-        mqtt_topics,
-        mqtt_topic_map,
         layout.default_window_s,
     );
 

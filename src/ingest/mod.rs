@@ -14,7 +14,7 @@ pub mod scalar;
 pub mod source;
 pub mod thread;
 
-pub use mqtt::{spawn_mqtt_ingest, MqttConfig, MqttHandles};
+pub use mqtt::{MqttConfig, MqttSource};
 pub use source::{DataSource, Discovery, SourceHandle};
 
 pub const CONNECTING: u8 = 0;
@@ -26,16 +26,10 @@ pub struct IngestConfig {
     pub proto_path: PathBuf,
 }
 
-pub struct IngestHandle {
-    pub conn_state: Arc<AtomicU8>,
-    pub record_sender: Arc<Mutex<Option<crossbeam_channel::Sender<RecordMsg>>>>,
-    pub schema_bytes: Vec<u8>,
-}
-
 pub struct ZmqSource {
     endpoint: String,
     router: router::TopicRouter,
-    schema_bytes: Vec<u8>,
+    pub(crate) schema_bytes: Vec<u8>,
 }
 
 impl ZmqSource {
@@ -75,21 +69,6 @@ impl source::DataSource for ZmqSource {
     }
 }
 
-pub fn spawn_ingest(
-    config: IngestConfig,
-    registry: &ChannelRegistry,
-    store: Arc<dyn ChannelStore>,
-) -> anyhow::Result<IngestHandle> {
-    let src = ZmqSource::build(config, registry)?;
-    let schema_bytes = src.schema_bytes.clone();
-    let handle = Box::new(src).spawn(store);
-    Ok(IngestHandle {
-        conn_state: handle.conn_state,
-        record_sender: handle.record_sender,
-        schema_bytes,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,7 +88,6 @@ mod tests {
 
     #[test]
     fn spawn_ingest_missing_schema_returns_err() {
-        use std::sync::Arc;
         let registry = crate::config::ChannelRegistry::from_toml_str(r#"
 [channels."x"]
 topic = "t"
@@ -117,15 +95,12 @@ proto_path = "A.v"
 ts_path = "A.t"
 type = "float"
 "#).unwrap();
-        let store: Arc<dyn crate::store::ChannelStore> =
-            Arc::new(crate::store::LiveStore::from_registry(&registry));
-        let result = spawn_ingest(
+        let result = ZmqSource::build(
             IngestConfig {
                 endpoint: "tcp://localhost:55999".to_string(),
                 proto_path: std::path::PathBuf::from("/nonexistent/schema.proto"),
             },
             &registry,
-            store,
         );
         assert!(result.is_err(), "expected Err for missing schema file");
     }
@@ -148,7 +123,6 @@ type = "float"
     #[test]
     fn zmq_source_handle_has_schema_no_discovery() {
         use std::io::Write;
-        use crate::ingest::source::DataSource;
 
         let dir = tempfile::tempdir().unwrap();
         let proto_path = dir.path().join("test.proto");
@@ -180,6 +154,7 @@ type = "float"
     #[test]
     fn schema_bytes_via_spawn_ingest_are_non_empty() {
         use std::io::Write;
+
         let dir = tempfile::tempdir().unwrap();
         let proto_path = dir.path().join("test.proto");
         let mut f = std::fs::File::create(&proto_path).unwrap();
@@ -191,16 +166,13 @@ proto_path = "M.v"
 ts_path = "M.t"
 type = "float"
 "#).unwrap();
-        let store: Arc<dyn crate::store::ChannelStore> =
-            Arc::new(crate::store::LiveStore::from_registry(&registry));
-        let handle = spawn_ingest(
+        let src = ZmqSource::build(
             IngestConfig {
                 endpoint: "tcp://localhost:59999".to_string(),
                 proto_path,
             },
             &registry,
-            store,
         ).unwrap();
-        assert!(!handle.schema_bytes.is_empty(), "schema_bytes must be populated");
+        assert!(!src.schema_bytes.is_empty(), "schema_bytes must be populated");
     }
 }

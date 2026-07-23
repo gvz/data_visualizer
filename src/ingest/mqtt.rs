@@ -13,16 +13,6 @@ use crate::record::RecordMsg;
 use crate::store::ChannelStore;
 use crate::types::{ChannelId, SampleType};
 
-/// Discovered-topic snapshot and the shared topic→channel routing table.
-pub struct MqttHandles {
-    /// All received topics with their last payload, for the sidebar picker.
-    pub discovered: Arc<Mutex<BTreeMap<String, String>>>,
-    /// topic → (id, type); extended when a topic is dropped onto a panel.
-    pub topic_map: Arc<MqttTopicMap>,
-    /// Installed by the app while recording so the ingest thread queues frames.
-    pub record_sender: Arc<Mutex<Option<crossbeam_channel::Sender<RecordMsg>>>>,
-}
-
 pub struct MqttConfig {
     /// Broker address as "host:port" or "host" (defaults to port 1883).
     pub broker_url: String,
@@ -31,7 +21,7 @@ pub struct MqttConfig {
 
 pub struct MqttSource {
     config: MqttConfig,
-    topic_map: Arc<MqttTopicMap>,
+    pub(crate) topic_map: Arc<MqttTopicMap>,
 }
 
 impl MqttSource {
@@ -77,26 +67,6 @@ impl DataSource for MqttSource {
             discovery: Some(Discovery { discovered, topic_map: self.topic_map }),
             schema_bytes: None,
         }
-    }
-}
-
-/// Spawn an MQTT ingest thread. Subscribes to `#` for discovery.
-/// Messages on channels with `mqtt_topic` configured are written to the store.
-/// All received topic names are added to the returned discovered set.
-///
-/// Thin remap wrapper over `MqttSource`; removed in Task 5.
-pub fn spawn_mqtt_ingest(
-    config: MqttConfig,
-    registry: &ChannelRegistry,
-    store: Arc<dyn ChannelStore>,
-) -> MqttHandles {
-    let src = MqttSource::new(config, registry);
-    let handle = Box::new(src).spawn(store);
-    let discovery = handle.discovery.expect("MqttSource always provides discovery");
-    MqttHandles {
-        discovered: discovery.discovered,
-        topic_map: discovery.topic_map,
-        record_sender: handle.record_sender,
     }
 }
 
@@ -214,29 +184,6 @@ type = "float"
     }
 
     #[test]
-    fn spawn_returns_discovered_set() {
-        let registry = crate::config::ChannelRegistry::from_toml_str(
-            r#"
-[channels."x"]
-topic = "t"
-proto_path = "M.v"
-ts_path = "M.t"
-type = "float"
-"#,
-        )
-        .unwrap();
-        let store: Arc<dyn ChannelStore> =
-            Arc::new(crate::store::LiveStore::from_registry(&registry));
-        let handles = spawn_mqtt_ingest(
-            MqttConfig { broker_url: "localhost:19998".into(), client_id: "test".into() },
-            &registry,
-            store,
-        );
-        // Starts empty; will stay empty since test broker won't connect.
-        assert!(handles.discovered.lock().unwrap().is_empty());
-    }
-
-    #[test]
     fn topic_map_built_from_mqtt_channels() {
         let registry = crate::config::ChannelRegistry::from_toml_str(
             r#"
@@ -257,13 +204,11 @@ type = "int"
         )
         .unwrap();
 
-        let mut map: HashMap<String, (ChannelId, SampleType)> = HashMap::new();
-        for id in registry.iter_ids() {
-            let cfg = registry.config(id);
-            if let Some(t) = &cfg.mqtt_topic {
-                map.insert(t.clone(), (id, registry.meta(id).sample_type));
-            }
-        }
+        let src = MqttSource::new(
+            MqttConfig { broker_url: "localhost:19999".into(), client_id: "test".into() },
+            &registry,
+        );
+        let map = src.topic_map.read().unwrap();
         assert_eq!(map.len(), 2);
         assert!(map.contains_key("home/sensors/temperature"));
         assert!(map.contains_key("home/sensors/door"));

@@ -79,6 +79,46 @@ pub(crate) enum AppMode {
     Replay(ReplayState),
 }
 
+/// Ingest-derived fields collapsed from the running sources. `conn_state`,
+/// `mqtt_topics`, `mqtt_topic_map` and `ingest_schema_bytes` take the first
+/// source that provides each — today at most one source provides any given one.
+pub(crate) struct DerivedIngest {
+    pub conn_state: Option<Arc<std::sync::atomic::AtomicU8>>,
+    pub record_sender_slots:
+        Vec<Arc<Mutex<Option<crossbeam_channel::Sender<crate::record::RecordMsg>>>>>,
+    pub ingest_schema_bytes: Vec<u8>,
+    pub mqtt_topics: Option<Arc<Mutex<BTreeMap<String, String>>>>,
+    pub mqtt_topic_map: Option<Arc<crate::dynamic_channel::MqttTopicMap>>,
+}
+
+impl DerivedIngest {
+    pub(crate) fn from_handles(handles: Vec<crate::ingest::SourceHandle>) -> Self {
+        let mut conn_state = None;
+        let mut record_sender_slots = Vec::new();
+        let mut ingest_schema_bytes = Vec::new();
+        let mut mqtt_topics = None;
+        let mut mqtt_topic_map = None;
+        for h in handles {
+            record_sender_slots.push(h.record_sender);
+            if conn_state.is_none() {
+                conn_state = Some(h.conn_state);
+            }
+            if let Some(bytes) = h.schema_bytes {
+                if ingest_schema_bytes.is_empty() {
+                    ingest_schema_bytes = bytes;
+                }
+            }
+            if let Some(d) = h.discovery {
+                if mqtt_topics.is_none() {
+                    mqtt_topics = Some(d.discovered);
+                    mqtt_topic_map = Some(d.topic_map);
+                }
+            }
+        }
+        Self { conn_state, record_sender_slots, ingest_schema_bytes, mqtt_topics, mqtt_topic_map }
+    }
+}
+
 /// Top-level eframe app: menu bar, screen tabs, tiled workspace, dialogs.
 pub struct DataVisApp {
     store: Arc<dyn ChannelStore>,
@@ -131,15 +171,18 @@ impl DataVisApp {
         registry: PanelRegistry,
         workspace: Workspace,
         layout_path: PathBuf,
-        conn_state: Option<Arc<std::sync::atomic::AtomicU8>>,
-        record_sender_slots: Vec<Arc<Mutex<Option<crossbeam_channel::Sender<crate::record::RecordMsg>>>>>,
-        ingest_schema_bytes: Vec<u8>,
+        sources: Vec<crate::ingest::SourceHandle>,
         live_view_ns: Arc<AtomicI64>,
         live_history_s: f64,
-        mqtt_topics: Option<Arc<Mutex<BTreeMap<String, String>>>>,
-        mqtt_topic_map: Option<Arc<crate::dynamic_channel::MqttTopicMap>>,
         default_window_s: f64,
     ) -> Self {
+        let DerivedIngest {
+            conn_state,
+            record_sender_slots,
+            ingest_schema_bytes,
+            mqtt_topics,
+            mqtt_topic_map,
+        } = DerivedIngest::from_handles(sources);
         let panel_type = registry
             .type_names()
             .first()
@@ -790,10 +833,22 @@ mod tests {
 
     #[test]
     fn record_sender_slots_install_and_clear() {
+        use crate::ingest::SourceHandle;
+        use std::sync::atomic::AtomicU8;
         use std::sync::{Arc, Mutex};
+
         let (tx, _rx) = crate::record::record_channel();
-        let slots: Vec<Arc<Mutex<Option<crossbeam_channel::Sender<crate::record::RecordMsg>>>>> =
-            vec![Arc::new(Mutex::new(None)), Arc::new(Mutex::new(None))];
+        // Build two handles, each with their own record_sender slot.
+        let make_handle = |name: &str| SourceHandle {
+            name: name.into(),
+            conn_state: Arc::new(AtomicU8::new(0)),
+            record_sender: Arc::new(Mutex::new(None)),
+            discovery: None,
+            schema_bytes: None,
+        };
+        let h1 = make_handle("a");
+        let h2 = make_handle("b");
+        let slots = vec![h1.record_sender.clone(), h2.record_sender.clone()];
         // Install into all.
         for slot in &slots {
             *slot.lock().unwrap() = Some(tx.clone());
@@ -804,6 +859,38 @@ mod tests {
             *slot.lock().unwrap() = None;
         }
         assert!(slots.iter().all(|s| s.lock().unwrap().is_none()));
+    }
+
+    #[test]
+    fn derives_ingest_fields_from_handles() {
+        use crate::ingest::{Discovery, SourceHandle};
+        use std::collections::BTreeMap;
+        use std::sync::atomic::AtomicU8;
+        use std::sync::{Arc, Mutex, RwLock};
+
+        let mqtt = SourceHandle {
+            name: "mqtt".into(),
+            conn_state: Arc::new(AtomicU8::new(0)),
+            record_sender: Arc::new(Mutex::new(None)),
+            discovery: Some(Discovery {
+                discovered: Arc::new(Mutex::new(BTreeMap::new())),
+                topic_map: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            }),
+            schema_bytes: None,
+        };
+        let zmq = SourceHandle {
+            name: "zmq".into(),
+            conn_state: Arc::new(AtomicU8::new(1)),
+            record_sender: Arc::new(Mutex::new(None)),
+            discovery: None,
+            schema_bytes: Some(vec![1, 2, 3]),
+        };
+        let d = DerivedIngest::from_handles(vec![mqtt, zmq]);
+        assert_eq!(d.record_sender_slots.len(), 2);
+        assert_eq!(d.ingest_schema_bytes, vec![1, 2, 3]);
+        assert!(d.mqtt_topics.is_some());
+        assert!(d.mqtt_topic_map.is_some());
+        assert!(d.conn_state.is_some());
     }
 
     #[test]
