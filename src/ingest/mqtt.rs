@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::AtomicU8;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -6,6 +7,8 @@ use rumqttc::{Client, Event, MqttOptions, Packet, QoS};
 
 use crate::config::ChannelRegistry;
 use crate::dynamic_channel::MqttTopicMap;
+use crate::ingest::source::{DataSource, Discovery, SourceHandle};
+use crate::ingest::{CONNECTING, LIVE};
 use crate::record::RecordMsg;
 use crate::store::ChannelStore;
 use crate::types::{ChannelId, SampleType};
@@ -26,40 +29,75 @@ pub struct MqttConfig {
     pub client_id: String,
 }
 
+pub struct MqttSource {
+    config: MqttConfig,
+    topic_map: Arc<MqttTopicMap>,
+}
+
+impl MqttSource {
+    pub fn new(config: MqttConfig, registry: &ChannelRegistry) -> Self {
+        let mut initial: HashMap<String, (ChannelId, SampleType)> = HashMap::new();
+        for id in registry.iter_ids() {
+            if let Some(mqtt_topic) = &registry.config(id).mqtt_topic {
+                initial.insert(mqtt_topic.clone(), (id, registry.meta(id).sample_type));
+            }
+        }
+        Self { config, topic_map: Arc::new(RwLock::new(initial)) }
+    }
+}
+
+impl DataSource for MqttSource {
+    fn name(&self) -> &str {
+        "mqtt"
+    }
+
+    fn spawn(self: Box<Self>, store: Arc<dyn ChannelStore>) -> SourceHandle {
+        let discovered: Arc<Mutex<BTreeMap<String, String>>> =
+            Arc::new(Mutex::new(BTreeMap::new()));
+        let (host, port) = parse_broker_url(&self.config.broker_url);
+        let mut opts = MqttOptions::new(self.config.client_id.clone(), host, port);
+        opts.set_keep_alive(Duration::from_secs(30));
+
+        let record_sender: Arc<Mutex<Option<crossbeam_channel::Sender<RecordMsg>>>> =
+            Arc::new(Mutex::new(None));
+        let conn_state = Arc::new(AtomicU8::new(CONNECTING));
+
+        let disc = discovered.clone();
+        let map = self.topic_map.clone();
+        let rec = record_sender.clone();
+        let state = conn_state.clone();
+        std::thread::spawn(move || {
+            run_loop(opts, map, disc, store, rec, state);
+        });
+
+        SourceHandle {
+            name: "mqtt".to_string(),
+            conn_state,
+            record_sender,
+            discovery: Some(Discovery { discovered, topic_map: self.topic_map }),
+            schema_bytes: None,
+        }
+    }
+}
+
 /// Spawn an MQTT ingest thread. Subscribes to `#` for discovery.
 /// Messages on channels with `mqtt_topic` configured are written to the store.
 /// All received topic names are added to the returned discovered set.
+///
+/// Thin remap wrapper over `MqttSource`; removed in Task 5.
 pub fn spawn_mqtt_ingest(
     config: MqttConfig,
     registry: &ChannelRegistry,
     store: Arc<dyn ChannelStore>,
 ) -> MqttHandles {
-    let discovered: Arc<Mutex<BTreeMap<String, String>>> = Arc::new(Mutex::new(BTreeMap::new()));
-
-    let mut initial: HashMap<String, (ChannelId, SampleType)> = HashMap::new();
-    for id in registry.iter_ids() {
-        let cfg = registry.config(id);
-        if let Some(mqtt_topic) = &cfg.mqtt_topic {
-            initial.insert(mqtt_topic.clone(), (id, registry.meta(id).sample_type));
-        }
+    let src = MqttSource::new(config, registry);
+    let handle = Box::new(src).spawn(store);
+    let discovery = handle.discovery.expect("MqttSource always provides discovery");
+    MqttHandles {
+        discovered: discovery.discovered,
+        topic_map: discovery.topic_map,
+        record_sender: handle.record_sender,
     }
-    let topic_map: Arc<MqttTopicMap> = Arc::new(RwLock::new(initial));
-
-    let (host, port) = parse_broker_url(&config.broker_url);
-    let mut opts = MqttOptions::new(config.client_id, host, port);
-    opts.set_keep_alive(Duration::from_secs(30));
-
-    let record_sender: Arc<Mutex<Option<crossbeam_channel::Sender<RecordMsg>>>> =
-        Arc::new(Mutex::new(None));
-
-    let disc = discovered.clone();
-    let map = topic_map.clone();
-    let rec = record_sender.clone();
-    std::thread::spawn(move || {
-        run_loop(opts, map, disc, store, rec);
-    });
-
-    MqttHandles { discovered, topic_map, record_sender }
 }
 
 fn run_loop(
@@ -68,7 +106,9 @@ fn run_loop(
     discovered: Arc<Mutex<BTreeMap<String, String>>>,
     store: Arc<dyn ChannelStore>,
     record_sender: Arc<Mutex<Option<crossbeam_channel::Sender<RecordMsg>>>>,
+    conn_state: Arc<AtomicU8>,
 ) {
+    use std::sync::atomic::Ordering;
     let (client, mut connection) = Client::new(opts, 64);
     let mut ingest =
         crate::ingest::scalar::ScalarIngest::new(discovered, topic_map, store, record_sender);
@@ -76,6 +116,7 @@ fn run_loop(
     for event in connection.iter() {
         match event {
             Ok(Event::Incoming(Packet::ConnAck(_))) => {
+                conn_state.store(LIVE, Ordering::Relaxed);
                 if let Err(e) = client.subscribe("#", QoS::AtMostOnce) {
                     eprintln!("mqtt: subscribe # failed: {e}");
                 }
@@ -88,6 +129,7 @@ fn run_loop(
                 ingest.on_message(&p.topic, payload_str.as_str(), ts);
             }
             Err(e) => {
+                conn_state.store(CONNECTING, Ordering::Relaxed);
                 eprintln!("mqtt: {e}");
                 std::thread::sleep(Duration::from_secs(2));
             }
@@ -142,6 +184,33 @@ mod tests {
     fn parse_ipv6() {
         assert_eq!(parse_broker_url("[::1]:1883"), ("::1".into(), 1883));
         assert_eq!(parse_broker_url("[::1]"), ("::1".into(), 1883));
+    }
+
+    #[test]
+    fn mqtt_source_handle_has_discovery_no_schema() {
+        use crate::ingest::{DataSource, CONNECTING};
+        use std::sync::atomic::Ordering;
+
+        let registry = crate::config::ChannelRegistry::from_toml_str(
+            r#"
+[channels."x"]
+mqtt_topic = "home/x"
+type = "float"
+"#,
+        )
+        .unwrap();
+        let store: Arc<dyn ChannelStore> =
+            Arc::new(crate::store::LiveStore::from_registry(&registry));
+        let src = MqttSource::new(
+            MqttConfig { broker_url: "localhost:19997".into(), client_id: "test".into() },
+            &registry,
+        );
+        let handle = Box::new(src).spawn(store);
+        assert_eq!(handle.name, "mqtt");
+        assert!(handle.discovery.is_some());
+        assert!(handle.schema_bytes.is_none());
+        // No broker at that port → stays CONNECTING.
+        assert_eq!(handle.conn_state.load(Ordering::Relaxed), CONNECTING);
     }
 
     #[test]
