@@ -6,10 +6,9 @@ use rumqttc::{Client, Event, MqttOptions, Packet, QoS};
 
 use crate::config::ChannelRegistry;
 use crate::dynamic_channel::MqttTopicMap;
-use crate::record::mqtt_schema::DynamicProtoRegistry;
 use crate::record::RecordMsg;
 use crate::store::ChannelStore;
-use crate::types::{ChannelId, NumericVal, SampleType};
+use crate::types::{ChannelId, SampleType};
 
 /// Discovered-topic snapshot and the shared topic→channel routing table.
 pub struct MqttHandles {
@@ -63,27 +62,6 @@ pub fn spawn_mqtt_ingest(
     MqttHandles { discovered, topic_map, record_sender }
 }
 
-/// Encode one MQTT publish and queue it for the recorder, if recording is
-/// active. Generates the topic's schema on first sight. A parse mismatch or a
-/// full queue silently drops the sample.
-fn record_publish(
-    reg: &mut DynamicProtoRegistry,
-    sender: &Option<crossbeam_channel::Sender<RecordMsg>>,
-    topic: &str,
-    payload: &str,
-    ts: i64,
-) {
-    let Some(tx) = sender else { return };
-    if let Some((schema, data)) = reg.record_frame(topic, ts, payload) {
-        let _ = tx.try_send(RecordMsg::DynamicProto {
-            topic: Arc::from(topic),
-            schema,
-            data,
-            ts,
-        });
-    }
-}
-
 fn run_loop(
     opts: MqttOptions,
     topic_map: Arc<MqttTopicMap>,
@@ -92,7 +70,8 @@ fn run_loop(
     record_sender: Arc<Mutex<Option<crossbeam_channel::Sender<RecordMsg>>>>,
 ) {
     let (client, mut connection) = Client::new(opts, 64);
-    let mut proto_registry = DynamicProtoRegistry::new();
+    let mut ingest =
+        crate::ingest::scalar::ScalarIngest::new(discovered, topic_map, store, record_sender);
 
     for event in connection.iter() {
         match event {
@@ -105,41 +84,8 @@ fn run_loop(
                 let payload_str = std::str::from_utf8(&p.payload)
                     .map(|s| s.trim().to_string())
                     .unwrap_or_else(|_| format!("({} bytes)", p.payload.len()));
-                discovered.lock().unwrap().insert(p.topic.to_string(), payload_str.clone());
-
                 let ts = crate::types::now_ns();
-                if let Ok(guard) = record_sender.try_lock() {
-                    record_publish(&mut proto_registry, &guard, &p.topic, payload_str.as_str(), ts);
-                }
-
-                let Some((id, sample_type)) =
-                    topic_map.read().unwrap().get(p.topic.as_str()).copied()
-                else {
-                    continue;
-                };
-                let payload = payload_str.as_str();
-                match sample_type {
-                    SampleType::Float => {
-                        if let Ok(v) = payload.parse::<f64>() {
-                            store.write_numeric(id, ts, NumericVal::Float(v));
-                        }
-                    }
-                    SampleType::Int => {
-                        if let Ok(v) = payload.parse::<i64>() {
-                            store.write_numeric(id, ts, NumericVal::Int(v));
-                        }
-                    }
-                    SampleType::Bool => {
-                        let v = matches!(
-                            payload,
-                            "1" | "true" | "True" | "TRUE" | "on" | "ON" | "yes" | "YES"
-                        );
-                        store.write_numeric(id, ts, NumericVal::Bool(v));
-                    }
-                    SampleType::Text => {
-                        store.write_text(id, ts, payload.to_string());
-                    }
-                }
+                ingest.on_message(&p.topic, payload_str.as_str(), ts);
             }
             Err(e) => {
                 eprintln!("mqtt: {e}");
@@ -176,45 +122,6 @@ fn parse_broker_url(url: &str) -> (String, u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn record_publish_sends_decodable_dynamic_proto() {
-        use crate::record::mqtt_schema::DynamicProtoRegistry;
-        use crate::record::{record_channel, RecordMsg};
-
-        let mut reg = DynamicProtoRegistry::new();
-        let (tx, rx) = record_channel();
-        let sender = Some(tx);
-
-        record_publish(&mut reg, &sender, "home/temp", "21.5", 1_234);
-
-        match rx.try_recv().unwrap() {
-            RecordMsg::DynamicProto { topic, schema, data, ts } => {
-                assert_eq!(topic.as_ref(), "home/temp");
-                assert_eq!(ts, 1_234);
-                let pool = prost_reflect::DescriptorPool::decode(schema.as_ref()).unwrap();
-                let desc = pool.get_message_by_name("mqtt.HomeTemp").unwrap();
-                let msg = prost_reflect::DynamicMessage::decode(desc, data.as_ref()).unwrap();
-                assert_eq!(msg.get_field_by_name("value").unwrap().as_f64(), Some(21.5));
-            }
-            other => panic!("wrong variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn record_publish_noop_when_no_sender() {
-        use crate::record::mqtt_schema::DynamicProtoRegistry;
-        let mut reg = DynamicProtoRegistry::new();
-        // No sender → returns before touching the registry, so no type is locked.
-        record_publish(&mut reg, &None, "x/y", "hello", 0);
-        // A later Int sample therefore still infers Int (would be Text if the
-        // earlier "hello" had locked the topic).
-        let (schema, data) = reg.record_frame("x/y", 1, "5").unwrap();
-        let pool = prost_reflect::DescriptorPool::decode(schema.as_ref()).unwrap();
-        let desc = pool.get_message_by_name("mqtt.XY").unwrap();
-        let msg = prost_reflect::DynamicMessage::decode(desc, data.as_ref()).unwrap();
-        assert_eq!(msg.get_field_by_name("value").unwrap().as_i64(), Some(5));
-    }
 
     #[test]
     fn parse_host_port() {

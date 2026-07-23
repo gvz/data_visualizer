@@ -10,6 +10,7 @@ pub mod decode;
 pub mod loader;
 pub mod mqtt;
 pub mod router;
+pub mod scalar;
 pub mod source;
 pub mod thread;
 
