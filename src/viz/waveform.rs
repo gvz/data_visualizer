@@ -7,7 +7,7 @@ use crate::store::ChannelStore;
 use crate::types::{SampleType, TimeWindow};
 use crate::viz::common::{
     bind, binding_color, binding_error, effective_window_s, format_time_of_day, label_config_row,
-    opt_bool, opt_f64_opt, opt_label, opt_str_array, refresh_binding, serialize_label,
+    opt_bool, opt_f64_opt, opt_label, opt_str, opt_str_array, refresh_binding, serialize_label,
     snapshot_to_f64, window_config_row, Binding, RebindCtx,
 };
 use crate::viz::decimate::decimate_minmax;
@@ -32,6 +32,9 @@ pub struct WaveformPanel {
     cursors: bool,
     /// Draw a marker on every actual sample, not just the connecting line.
     dots: bool,
+    /// Unit suffix appended to Y-axis tick labels (and the cursor readout).
+    /// Empty means no suffix.
+    y_unit: String,
     /// Cursor positions in absolute ns so they stay put while the plot scrolls.
     cursor_a_ns: Option<i64>,
     cursor_b_ns: Option<i64>,
@@ -57,6 +60,7 @@ pub fn ctor(
         time_window_s: opt_f64_opt(cfg, "time_window_s"),
         cursors: opt_bool(cfg, "cursors", false),
         dots: opt_bool(cfg, "dots", false),
+        y_unit: opt_str(cfg, "y_unit"),
         cursor_a_ns: None,
         cursor_b_ns: None,
         epoch_ns: None,
@@ -108,6 +112,14 @@ impl VizPanel for WaveformPanel {
     fn config_ui(&mut self, ui: &mut egui::Ui) {
         let default = self.bound.first().map(|b| b.name.clone()).unwrap_or_default();
         label_config_row(ui, &mut self.label, &default);
+        ui.horizontal(|ui| {
+            ui.label("y unit:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.y_unit)
+                    .desired_width(80.0)
+                    .hint_text("e.g. V"),
+            );
+        });
         ui.horizontal(|ui| {
             window_config_row(ui, &mut self.time_window_s, 0.1..=60.0);
             ui.checkbox(&mut self.cursors, "cursors");
@@ -210,7 +222,10 @@ impl VizPanel for WaveformPanel {
         // stats below it off the bottom of the pane. Reserve a strip so the
         // footer labels stay visible.
         let footer_h = if self.cursors { 120.0 } else { 24.0 };
-        let plot = Plot::new(("waveform", &self.title))
+        // Suffix ("" when unset) captured by the tick and hover formatters below.
+        let unit = self.y_unit.clone();
+        let unit_hover = unit.clone();
+        let mut plot = Plot::new(("waveform", &self.title))
             .include_x(x_of(t0))
             .include_x(x_of(end_ns))
             // X is plotted relative to the fixed anchor; label the ticks with the
@@ -220,13 +235,23 @@ impl VizPanel for WaveformPanel {
             })
             .label_formatter(move |name, p| {
                 let t = format_time_of_day(anchor + (p.x * 1e9) as i64);
+                let suffix =
+                    if unit_hover.is_empty() { String::new() } else { format!(" {unit_hover}") };
                 if name.is_empty() {
-                    format!("{t}\n{:.4}", p.y)
+                    format!("{t}\n{:.4}{suffix}", p.y)
                 } else {
-                    format!("{name}\n{t}\n{:.4}", p.y)
+                    format!("{name}\n{t}\n{:.4}{suffix}", p.y)
                 }
             })
             .height((ui.available_height() - footer_h).max(80.0));
+        if !unit.is_empty() {
+            // Append the unit to each Y tick, using decimals implied by the grid
+            // step so float error in the tick position doesn't leak into the label.
+            plot = plot.y_axis_formatter(move |mark, _| {
+                let decimals = (-mark.step_size.log10().floor()).max(0.0) as usize;
+                format!("{:.*} {unit}", decimals, mark.value)
+            });
+        }
         let inner = plot.show(ui, |plot_ui| {
             for (i, ts, vals) in &snaps {
                 let b = &self.bound[*i];
@@ -341,6 +366,9 @@ impl VizPanel for WaveformPanel {
         }
         t.insert("cursors".to_string(), toml::Value::Boolean(self.cursors));
         t.insert("dots".to_string(), toml::Value::Boolean(self.dots));
+        if !self.y_unit.is_empty() {
+            t.insert("y_unit".to_string(), toml::Value::String(self.y_unit.clone()));
+        }
         serialize_label(&mut t, &self.label);
         t
     }
