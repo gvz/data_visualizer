@@ -11,7 +11,6 @@ use crate::ingest::source::{DataSource, Discovery, SourceHandle};
 use crate::ingest::{CONNECTING, LIVE};
 use crate::record::RecordMsg;
 use crate::store::ChannelStore;
-use crate::types::SampleType;
 
 pub struct MqttConfig {
     /// Broker address as "host:port" or "host" (defaults to port 1883).
@@ -128,6 +127,7 @@ fn parse_broker_url(url: &str) -> (String, u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::SampleType;
 
     #[test]
     fn parse_host_port() {
