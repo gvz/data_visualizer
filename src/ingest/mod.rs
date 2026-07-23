@@ -32,24 +32,62 @@ pub struct IngestHandle {
     pub schema_bytes: Vec<u8>,
 }
 
+pub struct ZmqSource {
+    endpoint: String,
+    router: router::TopicRouter,
+    schema_bytes: Vec<u8>,
+}
+
+impl ZmqSource {
+    pub fn build(config: IngestConfig, registry: &ChannelRegistry) -> anyhow::Result<Self> {
+        let schema = loader::ProtoSchema::from_path(&config.proto_path)?;
+        let schema_bytes = schema.schema_bytes().to_vec();
+        let router = router::TopicRouter::build(registry, &schema);
+        Ok(Self { endpoint: config.endpoint, router, schema_bytes })
+    }
+}
+
+impl source::DataSource for ZmqSource {
+    fn name(&self) -> &str {
+        "zmq"
+    }
+
+    fn spawn(self: Box<Self>, store: Arc<dyn ChannelStore>) -> source::SourceHandle {
+        let conn_state = Arc::new(AtomicU8::new(CONNECTING));
+        let record_sender: Arc<Mutex<Option<crossbeam_channel::Sender<RecordMsg>>>> =
+            Arc::new(Mutex::new(None));
+
+        let state_clone = conn_state.clone();
+        let sender_clone = record_sender.clone();
+        let endpoint = self.endpoint.clone();
+        let router = self.router;
+        std::thread::spawn(move || {
+            thread::run_loop(endpoint, router, store, state_clone, sender_clone);
+        });
+
+        source::SourceHandle {
+            name: "zmq".to_string(),
+            conn_state,
+            record_sender,
+            discovery: None,
+            schema_bytes: Some(self.schema_bytes),
+        }
+    }
+}
+
 pub fn spawn_ingest(
     config: IngestConfig,
     registry: &ChannelRegistry,
     store: Arc<dyn ChannelStore>,
 ) -> anyhow::Result<IngestHandle> {
-    let schema = loader::ProtoSchema::from_path(&config.proto_path)?;
-    let schema_bytes = schema.schema_bytes().to_vec();
-    let router = router::TopicRouter::build(registry, &schema);
-    let conn_state = Arc::new(AtomicU8::new(CONNECTING));
-    let state_clone = conn_state.clone();
-    let endpoint = config.endpoint.clone();
-    let record_sender: Arc<Mutex<Option<crossbeam_channel::Sender<RecordMsg>>>> =
-        Arc::new(Mutex::new(None));
-    let record_sender_clone = record_sender.clone();
-    std::thread::spawn(move || {
-        thread::run_loop(endpoint, router, store, state_clone, record_sender_clone);
-    });
-    Ok(IngestHandle { conn_state, record_sender, schema_bytes })
+    let src = ZmqSource::build(config, registry)?;
+    let schema_bytes = src.schema_bytes.clone();
+    let handle = Box::new(src).spawn(store);
+    Ok(IngestHandle {
+        conn_state: handle.conn_state,
+        record_sender: handle.record_sender,
+        schema_bytes,
+    })
 }
 
 #[cfg(test)]
@@ -105,6 +143,38 @@ type = "float"
         let sender: Arc<std::sync::Mutex<Option<crossbeam_channel::Sender<crate::record::RecordMsg>>>> =
             Arc::new(std::sync::Mutex::new(None));
         drop(sender);
+    }
+
+    #[test]
+    fn zmq_source_handle_has_schema_no_discovery() {
+        use std::io::Write;
+        use crate::ingest::source::DataSource;
+
+        let dir = tempfile::tempdir().unwrap();
+        let proto_path = dir.path().join("test.proto");
+        let mut f = std::fs::File::create(&proto_path).unwrap();
+        write!(f, "syntax = \"proto3\";\nmessage M {{ int64 t = 1; float v = 2; }}\n").unwrap();
+        let registry = crate::config::ChannelRegistry::from_toml_str(
+            r#"
+[channels."x"]
+topic = "t"
+proto_path = "M.v"
+ts_path = "M.t"
+type = "float"
+"#,
+        )
+        .unwrap();
+        let store: Arc<dyn crate::store::ChannelStore> =
+            Arc::new(crate::store::LiveStore::from_registry(&registry));
+        let src = ZmqSource::build(
+            IngestConfig { endpoint: "tcp://localhost:59998".into(), proto_path },
+            &registry,
+        )
+        .unwrap();
+        let handle = Box::new(src).spawn(store);
+        assert_eq!(handle.name, "zmq");
+        assert!(handle.discovery.is_none());
+        assert!(handle.schema_bytes.as_ref().is_some_and(|b| !b.is_empty()));
     }
 
     #[test]
