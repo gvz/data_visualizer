@@ -25,6 +25,8 @@ pub struct PanelSlot {
 pub struct ScreenState {
     pub tree: Tree<usize>,
     pub panels: Vec<PanelSlot>,
+    /// Pane index whose settings window is currently open, if any.
+    pub settings_open: Option<usize>,
 }
 
 /// All screens + which one is showing. The dockable-layout engine.
@@ -98,7 +100,11 @@ fn tree_panes_valid(t: &Tree<usize>, n: usize) -> bool {
 
 impl ScreenState {
     fn empty(name: &str) -> Self {
-        Self { tree: Tree::empty(egui::Id::new(("screen", name))), panels: Vec::new() }
+        Self {
+            tree: Tree::empty(egui::Id::new(("screen", name))),
+            panels: Vec::new(),
+            settings_open: None,
+        }
     }
 
     fn remove_panel(&mut self, tile_id: TileId) {
@@ -110,6 +116,9 @@ impl ScreenState {
         if pane_idx < self.panels.len() {
             self.panels.remove(pane_idx);
         }
+        // Panel indices shift on removal; drop any open settings window rather
+        // than let it point at the wrong (or a since-removed) panel.
+        self.settings_open = None;
         // Shift down any pane indices that were above the removed one.
         for (_, tile) in self.tree.tiles.iter_mut() {
             if let Tile::Pane(i) = tile {
@@ -180,7 +189,7 @@ impl ScreenState {
             .and_then(parse_tree)
             .filter(|t| tree_panes_valid(t, panels.len()))
             .unwrap_or_else(|| default_tree(name, panels.len()));
-        Self { tree, panels }
+        Self { tree, panels, settings_open: None }
     }
 }
 
@@ -266,6 +275,7 @@ impl Workspace {
             panels: &mut st.panels,
             pending_remove: None,
             pending_split: None,
+            pending_settings: None,
             type_names: &type_names,
             channels,
             mqtt,
@@ -273,11 +283,35 @@ impl Workspace {
         st.tree.ui(&mut behavior, ui);
         let pending_remove = behavior.pending_remove;
         let pending_split = behavior.pending_split;
+        let pending_settings = behavior.pending_settings;
+        if let Some(pane) = pending_settings {
+            st.settings_open = Some(pane);
+        }
         if let Some(tile_id) = pending_remove {
             st.remove_panel(tile_id);
         }
         if let Some((tile_id, dir, type_name)) = pending_split {
             st.split_panel(tile_id, dir, &type_name, reg, channels);
+        }
+
+        // Floating settings window for the panel picked via the context menu.
+        // Rendered at the screen level (not inside the pane) so it can move
+        // freely and overlay other panels.
+        if let Some(pane) = st.settings_open {
+            if let Some(slot) = st.panels.get_mut(pane) {
+                let mut open = true;
+                egui::Window::new(format!("{} settings", slot.panel.title()))
+                    .id(egui::Id::new(("panel-settings-window", pane)))
+                    .collapsible(false)
+                    .resizable(true)
+                    .open(&mut open)
+                    .show(ui.ctx(), |ui| slot.panel.config_ui(ui));
+                if !open {
+                    st.settings_open = None;
+                }
+            } else {
+                st.settings_open = None;
+            }
         }
     }
 
@@ -350,6 +384,8 @@ struct TreeBehavior<'a> {
     pending_remove: Option<TileId>,
     /// Requested split: (target pane, layout direction, new panel type).
     pending_split: Option<(TileId, LinearDir, String)>,
+    /// Pane index whose settings window was just requested via context menu.
+    pending_settings: Option<usize>,
     /// Panel type names offered in the split submenus.
     type_names: &'a [&'static str],
     mqtt: Option<MqttDropCtx<'a>>,
@@ -378,9 +414,6 @@ impl egui_tiles::Behavior<usize> for TreeBehavior<'_> {
             if !title.is_empty() {
                 ui.strong(title);
             }
-            egui::CollapsingHeader::new("settings")
-                .id_source((*pane, "panel-settings"))
-                .show(ui, |ui| slot.panel.config_ui(ui));
             slot.panel.render(ui, self.store);
         }
 
@@ -409,6 +442,11 @@ impl egui_tiles::Behavior<usize> for TreeBehavior<'_> {
         }
 
         resp.context_menu(|ui| {
+            if ui.button(format!("{} Settings", icon::GEAR)).clicked() {
+                self.pending_settings = Some(*pane);
+                ui.close_menu();
+            }
+            ui.separator();
             ui.menu_button(format!("{} Split horizontal", icon::COLUMNS), |ui| {
                 for t in self.type_names {
                     if ui.button(*t).clicked() {
