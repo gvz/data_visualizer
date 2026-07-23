@@ -164,6 +164,56 @@ pub fn format_time_of_day(ts_ns: i64) -> String {
     format!("{:02}:{:02}:{:02}.{:03}", s / 3600, (s % 3600) / 60, s % 60, millis)
 }
 
+// ---- legend name shortening ----
+
+/// Split `s` into `(segment, separator)` tokens on `/` and `.` (MQTT topics and
+/// dotted channel ids). The final token's separator is `'\0'`. Keeping the
+/// separator per token lets a name be split on shared segments and rebuilt
+/// without guessing which delimiter joined them.
+fn tokenize_path(s: &str) -> Vec<(&str, char)> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        if c == '/' || c == '.' {
+            out.push((&s[start..i], c));
+            start = i + c.len_utf8();
+        }
+    }
+    out.push((&s[start..], '\0'));
+    out
+}
+
+/// Factor out the path prefix shared by every name so a legend can show it once
+/// instead of on each entry. Returns `(shared_prefix, shorts)` where `shorts[i]`
+/// is `names[i]` with that prefix removed and `format!("{shared_prefix}{short}")`
+/// reproduces the original. Only whole leading segments count, and each name
+/// always keeps its final segment, so `shorts` never has an empty entry.
+/// `shared_prefix` is `""` (and `shorts` mirrors `names`) when fewer than two
+/// names are given or they share no leading segment.
+pub fn shorten_common_prefix(names: &[&str]) -> (String, Vec<String>) {
+    if names.len() < 2 {
+        return (String::new(), names.iter().map(|s| s.to_string()).collect());
+    }
+    let toks: Vec<Vec<(&str, char)>> = names.iter().map(|s| tokenize_path(s)).collect();
+    // Each name must keep its last token, so only len-1 tokens are shareable.
+    let cap = toks.iter().map(|t| t.len().saturating_sub(1)).min().unwrap_or(0);
+    let mut shared = 0;
+    while shared < cap && toks[1..].iter().all(|t| t[shared] == toks[0][shared]) {
+        shared += 1;
+    }
+    if shared == 0 {
+        return (String::new(), names.iter().map(|s| s.to_string()).collect());
+    }
+    let render = |toks: &[(&str, char)]| -> String {
+        toks.iter()
+            .map(|(seg, sep)| if *sep == '\0' { seg.to_string() } else { format!("{seg}{sep}") })
+            .collect()
+    };
+    let prefix = render(&toks[0][..shared]);
+    let shorts = toks.iter().map(|t| render(&t[shared..])).collect();
+    (prefix, shorts)
+}
+
 // ---- panel-config accessors (ctor helpers) ----
 
 pub fn req_str(cfg: &toml::Table, key: &str, panel: &str) -> anyhow::Result<String> {
@@ -399,6 +449,43 @@ b = true"#).unwrap();
         assert_eq!(opt_f64(&cfg, "missing", 7.5), 7.5);
         assert_eq!(opt_i64(&cfg, "f", 0), 2);
         assert!(opt_bool(&cfg, "b", false));
+    }
+
+    #[test]
+    fn shortens_shared_path_prefix() {
+        // Shared leading segments factored out; each keeps its final segment.
+        let (prefix, shorts) = shorten_common_prefix(&[
+            "site/plant/line1/voltage",
+            "site/plant/line1/current",
+        ]);
+        assert_eq!(prefix, "site/plant/line1/");
+        assert_eq!(shorts, vec!["voltage", "current"]);
+
+        // Diverging mid-path stops at the common part.
+        let (prefix, shorts) =
+            shorten_common_prefix(&["a.b.c.x", "a.b.d.y"]);
+        assert_eq!(prefix, "a.b.");
+        assert_eq!(shorts, vec!["c.x", "d.y"]);
+
+        // Rebuild reproduces the originals.
+        for (s, name) in shorts.iter().zip(["a.b.c.x", "a.b.d.y"]) {
+            assert_eq!(format!("{prefix}{s}"), name);
+        }
+
+        // No common segment → unchanged.
+        let (prefix, shorts) = shorten_common_prefix(&["foo/bar", "baz/qux"]);
+        assert_eq!(prefix, "");
+        assert_eq!(shorts, vec!["foo/bar", "baz/qux"]);
+
+        // Single name is left whole (nothing to factor against).
+        let (prefix, shorts) = shorten_common_prefix(&["a/b/c"]);
+        assert_eq!(prefix, "");
+        assert_eq!(shorts, vec!["a/b/c"]);
+
+        // Identical names keep their last segment rather than vanishing.
+        let (prefix, shorts) = shorten_common_prefix(&["a/b", "a/b"]);
+        assert_eq!(prefix, "a/");
+        assert_eq!(shorts, vec!["b", "b"]);
     }
 
     #[test]

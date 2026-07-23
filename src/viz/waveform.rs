@@ -8,7 +8,7 @@ use crate::types::{SampleType, TimeWindow};
 use crate::viz::common::{
     bind, binding_color, binding_error, effective_window_s, format_time_of_day, label_config_row,
     opt_bool, opt_f64_opt, opt_label, opt_str, opt_str_array, refresh_binding, serialize_label,
-    snapshot_to_f64, window_config_row, Binding, RebindCtx,
+    shorten_common_prefix, snapshot_to_f64, window_config_row, Binding, RebindCtx,
 };
 use crate::viz::decimate::decimate_minmax;
 use crate::viz::measure::{stats, Stats};
@@ -145,12 +145,20 @@ impl VizPanel for WaveformPanel {
         // legend exposes no per-item right-click, so we draw our own.)
         let mut toggle: Option<String> = None;
         let mut remove_idx: Option<usize> = None;
+        // Drop the path prefix common to every channel and show it once, so
+        // entries carry only the part that distinguishes them.
+        let names: Vec<&str> = self.bound.iter().map(|b| b.name.as_str()).collect();
+        let (prefix, shorts) = shorten_common_prefix(&names);
         ui.horizontal_wrapped(|ui| {
+            if !prefix.is_empty() {
+                ui.add(egui::Label::new(egui::RichText::new(&prefix).weak()).selectable(false))
+                    .on_hover_text("prefix shared by all channels");
+            }
             for (i, b) in self.bound.iter().enumerate() {
                 let color = binding_color(b, i);
                 let hidden = self.hidden.contains(&b.name);
                 let swatch = if hidden { Color32::GRAY } else { color };
-                let text = egui::RichText::new(&b.name).color(swatch);
+                let text = egui::RichText::new(&shorts[i]).color(swatch);
                 let resp = ui
                     .add(egui::Button::new(text).small().frame(false))
                     .on_hover_text("click: show/hide — right-click: remove");
