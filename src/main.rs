@@ -5,7 +5,9 @@ use anyhow::anyhow;
 
 use datavis::app::DataVisApp;
 use datavis::config::{ChannelRegistry, LayoutConfig};
-use datavis::ingest::{DataSource, IngestConfig, MqttConfig, MqttSource, ZmqSource};
+use datavis::ingest::{
+    DataSource, IngestConfig, MqttConfig, MqttSource, WsConfig, WsSource, ZmqSource,
+};
 use datavis::store::{ChannelStore, LiveStore};
 use datavis::viz::PanelRegistry;
 use datavis::workspace::Workspace;
@@ -53,6 +55,11 @@ fn main() -> anyhow::Result<()> {
             MqttConfig { broker_url: broker, client_id: "datavis".to_string() },
             &channels,
         );
+        sources.push(Box::new(src).spawn(store.clone()));
+    }
+
+    if let Some(listen) = arg_value(&args, "--ws-listen") {
+        let src = WsSource::new(WsConfig { listen }, &channels);
         sources.push(Box::new(src).spawn(store.clone()));
     }
 
