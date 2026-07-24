@@ -30,8 +30,13 @@ pub struct ChannelConfig {
     pub unit: String,
     #[serde(default = "default_color")]
     pub color: String,
+    /// Raw file value; `None` when omitted. The resolved rate (after applying
+    /// `[defaults]` and the hardcoded fallback) lives in `ChannelMeta` — read
+    /// `meta(id).max_rate` for ring sizing, never this field.
     #[serde(default)]
     pub max_rate: Option<u32>,
+    /// Raw file value; `None` when omitted. Resolved value is in `ChannelMeta`
+    /// — read `meta(id).history_s`, never this field.
     #[serde(default)]
     pub history_s: Option<f64>,
     #[serde(default = "default_eu_scale")]
