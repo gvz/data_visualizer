@@ -53,10 +53,15 @@ pub struct WaveformPanel {
     /// set the panel freezes live scrolling: both the data-fetch window and the
     /// plot x-bounds follow this range. In-memory only; double-click clears it.
     zoom: Option<(i64, i64)>,
-    /// Screen x where the current zoom drag began, captured on drag-start. On
-    /// the release frame the pointer button is already up so `press_origin` is
-    /// gone; we need our own copy to know the box's other edge. In-memory only.
-    zoom_drag_x0: Option<f32>,
+    /// Active vertical zoom as an absolute Y-value [lo, hi] range. When set, the
+    /// plot's y-bounds follow this range instead of auto-fitting. Unlike the X
+    /// zoom it does NOT freeze horizontal scrolling — data keeps scrolling under
+    /// a fixed Y window. In-memory only; double-click clears it.
+    y_zoom: Option<(f64, f64)>,
+    /// Screen position where the current zoom drag began, captured on
+    /// drag-start. Needed on the release frame to know the box's opposite corner
+    /// (the press origin is gone once the button is up). In-memory only.
+    zoom_drag_origin: Option<egui::Pos2>,
 }
 
 pub fn ctor(
@@ -78,7 +83,8 @@ pub fn ctor(
         epoch_ns: None,
         hidden: std::collections::HashSet::new(),
         zoom: None,
-        zoom_drag_x0: None,
+        y_zoom: None,
+        zoom_drag_origin: None,
     }))
 }
 
@@ -303,6 +309,10 @@ impl VizPanel for WaveformPanel {
                 format!("{:.*} {unit}", decimals, mark.value)
             });
         }
+        // A vertical zoom pins the y-bounds; without it Y stays auto-fit.
+        if let Some((lo, hi)) = self.y_zoom {
+            plot = plot.include_y(lo).include_y(hi);
+        }
         let inner = plot.show(ui, |plot_ui| {
             for (i, ts, vals) in &snaps {
                 let b = &self.bound[*i];
@@ -348,40 +358,71 @@ impl VizPanel for WaveformPanel {
             plot_ui.pointer_coordinate()
         });
 
-        // Left-drag draws a full-height selection box; releasing zooms the time
-        // axis to that span (vertical extent ignored). Double-click clears the
-        // zoom and resumes live scrolling. A plain click is not a drag, so this
-        // never fires cursor placement below.
+        // Left-drag draws a selection box; releasing zooms. A plain drag snaps
+        // to the dominant axis (full-height band → X, full-width band → Y); a
+        // Shift-drag is a free both-axis box zoom. Double-click clears both
+        // zooms. A plain click is not a drag, so this never fires cursor
+        // placement below.
         let tf = &inner.transform;
         let frame = *tf.frame();
         let primary = egui::PointerButton::Primary;
         if inner.response.drag_started_by(primary) {
-            self.zoom_drag_x0 = inner.response.interact_pointer_pos().map(|p| p.x);
+            self.zoom_drag_origin = inner.response.interact_pointer_pos();
         }
-        if let (Some(sx), Some(cur)) = (self.zoom_drag_x0, inner.response.interact_pointer_pos()) {
-            let x0 = sx.min(cur.x).clamp(frame.left(), frame.right());
-            let x1 = sx.max(cur.x).clamp(frame.left(), frame.right());
+        if let (Some(p0), Some(cur)) =
+            (self.zoom_drag_origin, inner.response.interact_pointer_pos())
+        {
+            let free = ui.input(|i| i.modifiers.shift);
+            let x0 = p0.x.min(cur.x).clamp(frame.left(), frame.right());
+            let x1 = p0.x.max(cur.x).clamp(frame.left(), frame.right());
+            let y0 = p0.y.min(cur.y).clamp(frame.top(), frame.bottom());
+            let y1 = p0.y.max(cur.y).clamp(frame.top(), frame.bottom());
+            let (dx, dy) = (x1 - x0, y1 - y0);
+            let (zx, zy) = zoom_axes(dx, dy, free);
+
+            // Preview the region that will apply: full 2D box under Shift, else
+            // a band on whichever axis is dominant. Drawn while dragging
+            // regardless of threshold so the intent is visible immediately.
             if inner.response.dragged_by(primary) {
-                let rect =
-                    egui::Rect::from_min_max(egui::pos2(x0, frame.top()), egui::pos2(x1, frame.bottom()));
+                let rect = if free {
+                    egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1))
+                } else if dx >= dy {
+                    egui::Rect::from_min_max(
+                        egui::pos2(x0, frame.top()),
+                        egui::pos2(x1, frame.bottom()),
+                    )
+                } else {
+                    egui::Rect::from_min_max(
+                        egui::pos2(frame.left(), y0),
+                        egui::pos2(frame.right(), y1),
+                    )
+                };
                 ui.painter().rect_filled(rect, 0.0, Color32::from_white_alpha(24));
                 ui.painter().rect_stroke(rect, 0.0, egui::Stroke::new(1.0_f32, Color32::WHITE));
             }
-            // Require a few pixels of travel so a slightly-dragged click doesn't
-            // collapse the view to a near-zero time span.
             if inner.response.drag_stopped_by(primary) {
-                if x1 - x0 >= 5.0 {
+                if zx {
                     let ns_at = |x: f32| {
-                        anchor + (tf.value_from_position(egui::pos2(x, frame.center().y)).x * 1e9) as i64
+                        anchor
+                            + (tf.value_from_position(egui::pos2(x, frame.center().y)).x * 1e9)
+                                as i64
                     };
                     let (a, b) = (ns_at(x0), ns_at(x1));
                     self.zoom = Some((a.min(b), a.max(b)));
                 }
-                self.zoom_drag_x0 = None;
+                if zy {
+                    let val_at =
+                        |y: f32| tf.value_from_position(egui::pos2(frame.center().x, y)).y;
+                    // Screen y grows downward, so y0 (top) is the larger value.
+                    let (a, b) = (val_at(y0), val_at(y1));
+                    self.y_zoom = Some((a.min(b), a.max(b)));
+                }
+                self.zoom_drag_origin = None;
             }
         }
         if inner.response.double_clicked() {
             self.zoom = None;
+            self.y_zoom = None;
         }
 
         if self.cursors && inner.response.clicked() {
@@ -477,7 +518,8 @@ impl VizPanel for WaveformPanel {
 
     fn reset_zoom(&mut self) {
         self.zoom = None;
-        self.zoom_drag_x0 = None;
+        self.y_zoom = None;
+        self.zoom_drag_origin = None;
     }
 }
 
@@ -615,7 +657,8 @@ channels = ["demo.sine"]"#,
             hidden: std::collections::HashSet::new(),
             // Frozen sub-range in the middle of the written data.
             zoom: Some((200_000_000, 400_000_000)),
-            zoom_drag_x0: None,
+            y_zoom: None,
+            zoom_drag_origin: None,
         };
         let ctx = egui::Context::default();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
@@ -671,5 +714,38 @@ channels = ["demo.sine", "demo.log", "does.not.exist"]"#,
         // Free drag with one axis under threshold zooms only the other.
         assert_eq!(zoom_axes(20.0, 2.0, true), (true, false));
         assert_eq!(zoom_axes(2.0, 20.0, true), (false, true));
+    }
+
+    #[test]
+    fn y_zoomed_render_preserves_range_without_panic() {
+        let channels = registry();
+        let store = LiveStore::from_registry(&channels);
+        let sine = channels.id("demo.sine").unwrap();
+        for i in 0..1000i64 {
+            store.write_numeric(sine, i * 1_000_000, NumericVal::Float((i as f64 * 0.1).sin()));
+        }
+        let mut p = WaveformPanel {
+            title: "demo.sine".into(),
+            label: None,
+            bound: vec![bind("demo.sine", &channels, ACCEPTED)],
+            time_window_s: None,
+            cursors: false,
+            dots: false,
+            y_unit: String::new(),
+            cursor_a_ns: None,
+            cursor_b_ns: None,
+            epoch_ns: None,
+            hidden: std::collections::HashSet::new(),
+            zoom: None,
+            // Vertical zoom set; horizontal scroll stays live.
+            y_zoom: Some((-0.5, 0.5)),
+            zoom_drag_origin: None,
+        };
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| p.render(ui, &store));
+        });
+        // Y zoom is independent of the store clock, so it survives a render.
+        assert_eq!(p.y_zoom, Some((-0.5, 0.5)));
     }
 }
