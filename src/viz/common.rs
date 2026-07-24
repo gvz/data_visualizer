@@ -277,6 +277,38 @@ pub fn set_global_window_s(ctx: &egui::Context, secs: f64) {
     ctx.data_mut(|d| d.insert_temp(global_window_id(), secs));
 }
 
+fn linked_zoom_enabled_id() -> egui::Id {
+    egui::Id::new("datavis_linked_zoom_enabled")
+}
+
+fn linked_zoom_range_id() -> egui::Id {
+    egui::Id::new("datavis_linked_zoom_range")
+}
+
+/// Whether linked time-zoom is armed (the toolbar checkbox). The app
+/// republishes this into ctx data each frame; time-based panels read it during
+/// render. Absent (e.g. headless panel tests) → false.
+pub fn linked_zoom_enabled(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(linked_zoom_enabled_id())).unwrap_or(false)
+}
+
+/// Publish whether linked time-zoom is armed.
+pub fn set_linked_zoom_enabled(ctx: &egui::Context, on: bool) {
+    ctx.data_mut(|d| d.insert_temp(linked_zoom_enabled_id(), on));
+}
+
+/// The shared absolute-ns time window `[start, end]` while linked, or `None`
+/// when armed but not yet zoomed. A waveform's zoom gesture writes it; every
+/// participating panel reads it. Absent → None.
+pub fn linked_zoom_range(ctx: &egui::Context) -> Option<(i64, i64)> {
+    ctx.data(|d| d.get_temp::<Option<(i64, i64)>>(linked_zoom_range_id())).flatten()
+}
+
+/// Publish (or clear, with `None`) the shared linked time window.
+pub fn set_linked_zoom_range(ctx: &egui::Context, range: Option<(i64, i64)>) {
+    ctx.data_mut(|d| d.insert_temp(linked_zoom_range_id(), range));
+}
+
 /// Effective window for a panel: its explicit override, else the global default.
 pub fn effective_window_s(ctx: &egui::Context, override_s: Option<f64>) -> f64 {
     override_s.unwrap_or_else(|| global_window_s(ctx))
@@ -520,5 +552,22 @@ b = true"#).unwrap();
         assert!(b.id.is_some());
         assert!(b.type_ok);
         assert_eq!(reg.meta(b.id.unwrap()).sample_type, SampleType::Float);
+    }
+
+    #[test]
+    fn linked_zoom_round_trips_through_ctx() {
+        let ctx = egui::Context::default();
+        // Defaults when nothing has been published.
+        assert!(!linked_zoom_enabled(&ctx));
+        assert_eq!(linked_zoom_range(&ctx), None);
+
+        set_linked_zoom_enabled(&ctx, true);
+        assert!(linked_zoom_enabled(&ctx));
+
+        set_linked_zoom_range(&ctx, Some((100, 200)));
+        assert_eq!(linked_zoom_range(&ctx), Some((100, 200)));
+
+        set_linked_zoom_range(&ctx, None);
+        assert_eq!(linked_zoom_range(&ctx), None);
     }
 }

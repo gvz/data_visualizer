@@ -40,6 +40,11 @@ pub trait VizPanel {
     /// no-op; panels with a zoom state (e.g. waveform) override. Driven by the
     /// global "reset zoom" toolbar action across every panel.
     fn reset_zoom(&mut self) {}
+    /// Freeze a linked time-window into this panel's own zoom state so it stays
+    /// put after the link is released. Default no-op; waveform and state_graph
+    /// override. Only called for participating panels when a shared linked zoom
+    /// is active.
+    fn freeze_time_zoom(&mut self, _range: (i64, i64)) {}
 }
 
 /// Constructor: panel-specific toml table + channel registry (for resolving
