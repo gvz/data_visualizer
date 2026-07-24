@@ -81,6 +81,9 @@ struct ChannelsFile {
     #[serde(default)]
     defaults: ChannelDefaults,
     // BTreeMap: sorted names → deterministic ChannelId assignment.
+    // Defaults to empty so a channels.toml with no channels (or only
+    // `[defaults]`, or an empty file) is valid.
+    #[serde(default)]
     channels: BTreeMap<String, ChannelConfig>,
 }
 
@@ -511,5 +514,29 @@ type = "float"
 "#,
         );
         assert!(err.is_err(), "unknown [defaults] key must be rejected");
+    }
+
+    #[test]
+    fn empty_file_is_valid_and_has_no_channels() {
+        let reg = ChannelRegistry::from_toml_str("").unwrap();
+        assert!(reg.is_empty());
+        assert_eq!(reg.len(), 0);
+    }
+
+    #[test]
+    fn defaults_only_file_is_valid_with_no_channels() {
+        let reg = ChannelRegistry::from_toml_str(
+            r#"
+[defaults]
+max_rate = 100000
+history_s = 5.0
+"#,
+        )
+        .unwrap();
+        assert!(reg.is_empty());
+        // A later dynamic channel still picks up the [defaults].
+        let id = reg.add_dynamic("dyn/topic", "dyn/topic", SampleType::Float);
+        assert_eq!(reg.meta(id).max_rate, 100_000);
+        assert_eq!(reg.meta(id).history_s, 5.0);
     }
 }
