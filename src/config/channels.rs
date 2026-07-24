@@ -75,8 +75,10 @@ struct ChannelDefaults {
     history_s: Option<f64>,
 }
 
+// No `deny_unknown_fields`: config.toml is shared with the layout, so the
+// `default_window_s` scalar and `[screens]` tables live here too and must be
+// ignored by the channel parser (LayoutConfig reads those).
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ChannelsFile {
     #[serde(default)]
     defaults: ChannelDefaults,
@@ -144,7 +146,7 @@ fn dynamic_channel(
 
 impl ChannelRegistry {
     pub fn from_toml_str(s: &str) -> anyhow::Result<Self> {
-        let file: ChannelsFile = toml::from_str(s).context("parsing channels.toml")?;
+        let file: ChannelsFile = toml::from_str(s).context("parsing config.toml channels")?;
         let defaults = file.defaults;
         let mut ids = HashMap::new();
         let mut configs = Vec::new();

@@ -45,6 +45,14 @@ pub struct WaveformPanel {
     epoch_ns: Option<i64>,
     /// Channel names toggled off via the legend (left-click). In-memory only.
     hidden: std::collections::HashSet<String>,
+    /// Active horizontal time-zoom as an absolute-ns [start, end] range. When
+    /// set the panel freezes live scrolling: both the data-fetch window and the
+    /// plot x-bounds follow this range. In-memory only; double-click clears it.
+    zoom: Option<(i64, i64)>,
+    /// Screen x where the current zoom drag began, captured on drag-start. On
+    /// the release frame the pointer button is already up so `press_origin` is
+    /// gone; we need our own copy to know the box's other edge. In-memory only.
+    zoom_drag_x0: Option<f32>,
 }
 
 pub fn ctor(
@@ -65,6 +73,8 @@ pub fn ctor(
         cursor_b_ns: None,
         epoch_ns: None,
         hidden: std::collections::HashSet::new(),
+        zoom: None,
+        zoom_drag_x0: None,
     }))
 }
 
@@ -199,13 +209,18 @@ impl VizPanel for WaveformPanel {
             ui.label("no data");
             return;
         }
-        // Anchor the window's right edge on the store clock so the live scrub
-        // slider (and replay position) drive the view instead of pinning to the
-        // newest sample.
-        let end_ns = store.now_ns();
+        // A horizontal zoom freezes the scrolling window and drives both the
+        // data-fetch range and the plot x-bounds. Otherwise the window's right
+        // edge tracks the store clock so the live scrub slider (and replay
+        // position) drive the view instead of pinning to the newest sample.
         let win_s = effective_window_s(ui.ctx(), self.time_window_s);
-        let span_ns = (win_s * 1e9) as i64;
-        let t0 = end_ns - span_ns;
+        let (t0, end_ns) = match self.zoom {
+            Some((a, b)) => (a, b),
+            None => {
+                let end = store.now_ns();
+                (end - (win_s * 1e9) as i64, end)
+            }
+        };
         let window = TimeWindow { start_ns: t0, end_ns: end_ns + 1 };
 
         // Fixed plot origin (whole second) chosen on first render. All x values
@@ -234,6 +249,14 @@ impl VizPanel for WaveformPanel {
         let unit = self.y_unit.clone();
         let unit_hover = unit.clone();
         let mut plot = Plot::new(("waveform", &self.title))
+            // egui_plot's own pan/scroll/zoom are disabled so left-drag is free
+            // for our horizontal time-zoom and the include_x bounds stay
+            // authoritative (built-in zoom would flip auto_bounds off).
+            .allow_drag(false)
+            .allow_scroll(false)
+            .allow_zoom(false)
+            .allow_boxed_zoom(false)
+            .allow_double_click_reset(false)
             .include_x(x_of(t0))
             .include_x(x_of(end_ns))
             // X is plotted relative to the fixed anchor; label the ticks with the
@@ -304,6 +327,43 @@ impl VizPanel for WaveformPanel {
             }
             plot_ui.pointer_coordinate()
         });
+
+        // Left-drag draws a full-height selection box; releasing zooms the time
+        // axis to that span (vertical extent ignored). Double-click clears the
+        // zoom and resumes live scrolling. A plain click is not a drag, so this
+        // never fires cursor placement below.
+        let tf = &inner.transform;
+        let frame = *tf.frame();
+        let primary = egui::PointerButton::Primary;
+        if inner.response.drag_started_by(primary) {
+            self.zoom_drag_x0 = inner.response.interact_pointer_pos().map(|p| p.x);
+        }
+        if let (Some(sx), Some(cur)) = (self.zoom_drag_x0, inner.response.interact_pointer_pos()) {
+            let x0 = sx.min(cur.x).clamp(frame.left(), frame.right());
+            let x1 = sx.max(cur.x).clamp(frame.left(), frame.right());
+            if inner.response.dragged_by(primary) {
+                let rect =
+                    egui::Rect::from_min_max(egui::pos2(x0, frame.top()), egui::pos2(x1, frame.bottom()));
+                ui.painter().rect_filled(rect, 0.0, Color32::from_white_alpha(24));
+                ui.painter().rect_stroke(rect, 0.0, egui::Stroke::new(1.0_f32, Color32::WHITE));
+            }
+            // Require a few pixels of travel so a slightly-dragged click doesn't
+            // collapse the view to a near-zero time span.
+            if inner.response.drag_stopped_by(primary) {
+                if x1 - x0 >= 5.0 {
+                    let ns_at = |x: f32| {
+                        anchor + (tf.value_from_position(egui::pos2(x, frame.center().y)).x * 1e9) as i64
+                    };
+                    let (a, b) = (ns_at(x0), ns_at(x1));
+                    self.zoom = Some((a.min(b), a.max(b)));
+                }
+                self.zoom_drag_x0 = None;
+            }
+        }
+        if inner.response.double_clicked() {
+            self.zoom = None;
+        }
+
         if self.cursors && inner.response.clicked() {
             if let Some(p) = inner.inner {
                 let raw_ts = anchor + (p.x * 1e9) as i64;
@@ -393,6 +453,11 @@ impl VizPanel for WaveformPanel {
         for b in &mut self.bound {
             refresh_binding(b, ACCEPTED, ctx);
         }
+    }
+
+    fn reset_zoom(&mut self) {
+        self.zoom = None;
+        self.zoom_drag_x0 = None;
     }
 }
 
@@ -506,6 +571,38 @@ channels = ["demo.sine"]"#,
         assert_eq!(nearest_point(&ts, &vals, 190), Some((200, 12.0)));
         assert_eq!(nearest_point(&ts, &vals, 200), Some((200, 12.0)));
         assert_eq!(nearest_point(&[], &[], 5), None);
+    }
+
+    #[test]
+    fn zoomed_window_fetches_frozen_range_without_panic() {
+        let channels = registry();
+        let store = LiveStore::from_registry(&channels);
+        let sine = channels.id("demo.sine").unwrap();
+        for i in 0..1000i64 {
+            store.write_numeric(sine, i * 1_000_000, NumericVal::Float((i as f64 * 0.1).sin()));
+        }
+        let mut p = WaveformPanel {
+            title: "demo.sine".into(),
+            label: None,
+            bound: vec![bind("demo.sine", &channels, ACCEPTED)],
+            time_window_s: None,
+            cursors: false,
+            dots: false,
+            y_unit: String::new(),
+            cursor_a_ns: None,
+            cursor_b_ns: None,
+            epoch_ns: None,
+            hidden: std::collections::HashSet::new(),
+            // Frozen sub-range in the middle of the written data.
+            zoom: Some((200_000_000, 400_000_000)),
+            zoom_drag_x0: None,
+        };
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| p.render(ui, &store));
+        });
+        // Zoom range is independent of the store clock (no now_ns pinning).
+        assert_eq!(p.zoom, Some((200_000_000, 400_000_000)));
     }
 
     #[test]

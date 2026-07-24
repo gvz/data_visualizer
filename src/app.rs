@@ -179,6 +179,10 @@ pub struct DataVisApp {
     /// data buffered during the pause.
     live_paused: bool,
     live_pause_ns: i64,
+    /// Last observed store write counter. When it stops advancing the live view
+    /// is idle, so the update loop drops to a slow heartbeat instead of forcing
+    /// 60 fps repaints. See [`ChannelStore::write_seq`].
+    last_write_seq: u64,
     /// App-wide default visible time span (seconds); panels without an explicit
     /// override follow it. Published to egui ctx data each frame.
     default_window_s: f64,
@@ -237,6 +241,7 @@ impl DataVisApp {
             live_history_s,
             live_paused: false,
             live_pause_ns: 0,
+            last_write_seq: 0,
             default_window_s,
         }
     }
@@ -264,6 +269,35 @@ impl DataVisApp {
             }
             Err(e) => self.status = format!("layout load failed: {e}"),
         }
+    }
+
+    /// Prompt for a target file and save the layout there, then make it the
+    /// active config path so later quick-saves follow it. The channel section
+    /// of an existing target is preserved (same merge as `save_layout`); a new
+    /// target gets a layout-only file.
+    fn save_layout_as(&mut self) {
+        let start = self.layout_path.file_name().and_then(|n| n.to_str()).unwrap_or("config.toml");
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("TOML config", &["toml"])
+            .set_file_name(start)
+            .save_file()
+        else {
+            return;
+        };
+        self.layout_path = path;
+        self.save_layout();
+    }
+
+    /// Prompt for a config file and load its layout, then make it the active
+    /// config path. Channels are fixed at startup and unaffected.
+    fn load_layout_from(&mut self) {
+        let Some(path) =
+            rfd::FileDialog::new().add_filter("TOML config", &["toml"]).pick_file()
+        else {
+            return;
+        };
+        self.layout_path = path;
+        self.load_layout();
     }
 
     fn start_recording(&mut self) {
@@ -355,8 +389,16 @@ impl DataVisApp {
                         self.save_layout();
                         ui.close_menu();
                     }
+                    if ui.button(format!("{} Save layout as…", icon::FLOPPY_DISK)).clicked() {
+                        self.save_layout_as();
+                        ui.close_menu();
+                    }
                     if ui.button(format!("{} Load layout", icon::FOLDER_OPEN)).clicked() {
                         self.load_layout();
+                        ui.close_menu();
+                    }
+                    if ui.button(format!("{} Load layout from…", icon::FOLDER_OPEN)).clicked() {
+                        self.load_layout_from();
                         ui.close_menu();
                     }
                     ui.separator();
@@ -418,6 +460,13 @@ impl DataVisApp {
                         .range(0.1..=3600.0),
                 )
                 .on_hover_text("Default visible time span for time-based panels");
+                if ui
+                    .button(icon::MAGNIFYING_GLASS_MINUS)
+                    .on_hover_text("Reset zoom on all waveforms")
+                    .clicked()
+                {
+                    self.workspace.reset_zoom();
+                }
                 ui.separator();
                 let (theme_icon, theme_hint) =
                     if self.dark_mode { (icon::SUN, "Light mode") } else { (icon::MOON, "Dark mode") };
@@ -633,7 +682,22 @@ impl DataVisApp {
 
 impl eframe::App for DataVisApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(Duration::from_millis(16));
+        // Repaint only as fast as something actually changes. A blanket 60 fps
+        // repaint burns a full CPU core re-tessellating static panels even with
+        // no data. Animate at 60 fps while replay is playing or fresh live
+        // samples are arriving; otherwise fall back to a slow heartbeat that
+        // still polls for new data and connection state. Any input event
+        // repaints immediately regardless of this hint.
+        let animating = match self.mode {
+            AppMode::Replay(ref rs) => rs.playing,
+            AppMode::Live => {
+                let seq = self.store.write_seq();
+                let changed = seq != self.last_write_seq;
+                self.last_write_seq = seq;
+                changed && !self.live_paused
+            }
+        };
+        ctx.request_repaint_after(Duration::from_millis(if animating { 16 } else { 200 }));
 
         // Publish the app-wide default window so panels can read it this frame.
         crate::viz::common::set_global_window_s(ctx, self.default_window_s);

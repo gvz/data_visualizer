@@ -26,6 +26,13 @@ pub trait ChannelStore: Send + Sync {
         crate::types::now_ns()
     }
 
+    /// Monotonic counter bumped on every data write. The GUI polls this for
+    /// cheap change detection so it repaints at full rate only while new
+    /// samples arrive and stays idle otherwise. Default 0 = never changes.
+    fn write_seq(&self) -> u64 {
+        0
+    }
+
     /// Newest sample at or before `end_ns`. When panels pass `now_ns()`, this
     /// honors the live scrub slider (and replay position) instead of always
     /// returning the very latest sample.

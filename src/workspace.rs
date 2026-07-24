@@ -334,6 +334,16 @@ impl Workspace {
         }
     }
 
+    /// Clear the interactive time-zoom on every panel across all screens, so
+    /// one toolbar click returns the whole workspace to its live/default view.
+    pub fn reset_zoom(&mut self) {
+        for st in self.screens.values_mut() {
+            for slot in &mut st.panels {
+                slot.panel.reset_zoom();
+            }
+        }
+    }
+
     pub fn add_screen(&mut self, name: &str) {
         if !self.screens.contains_key(name) {
             self.screens.insert(name.to_string(), ScreenState::empty(name));
@@ -444,6 +454,12 @@ impl egui_tiles::Behavior<usize> for TreeBehavior<'_> {
         resp.context_menu(|ui| {
             if ui.button(format!("{} Settings", icon::GEAR)).clicked() {
                 self.pending_settings = Some(*pane);
+                ui.close_menu();
+            }
+            if ui.button(format!("{} Reset zoom", icon::MAGNIFYING_GLASS_MINUS)).clicked() {
+                if let Some(slot) = self.panels.get_mut(*pane) {
+                    slot.panel.reset_zoom();
+                }
                 ui.close_menu();
             }
             ui.separator();

@@ -1,0 +1,64 @@
+default_window_s = 60.0
+
+[defaults]
+max_rate  = 100000
+history_s = 5.0
+
+[screens.analysis]
+tiles_json = '{"id":3063161388594286623,"root":9,"tiles":{"next_tile_id":10,"tiles":{"9":{"Pane":0}},"invisible":[]},"height":null,"width":null}'
+
+[[screens.analysis.panels]]
+type = "waveform"
+channels = [
+    "homeassistant/sensor/tech_powermeter_voltage_l1/state",
+    "load/ch0",
+]
+cursors = false
+dots = false
+
+[screens.main]
+tiles_json = '{"id":5410085660609570307,"root":8,"tiles":{"next_tile_id":9,"tiles":{"2":{"Pane":1},"4":{"Pane":3},"7":{"Pane":6},"1":{"Pane":0},"8":{"Container":{"Grid":{"children":[1,2,3,4,5,6,7],"layout":"Auto","col_shares":[],"row_shares":[]}}},"5":{"Pane":4},"6":{"Pane":5},"3":{"Pane":2}},"invisible":[]},"height":null,"width":null}'
+
+[[screens.main.panels]]
+type = "waveform"
+channels = ["example/demo/sine"]
+cursors = true
+dots = false
+time_window_s = 5.0
+
+[[screens.main.panels]]
+type = "gauge"
+channel = "example/demo/sine"
+max = 10.0
+min = -10.0
+
+[[screens.main.panels]]
+type = "numeric"
+channel = "example/demo/counter"
+
+[[screens.main.panels]]
+type = "state_graph"
+channel = "example/demo/enabled"
+time_window_s = 30.0
+
+[screens.main.panels.states]
+0 = "OFF"
+1 = "ON"
+
+[[screens.main.panels]]
+type = "log"
+channels = ["example/demo/log"]
+max_lines = 200
+
+[[screens.main.panels]]
+type = "gauge"
+channel = "example/demo/counter"
+max = 100.0
+min = 0.0
+
+[[screens.main.panels]]
+type = "waveform"
+channels = ["example/demo/counter"]
+cursors = false
+dots = false
+time_window_s = 5.0

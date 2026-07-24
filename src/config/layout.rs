@@ -4,8 +4,10 @@ use std::path::Path;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-/// layout.toml — screens with panel lists. Panel-specific settings stay an
-/// opaque toml::Table here; the viz PanelRegistry interprets them.
+/// Layout half of config.toml — screens with panel lists. Panel-specific
+/// settings stay an opaque toml::Table here; the viz PanelRegistry interprets
+/// them. Channels live in the same file but are parsed by ChannelRegistry;
+/// this parser ignores the `[defaults]`/`[channels]` sections.
 fn default_window_s() -> f64 {
     10.0
 }
@@ -48,7 +50,7 @@ pub struct PanelEntry {
 
 impl LayoutConfig {
     pub fn from_toml_str(s: &str) -> anyhow::Result<Self> {
-        toml::from_str(s).context("parsing layout.toml")
+        toml::from_str(s).context("parsing config.toml layout")
     }
 
     pub fn to_toml_string(&self) -> anyhow::Result<String> {
@@ -61,10 +63,36 @@ impl LayoutConfig {
         Self::from_toml_str(&s)
     }
 
+    /// Write the layout (`default_window_s` + `[screens]`) into `path` while
+    /// preserving every other section — `[defaults]`, `[channels]`, comments,
+    /// and formatting — verbatim. config.toml is shared with the hand-authored
+    /// channel list, so a blind re-serialize would clobber it.
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        std::fs::write(path, self.to_toml_string()?)
-            .with_context(|| format!("writing {}", path.display()))?;
+        let existing = std::fs::read_to_string(path).unwrap_or_default();
+        let out = self.merge_into(&existing)?;
+        std::fs::write(path, out).with_context(|| format!("writing {}", path.display()))?;
         Ok(())
+    }
+
+    /// Build the config.toml text: the layout portion (`default_window_s` +
+    /// `[screens]`) regenerated fresh and placed first (a root scalar must
+    /// precede every table header), followed by every other section from
+    /// `existing` — `[defaults]`, `[channels]`, and their comments — kept
+    /// verbatim by stripping only the two layout-owned keys with toml_edit.
+    fn merge_into(&self, existing: &str) -> anyhow::Result<String> {
+        let mut doc: toml_edit::DocumentMut =
+            existing.parse().context("parsing existing config.toml")?;
+        doc.remove("default_window_s");
+        doc.remove("screens");
+        let preserved = doc.to_string();
+        let preserved = preserved.trim();
+
+        let layout = self.to_toml_string()?;
+        if preserved.is_empty() {
+            Ok(layout)
+        } else {
+            Ok(format!("{}\n\n{}\n", layout.trim_end(), preserved))
+        }
     }
 }
 
@@ -144,6 +172,52 @@ channel = "demo.sine"
         );
         let l2 = LayoutConfig::from_toml_str(&l.to_toml_string().unwrap()).unwrap();
         assert_eq!(l, l2);
+    }
+
+    #[test]
+    fn save_preserves_channels_and_comments() {
+        // A shared config.toml with a hand-authored, commented channel section.
+        let src = r#"default_window_s = 30.0
+
+[defaults]
+max_rate = 100000  # global fallback
+
+# Voltage on phase 1
+[channels."volt.l1"]
+mqtt_topic = "home/volt/l1"
+type = "float"
+
+[screens.main]
+[[screens.main.panels]]
+type = "numeric"
+channel = "volt.l1"
+"#;
+        let dir = std::env::temp_dir().join("datavis_merge_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, src).unwrap();
+
+        // Load layout, change a layout-owned value, save back.
+        let mut l = LayoutConfig::load(&path).unwrap();
+        l.default_window_s = 12.5;
+        l.save(&path).unwrap();
+
+        let out = std::fs::read_to_string(&path).unwrap();
+        // Channel section and its comments survive verbatim.
+        assert!(out.contains("# Voltage on phase 1"));
+        assert!(out.contains("max_rate = 100000  # global fallback"));
+        assert!(out.contains(r#"[channels."volt.l1"]"#));
+        // Layout value was rewritten; a root scalar still leads the file.
+        assert!(out.contains("default_window_s = 12.5"));
+        assert!(out.trim_start().starts_with("default_window_s"));
+
+        // Channels still parse from the rewritten file.
+        let reg = crate::config::ChannelRegistry::from_toml_str(&out).unwrap();
+        assert!(reg.id("volt.l1").is_some());
+        // Layout re-reads with the updated value.
+        let l2 = LayoutConfig::load(&path).unwrap();
+        assert_eq!(l2.default_window_s, 12.5);
+        assert_eq!(l2.screens["main"].panels.len(), 1);
     }
 
     #[test]

@@ -36,6 +36,10 @@ pub trait VizPanel {
     /// MQTT topics are discovered, so a panel loaded from a layout before its
     /// (dynamic) MQTT topic reappeared can bind once it does. Default no-op.
     fn refresh_bindings(&mut self, _ctx: &common::RebindCtx) {}
+    /// Clear any interactive zoom and resume the default/live view. Default
+    /// no-op; panels with a zoom state (e.g. waveform) override. Driven by the
+    /// global "reset zoom" toolbar action across every panel.
+    fn reset_zoom(&mut self) {}
 }
 
 /// Constructor: panel-specific toml table + channel registry (for resolving

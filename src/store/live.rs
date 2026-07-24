@@ -26,6 +26,9 @@ struct ChannelSlot {
 pub struct LiveStore {
     channels: boxcar::Vec<ChannelSlot>,
     type_errors: AtomicU64,
+    /// Bumped on every write; the GUI polls it for cheap change detection so it
+    /// only repaints at full rate while data is arriving.
+    writes: AtomicU64,
     /// When non-zero, `now_ns()` returns this value instead of the wall clock.
     /// Set by the app to implement live scrubbing without entering replay mode.
     pub view_override: Arc<AtomicI64>,
@@ -50,7 +53,12 @@ impl LiveStore {
         for id in reg.iter_ids() {
             channels.push(slot_from_meta(reg.meta(id).clone()));
         }
-        Self { channels, type_errors: AtomicU64::new(0), view_override: Arc::new(AtomicI64::new(0)) }
+        Self {
+            channels,
+            type_errors: AtomicU64::new(0),
+            writes: AtomicU64::new(0),
+            view_override: Arc::new(AtomicI64::new(0)),
+        }
     }
 
     /// Count of writes dropped because value type didn't match channel type.
@@ -74,6 +82,7 @@ impl ChannelStore for LiveStore {
     }
 
     fn write_numeric(&self, channel: ChannelId, ts: i64, val: NumericVal) {
+        self.writes.fetch_add(1, Ordering::Relaxed);
         match (&self.slot(channel).data, val) {
             (ChannelData::Float(r), NumericVal::Float(v)) => r.push(ts, v),
             (ChannelData::Int(r), NumericVal::Int(v)) => r.push(ts, v),
@@ -83,10 +92,15 @@ impl ChannelStore for LiveStore {
     }
 
     fn write_text(&self, channel: ChannelId, ts: i64, line: String) {
+        self.writes.fetch_add(1, Ordering::Relaxed);
         match &self.slot(channel).data {
             ChannelData::Text(t) => t.push(ts, line),
             _ => self.count_type_error(),
         }
+    }
+
+    fn write_seq(&self) -> u64 {
+        self.writes.load(Ordering::Relaxed)
     }
 
     fn snapshot(&self, channel: ChannelId, window: TimeWindow) -> ChannelSnapshot {

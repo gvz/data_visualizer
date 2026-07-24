@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::anyhow;
@@ -14,15 +14,19 @@ use datavis::workspace::Workspace;
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
     let demo = args.iter().any(|a| a == "--demo");
     let endpoint =
         arg_value(&args, "--endpoint").unwrap_or_else(|| "tcp://localhost:5555".to_string());
     let schema_path =
         arg_value(&args, "--schema").unwrap_or_else(|| "schema.proto".to_string());
     let mqtt_endpoint = arg_value(&args, "--mqtt-endpoint");
-    let layout_path = PathBuf::from("layout.toml");
+    let layout_path = PathBuf::from("config.toml");
 
-    let channels = ChannelRegistry::load(Path::new("channels.toml"))?;
+    let channels = ChannelRegistry::load(&layout_path)?;
     let layout = LayoutConfig::load(&layout_path)?;
 
     let store = Arc::new(LiveStore::from_registry(&channels));
@@ -94,4 +98,28 @@ fn main() -> anyhow::Result<()> {
 
 fn arg_value(args: &[String], flag: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
+}
+
+fn print_help() {
+    println!(
+        "datavis - real-time channel data visualizer
+
+USAGE:
+    datavis [OPTIONS]
+
+OPTIONS:
+    --demo                    Run with the built-in demo source (no live inputs).
+    --endpoint <ADDR>         ZMQ SUB endpoint for live proto data.
+                              [default: tcp://localhost:5555]
+    --schema <PATH>           Proto schema file for the ZMQ source.
+                              [default: schema.proto]
+    --mqtt-endpoint <ADDR>    MQTT broker as \"host:port\" (or \"host\", port 1883).
+                              Enables the MQTT source; off when omitted.
+    --ws-listen <ADDR>        Bind a WebSocket server (\"host:port\") that receives
+                              InfluxDB line protocol. Off when omitted.
+    -h, --help                Print this help and exit.
+
+Channels and layout share config.toml; the layout section persists there.
+The status indicator reads LIVE if any configured source is receiving data."
+    );
 }
