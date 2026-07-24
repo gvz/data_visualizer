@@ -4,7 +4,10 @@ use crate::config::ChannelRegistry;
 use crate::dynamic_channel::resolve_or_register_drop;
 use crate::store::ChannelStore;
 use crate::types::{ChannelId, Sample, SampleType};
-use crate::viz::common::{label_config_row, opt_label, opt_str, serialize_label, RebindCtx};
+use crate::viz::common::{
+    label_config_row, opt_label, opt_str, sample_as_f64, serialize_label, ColorThresholds,
+    RebindCtx,
+};
 use crate::viz::VizPanel;
 
 pub const TYPE_NAME: &str = "numeric";
@@ -21,6 +24,8 @@ pub struct NumericPanel {
     unit: String,
     /// Per-panel unit suffix override; when non-empty it replaces `unit`.
     unit_override: String,
+    /// Color cutoffs applied to the readout text.
+    colors: ColorThresholds,
 }
 
 impl NumericPanel {
@@ -54,6 +59,7 @@ pub fn ctor(
         type_ok,
         unit,
         unit_override: opt_str(cfg, "unit"),
+        colors: ColorThresholds::from_config(cfg),
     }))
 }
 
@@ -78,6 +84,8 @@ impl VizPanel for NumericPanel {
                     .hint_text(hint),
             );
         });
+        ui.separator();
+        self.colors.config_ui(ui);
     }
 
     fn render(&mut self, ui: &mut egui::Ui, store: &dyn ChannelStore) {
@@ -107,13 +115,21 @@ impl VizPanel for NumericPanel {
         let at = crate::viz::common::linked_window(ui.ctx())
             .map(|(_, end)| end)
             .unwrap_or_else(|| store.now_ns());
-        let text = match store.latest_at(id, at) {
+        let sample = store.latest_at(id, at);
+        let text = match &sample {
             Some((_, Sample::Float(v))) => format!("{v:.3}"),
             Some((_, Sample::Int(v))) => v.to_string(),
-            Some((_, Sample::Bool(b))) => if b { "ON" } else { "OFF" }.to_string(),
+            Some((_, Sample::Bool(b))) => if *b { "ON" } else { "OFF" }.to_string(),
             Some((_, Sample::Text(_))) | None => "\u{2014}".to_string(),
         };
-        ui.label(egui::RichText::new(format!("{text} {}", self.effective_unit())).size(32.0));
+        let mut rich =
+            egui::RichText::new(format!("{text} {}", self.effective_unit())).size(32.0);
+        if let Some(v) = sample.as_ref().and_then(|(_, s)| sample_as_f64(s)) {
+            if let Some(color) = self.colors.color_for(v) {
+                rich = rich.color(color);
+            }
+        }
+        ui.label(rich);
     }
 
     fn serialize(&self) -> toml::Table {
@@ -126,6 +142,7 @@ impl VizPanel for NumericPanel {
         if !self.unit_override.is_empty() {
             t.insert("unit".to_string(), toml::Value::String(self.unit_override.clone()));
         }
+        self.colors.write_config(&mut t);
         t
     }
 
@@ -167,6 +184,7 @@ mod tests {
             type_ok: true,
             unit: unit.into(),
             unit_override: unit_override.into(),
+            colors: ColorThresholds::default(),
         }
     }
 
@@ -191,6 +209,39 @@ mod tests {
         cfg.insert("unit".into(), toml::Value::String("psi".into()));
         let out = ctor(&cfg, &reg).unwrap().serialize();
         assert_eq!(out.get("unit").and_then(|v| v.as_str()), Some("psi"));
+    }
+
+    #[test]
+    fn thresholds_round_trip_through_config() {
+        let reg = ChannelRegistry::from_toml_str(
+            "[channels.\"x\"]\nmqtt_topic = \"t\"\ntype = \"float\"\n",
+        )
+        .unwrap();
+        let mut cfg = toml::Table::new();
+        cfg.insert("channel".into(), toml::Value::String("x".into()));
+        let mut th = toml::Table::new();
+        th.insert("value".into(), toml::Value::Float(90.0));
+        th.insert("color".into(), toml::Value::String("#ff0000".into()));
+        cfg.insert("thresholds".into(), toml::Value::Array(vec![toml::Value::Table(th)]));
+        let out = ctor(&cfg, &reg).unwrap().serialize();
+        let arr = out.get("thresholds").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(arr.len(), 1);
+        let t0 = arr[0].as_table().unwrap();
+        assert_eq!(t0.get("value").and_then(|v| v.as_float()), Some(90.0));
+        assert_eq!(t0.get("color").and_then(|v| v.as_str()), Some("#ff0000"));
+    }
+
+    #[test]
+    fn base_color_round_trips_through_config() {
+        let reg = ChannelRegistry::from_toml_str(
+            "[channels.\"x\"]\nmqtt_topic = \"t\"\ntype = \"float\"\n",
+        )
+        .unwrap();
+        let mut cfg = toml::Table::new();
+        cfg.insert("channel".into(), toml::Value::String("x".into()));
+        cfg.insert("base_color".into(), toml::Value::String("#00ff00".into()));
+        let out = ctor(&cfg, &reg).unwrap().serialize();
+        assert_eq!(out.get("base_color").and_then(|v| v.as_str()), Some("#00ff00"));
     }
 
     #[test]

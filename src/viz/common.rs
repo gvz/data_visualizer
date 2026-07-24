@@ -133,6 +133,152 @@ pub fn parse_hex_color(s: &str) -> Color32 {
     Color32::GRAY
 }
 
+/// Color32 → "#rrggbb", alpha dropped.
+pub fn color_to_hex(c: Color32) -> String {
+    format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b())
+}
+
+/// "#rrggbb" (or "rrggbb") → opaque Color32; None if malformed.
+pub fn hex_to_color(s: &str) -> Option<Color32> {
+    let hex = s.strip_prefix('#').unwrap_or(s);
+    if hex.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some(Color32::from_rgb(r, g, b))
+}
+
+/// A value cutoff: when the evaluated value is at or above `value`, the target
+/// (readout text, gauge bar, …) is drawn in `color`.
+#[derive(Clone, Copy)]
+pub struct Threshold {
+    pub value: f64,
+    pub color: Color32,
+}
+
+/// Reusable "color by value" rule shared by panels: a set of cutoffs plus an
+/// optional color for values below all of them. The highest matching threshold
+/// wins; malformed config entries are skipped.
+#[derive(Clone, Default)]
+pub struct ColorThresholds {
+    pub thresholds: Vec<Threshold>,
+    /// Color for values below every threshold; `None` leaves the default.
+    pub base_color: Option<Color32>,
+}
+
+impl ColorThresholds {
+    /// Read `thresholds` (array of `{value, color}`) and `base_color` from config.
+    pub fn from_config(cfg: &toml::Table) -> Self {
+        let thresholds = cfg
+            .get("thresholds")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|item| {
+                        let t = item.as_table()?;
+                        let value = match t.get("value")? {
+                            toml::Value::Float(f) => *f,
+                            toml::Value::Integer(i) => *i as f64,
+                            _ => return None,
+                        };
+                        let color = hex_to_color(t.get("color")?.as_str()?)?;
+                        Some(Threshold { value, color })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let base_color = cfg.get("base_color").and_then(|v| v.as_str()).and_then(hex_to_color);
+        ColorThresholds { thresholds, base_color }
+    }
+
+    /// Write the `thresholds` array and `base_color` key, omitting empties.
+    pub fn write_config(&self, t: &mut toml::Table) {
+        if !self.thresholds.is_empty() {
+            let arr = self
+                .thresholds
+                .iter()
+                .map(|th| {
+                    let mut tt = toml::Table::new();
+                    tt.insert("value".to_string(), toml::Value::Float(th.value));
+                    tt.insert("color".to_string(), toml::Value::String(color_to_hex(th.color)));
+                    toml::Value::Table(tt)
+                })
+                .collect();
+            t.insert("thresholds".to_string(), toml::Value::Array(arr));
+        }
+        if let Some(c) = self.base_color {
+            t.insert("base_color".to_string(), toml::Value::String(color_to_hex(c)));
+        }
+    }
+
+    /// Color for value `v`: the highest threshold at or below it, else the base
+    /// color, else `None` (draw in the default color).
+    pub fn color_for(&self, v: f64) -> Option<Color32> {
+        self.thresholds
+            .iter()
+            .filter(|t| v >= t.value)
+            .max_by(|a, b| a.value.total_cmp(&b.value))
+            .map(|t| t.color)
+            .or(self.base_color)
+    }
+
+    /// Threshold editor rows plus the default-color toggle.
+    pub fn config_ui(&mut self, ui: &mut egui::Ui) {
+        ui.label("color thresholds (value \u{2265}):");
+        let mut remove = None;
+        for (i, th) in self.thresholds.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.add(egui::DragValue::new(&mut th.value).speed(0.1));
+                ui.color_edit_button_srgba(&mut th.color);
+                if ui.button("\u{2715}").clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            self.thresholds.remove(i);
+        }
+        if ui.button("+ threshold").clicked() {
+            self.thresholds.push(Threshold { value: 0.0, color: Color32::YELLOW });
+        }
+        ui.horizontal(|ui| {
+            let mut enabled = self.base_color.is_some();
+            if ui.checkbox(&mut enabled, "default color").changed() {
+                self.base_color = enabled.then_some(Color32::GRAY);
+            }
+            if let Some(c) = &mut self.base_color {
+                ui.color_edit_button_srgba(c);
+            }
+        });
+    }
+}
+
+/// Draw centered text with a one-pixel contrasting outline so it stays legible
+/// on any background color (e.g. over a gauge bar of arbitrary fill).
+pub fn outlined_text(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    text: &str,
+    font: egui::FontId,
+    color: Color32,
+    outline: Color32,
+) {
+    for dx in [-1.0_f32, 1.0] {
+        for dy in [-1.0_f32, 1.0] {
+            painter.text(
+                center + egui::vec2(dx, dy),
+                egui::Align2::CENTER_CENTER,
+                text,
+                font.clone(),
+                outline,
+            );
+        }
+    }
+    painter.text(center, egui::Align2::CENTER_CENTER, text, font, color);
+}
+
 /// Numeric snapshot as (borrowed ts, owned f64 values). None for Text.
 pub fn snapshot_to_f64(snap: &ChannelSnapshot) -> Option<(&[i64], Vec<f64>)> {
     match snap {
@@ -461,6 +607,66 @@ pub fn opt_str_array(cfg: &toml::Table, key: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::types::SampleType;
+
+    #[test]
+    fn hex_color_round_trips() {
+        let c = Color32::from_rgb(18, 52, 86);
+        assert_eq!(color_to_hex(c), "#123456");
+        assert_eq!(hex_to_color("#123456"), Some(c));
+        assert_eq!(hex_to_color("123456"), Some(c));
+        assert_eq!(hex_to_color("#12345"), None);
+        assert_eq!(hex_to_color("#12345g"), None);
+    }
+
+    #[test]
+    fn highest_matching_threshold_wins() {
+        let red = Color32::from_rgb(255, 0, 0);
+        let yellow = Color32::from_rgb(255, 255, 0);
+        let ct = ColorThresholds {
+            thresholds: vec![
+                Threshold { value: 50.0, color: yellow },
+                Threshold { value: 90.0, color: red },
+            ],
+            base_color: None,
+        };
+        assert_eq!(ct.color_for(10.0), None);
+        assert_eq!(ct.color_for(50.0), Some(yellow));
+        assert_eq!(ct.color_for(75.0), Some(yellow));
+        assert_eq!(ct.color_for(90.0), Some(red));
+        assert_eq!(ct.color_for(200.0), Some(red));
+    }
+
+    #[test]
+    fn base_color_is_used_below_all_thresholds() {
+        let blue = Color32::from_rgb(0, 0, 255);
+        let ct = ColorThresholds {
+            thresholds: vec![Threshold { value: 100.0, color: Color32::RED }],
+            base_color: Some(blue),
+        };
+        assert_eq!(ct.color_for(0.0), Some(blue));
+        assert_eq!(ct.color_for(100.0), Some(Color32::RED));
+    }
+
+    #[test]
+    fn color_thresholds_config_round_trips() {
+        let mut src = toml::Table::new();
+        let mut th = toml::Table::new();
+        th.insert("value".into(), toml::Value::Float(90.0));
+        th.insert("color".into(), toml::Value::String("#ff0000".into()));
+        src.insert("thresholds".into(), toml::Value::Array(vec![toml::Value::Table(th)]));
+        src.insert("base_color".into(), toml::Value::String("#00ff00".into()));
+
+        let ct = ColorThresholds::from_config(&src);
+        assert_eq!(ct.thresholds.len(), 1);
+        assert_eq!(ct.thresholds[0].value, 90.0);
+        assert_eq!(ct.base_color, Some(Color32::from_rgb(0, 255, 0)));
+
+        let mut out = toml::Table::new();
+        ct.write_config(&mut out);
+        let arr = out.get("thresholds").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(arr[0].as_table().unwrap().get("color").and_then(|v| v.as_str()), Some("#ff0000"));
+        assert_eq!(out.get("base_color").and_then(|v| v.as_str()), Some("#00ff00"));
+    }
 
     fn registry() -> ChannelRegistry {
         ChannelRegistry::from_toml_str(

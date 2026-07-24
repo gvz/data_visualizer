@@ -1,11 +1,11 @@
-use eframe::egui::{self, Align2, Color32, FontId};
+use eframe::egui::{self, Color32, FontId};
 
 use crate::config::ChannelRegistry;
 use crate::store::ChannelStore;
 use crate::types::SampleType;
 use crate::viz::common::{
-    bind, binding_error, label_config_row, opt_f64, opt_label, opt_str, refresh_binding,
-    sample_as_f64, serialize_label, Binding, RebindCtx,
+    bind, binding_error, label_config_row, opt_f64, opt_label, opt_str, outlined_text,
+    refresh_binding, sample_as_f64, serialize_label, Binding, ColorThresholds, RebindCtx,
 };
 use crate::viz::VizPanel;
 
@@ -19,6 +19,8 @@ pub struct GaugePanel {
     label: Option<String>,
     min: f64,
     max: f64,
+    /// Color cutoffs applied to the bar fill.
+    colors: ColorThresholds,
 }
 
 pub fn ctor(
@@ -31,7 +33,19 @@ pub fn ctor(
     if max <= min {
         anyhow::bail!("{TYPE_NAME} panel: max ({max}) must be greater than min ({min})");
     }
-    Ok(Box::new(GaugePanel { bound: bind(&name, reg, ACCEPTED), label: opt_label(cfg), min, max }))
+    Ok(Box::new(GaugePanel {
+        bound: bind(&name, reg, ACCEPTED),
+        label: opt_label(cfg),
+        min,
+        max,
+        colors: ColorThresholds::from_config(cfg),
+    }))
+}
+
+/// Perceived luminance (0..1) via Rec. 601 weights; picks readable text color.
+fn is_light(c: Color32) -> bool {
+    let l = 0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32;
+    l > 140.0
 }
 
 pub(crate) fn fraction(v: f64, min: f64, max: f64) -> f32 {
@@ -58,6 +72,8 @@ impl VizPanel for GaugePanel {
                 self.max = self.min + 1.0;
             }
         });
+        ui.separator();
+        self.colors.config_ui(ui);
     }
 
     fn render(&mut self, ui: &mut egui::Ui, store: &dyn ChannelStore) {
@@ -78,21 +94,35 @@ impl VizPanel for GaugePanel {
         let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
         let painter = ui.painter();
         painter.rect_filled(rect, 4.0, Color32::from_gray(40));
+        // Bar color follows the thresholds; below all of them it falls back to
+        // the base color, then the channel's binding color.
+        let bar_color = value
+            .and_then(|v| self.colors.color_for(v))
+            .unwrap_or_else(|| crate::viz::common::binding_color(&self.bound, 0));
         let text = match value {
             Some(v) => {
                 let mut fill = rect;
                 fill.set_width(rect.width() * fraction(v, self.min, self.max));
-                painter.rect_filled(fill, 4.0, crate::viz::common::binding_color(&self.bound, 0));
+                painter.rect_filled(fill, 4.0, bar_color);
                 format!("{v:.3} {}", self.bound.unit)
             }
             None => "—".to_string(),
         };
-        painter.text(
+        // Keep the readout legible over any fill: pick black on light bars,
+        // white on dark ones, and outline with the opposite so the part of the
+        // text over the unfilled track stays readable too.
+        let (fg, outline) = if is_light(bar_color) {
+            (Color32::BLACK, Color32::WHITE)
+        } else {
+            (Color32::WHITE, Color32::BLACK)
+        };
+        outlined_text(
+            painter,
             rect.center(),
-            Align2::CENTER_CENTER,
-            text,
+            &text,
             FontId::proportional(16.0),
-            Color32::WHITE,
+            fg,
+            outline,
         );
         ui.horizontal(|ui| {
             ui.label(format!("{:.1}", self.min));
@@ -108,6 +138,7 @@ impl VizPanel for GaugePanel {
         t.insert("min".to_string(), toml::Value::Float(self.min));
         t.insert("max".to_string(), toml::Value::Float(self.max));
         serialize_label(&mut t, &self.label);
+        self.colors.write_config(&mut t);
         t
     }
 
@@ -149,6 +180,34 @@ unit = "V"
         assert_eq!(fraction(-1.0, 0.0, 10.0), 0.0);
         assert_eq!(fraction(11.0, 0.0, 10.0), 1.0);
         assert_eq!(fraction(0.0, -10.0, 10.0), 0.5);
+    }
+
+    #[test]
+    fn light_bars_get_dark_text() {
+        assert!(is_light(Color32::YELLOW));
+        assert!(is_light(Color32::WHITE));
+        assert!(!is_light(Color32::from_rgb(0xd6, 0x27, 0x28))); // palette red
+        assert!(!is_light(Color32::BLACK));
+    }
+
+    #[test]
+    fn thresholds_round_trip_through_config() {
+        let channels = registry();
+        let reg = PanelRegistry::with_builtins();
+        let e: PanelEntry = toml::from_str(
+            r##"type = "gauge"
+channel = "demo.sine"
+min = 0.0
+max = 100.0
+
+[[thresholds]]
+value = 90.0
+color = "#ff0000""##,
+        )
+        .unwrap();
+        let out = reg.build(&e, &channels).unwrap().serialize();
+        let arr = out.get("thresholds").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(arr[0].as_table().unwrap().get("color").and_then(|v| v.as_str()), Some("#ff0000"));
     }
 
     #[test]
