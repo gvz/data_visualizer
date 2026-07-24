@@ -309,6 +309,23 @@ pub fn set_linked_zoom_range(ctx: &egui::Context, range: Option<(i64, i64)>) {
     ctx.data_mut(|d| d.insert_temp(linked_zoom_range_id(), range));
 }
 
+fn frame_clock_id() -> egui::Id {
+    egui::Id::new("datavis_frame_clock_ns")
+}
+
+/// The active store clock for this frame, published once by the app so every
+/// panel shares one value instead of each sampling `now_ns()` independently.
+/// `None` when unpublished (e.g. headless panel tests); callers fall back to
+/// their own `store.now_ns()`.
+pub fn frame_clock(ctx: &egui::Context) -> Option<i64> {
+    ctx.data(|d| d.get_temp::<i64>(frame_clock_id()))
+}
+
+/// Publish the shared per-frame clock. Called once per frame by the app.
+pub fn set_frame_clock(ctx: &egui::Context, ns: i64) {
+    ctx.data_mut(|d| d.insert_temp(frame_clock_id(), ns));
+}
+
 /// Effective window for a panel: its explicit override, else the global default.
 pub fn effective_window_s(ctx: &egui::Context, override_s: Option<f64>) -> f64 {
     override_s.unwrap_or_else(|| global_window_s(ctx))
@@ -569,5 +586,14 @@ b = true"#).unwrap();
 
         set_linked_zoom_range(&ctx, None);
         assert_eq!(linked_zoom_range(&ctx), None);
+    }
+
+    #[test]
+    fn frame_clock_round_trips_through_ctx() {
+        let ctx = egui::Context::default();
+        // Unpublished default is None.
+        assert_eq!(frame_clock(&ctx), None);
+        set_frame_clock(&ctx, 1_700_000_000_000_000_000);
+        assert_eq!(frame_clock(&ctx), Some(1_700_000_000_000_000_000));
     }
 }
