@@ -186,6 +186,9 @@ pub struct DataVisApp {
     /// App-wide default visible time span (seconds); panels without an explicit
     /// override follow it. Published to egui ctx data each frame.
     default_window_s: f64,
+    /// Whether the toolbar "link time zoom" checkbox is on. In-memory only;
+    /// published to egui ctx data each frame so time-based panels follow it.
+    link_zoom: bool,
 }
 
 impl DataVisApp {
@@ -243,6 +246,7 @@ impl DataVisApp {
             live_pause_ns: 0,
             last_write_seq: 0,
             default_window_s,
+            link_zoom: false,
         }
     }
 
@@ -462,11 +466,30 @@ impl DataVisApp {
                 .on_hover_text("Default visible time span for time-based panels");
                 if ui
                     .button(icon::MAGNIFYING_GLASS_MINUS)
-                    .on_hover_text("Reset zoom on all waveforms")
+                    .on_hover_text("Reset zoom on all panels")
                     .clicked()
                 {
+                    crate::viz::common::set_linked_zoom_range(ctx, None);
                     self.workspace.reset_zoom();
                 }
+                if ui
+                    .checkbox(&mut self.link_zoom, icon::LINK)
+                    .on_hover_text("Link time zoom across all panels")
+                    .changed()
+                {
+                    if self.link_zoom {
+                        // Just armed: start inert (no shared window yet).
+                        crate::viz::common::set_linked_zoom_range(ctx, None);
+                    } else {
+                        // Just released: freeze the shared window into each
+                        // panel (if any zoom was active), then clear it.
+                        if let Some(r) = crate::viz::common::linked_zoom_range(ctx) {
+                            self.workspace.freeze_time_zoom(r);
+                        }
+                        crate::viz::common::set_linked_zoom_range(ctx, None);
+                    }
+                }
+                crate::viz::common::set_linked_zoom_enabled(ctx, self.link_zoom);
                 ui.separator();
                 let (theme_icon, theme_hint) =
                     if self.dark_mode { (icon::SUN, "Light mode") } else { (icon::MOON, "Dark mode") };

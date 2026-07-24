@@ -344,6 +344,17 @@ impl Workspace {
         }
     }
 
+    /// Copy a linked time-window into every panel's own zoom state across all
+    /// screens — used when the toolbar link is released so panels stay frozen
+    /// where they were.
+    pub fn freeze_time_zoom(&mut self, range: (i64, i64)) {
+        for st in self.screens.values_mut() {
+            for slot in &mut st.panels {
+                slot.panel.freeze_time_zoom(range);
+            }
+        }
+    }
+
     pub fn add_screen(&mut self, name: &str) {
         if !self.screens.contains_key(name) {
             self.screens.insert(name.to_string(), ScreenState::empty(name));
@@ -754,6 +765,15 @@ channel = "home/sensors/temp"
 
         assert!(ch.id("home/sensors/temp").is_some(), "resolved after discovery");
         assert!(topic_map.read().unwrap().contains_key("home/sensors/temp"));
+    }
+
+    #[test]
+    fn freeze_time_zoom_reaches_panels() {
+        let (_ch, _reg, mut ws) = build();
+        // Iterates every panel across both screens; must not panic.
+        ws.freeze_time_zoom((1_000, 2_000));
+        // Re-freezing with a new range is also fine.
+        ws.freeze_time_zoom((3_000, 4_000));
     }
 }
 
