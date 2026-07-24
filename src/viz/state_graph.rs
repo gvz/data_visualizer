@@ -36,6 +36,11 @@ pub struct StateGraphPanel {
     states: BTreeMap<i64, String>,
     /// Visible span in seconds; `None` follows the global default.
     time_window_s: Option<f64>,
+    /// Active absolute-ns time window `[start, end]`. Set by the linked-zoom
+    /// freeze (or a linked follow), it overrides the trailing window. This
+    /// panel has no drag-zoom of its own — it only follows and freezes.
+    /// In-memory only; not serialized.
+    zoom: Option<(i64, i64)>,
 }
 
 pub fn ctor(
@@ -57,6 +62,7 @@ pub fn ctor(
         label: opt_label(cfg),
         states,
         time_window_s: opt_f64_opt(cfg, "time_window_s"),
+        zoom: None,
     }))
 }
 
@@ -117,11 +123,23 @@ impl VizPanel for StateGraphPanel {
             ui.label("no data");
             return;
         }
-        // Anchor the window on the store's clock so the live scrub slider (and
-        // replay position) move the view rather than pinning to the newest sample.
-        let end_ns = store.now_ns();
-        let span = (effective_window_s(ui.ctx(), self.time_window_s) * 1e9) as i64;
-        let t0 = end_ns - span;
+        // When the toolbar link is armed, a shared time window overrides this
+        // panel's trailing view; before any shared zoom (`linked == None`) it
+        // keeps its own frozen zoom, else the live trailing window.
+        let linked = if crate::viz::common::linked_zoom_enabled(ui.ctx()) {
+            crate::viz::common::linked_zoom_range(ui.ctx())
+        } else {
+            None
+        };
+        let (t0, end_ns) = match linked.or(self.zoom) {
+            Some((a, b)) => (a, b),
+            None => {
+                let end = store.now_ns();
+                let span = (effective_window_s(ui.ctx(), self.time_window_s) * 1e9) as i64;
+                (end - span, end)
+            }
+        };
+        let span = (end_ns - t0).max(1);
         let snap = store.snapshot(id, TimeWindow { start_ns: t0, end_ns: end_ns + 1 });
         let (ts, vals): (Vec<i64>, Vec<i64>) = match &snap {
             ChannelSnapshot::Int { ts, vals } => (ts.clone(), vals.clone()),
@@ -184,6 +202,14 @@ impl VizPanel for StateGraphPanel {
 
     fn drop_channel(&mut self, name: &str, reg: &crate::config::ChannelRegistry) {
         self.bound = bind(name, reg, ACCEPTED);
+    }
+
+    fn freeze_time_zoom(&mut self, range: (i64, i64)) {
+        self.zoom = Some(range);
+    }
+
+    fn reset_zoom(&mut self) {
+        self.zoom = None;
     }
 
     fn refresh_bindings(&mut self, ctx: &RebindCtx) {
@@ -284,5 +310,52 @@ channel = "demo.enabled""#,
                 });
             });
         }
+    }
+
+    #[test]
+    fn linked_window_render_without_panic() {
+        let channels = registry();
+        let store = LiveStore::from_registry(&channels);
+        let motor = channels.id("motor.state").unwrap();
+        for i in 0..50i64 {
+            store.write_numeric(motor, i * 1_000_000, NumericVal::Int(i / 20));
+        }
+        let reg = PanelRegistry::with_builtins();
+        let e: PanelEntry = toml::from_str(
+            "type = \"state_graph\"\nchannel = \"motor.state\"",
+        )
+        .unwrap();
+        let mut p = reg.build(&e, &channels).unwrap();
+
+        let ctx = egui::Context::default();
+        crate::viz::common::set_linked_zoom_enabled(&ctx, true);
+        crate::viz::common::set_linked_zoom_range(&ctx, Some((5_000_000, 30_000_000)));
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                p.render(ui, &store);
+            });
+        });
+    }
+
+    #[test]
+    fn freeze_then_reset_zoom() {
+        let channels = registry();
+        let reg = PanelRegistry::with_builtins();
+        let e: PanelEntry = toml::from_str(
+            "type = \"state_graph\"\nchannel = \"motor.state\"",
+        )
+        .unwrap();
+        let mut p = reg.build(&e, &channels).unwrap();
+        p.freeze_time_zoom((5, 9));
+        // reset_zoom must clear it back to the trailing/live view.
+        p.reset_zoom();
+        // A render after reset must still not panic (no lingering bad range).
+        let store = LiveStore::from_registry(&channels);
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                p.render(ui, &store);
+            });
+        });
     }
 }
