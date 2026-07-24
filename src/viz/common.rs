@@ -309,6 +309,20 @@ pub fn set_linked_zoom_range(ctx: &egui::Context, range: Option<(i64, i64)>) {
     ctx.data_mut(|d| d.insert_temp(linked_zoom_range_id(), range));
 }
 
+/// The absolute-ns window `[start, end]` a panel should evaluate against this
+/// frame, or `None` for its own live/trailing view. `Some` only in sync mode
+/// (the toolbar link-zoom checkbox armed) with an active shared range: then
+/// every panel reads the same window, so a numeric/gauge shows the value at
+/// `end`, a spectrum/xy_scatter computes over `[start, end]`, and a log lists
+/// only lines in `[start, end]` — all consistent with the zoomed waveform.
+pub fn linked_window(ctx: &egui::Context) -> Option<(i64, i64)> {
+    if linked_zoom_enabled(ctx) {
+        linked_zoom_range(ctx)
+    } else {
+        None
+    }
+}
+
 fn frame_clock_id() -> egui::Id {
     egui::Id::new("datavis_frame_clock_ns")
 }
@@ -613,6 +627,26 @@ b = true"#).unwrap();
 
         set_linked_zoom_range(&ctx, None);
         assert_eq!(linked_zoom_range(&ctx), None);
+    }
+
+    #[test]
+    fn linked_window_gates_on_enabled_and_range() {
+        let ctx = egui::Context::default();
+        // Not armed, no range: no shared window.
+        assert_eq!(linked_window(&ctx), None);
+
+        // Range set but checkbox off: still no shared window.
+        set_linked_zoom_range(&ctx, Some((100, 200)));
+        assert_eq!(linked_window(&ctx), None);
+
+        // Armed but no range yet (armed, not zoomed): none.
+        set_linked_zoom_range(&ctx, None);
+        set_linked_zoom_enabled(&ctx, true);
+        assert_eq!(linked_window(&ctx), None);
+
+        // Armed with a range: that window governs every panel.
+        set_linked_zoom_range(&ctx, Some((100, 200)));
+        assert_eq!(linked_window(&ctx), Some((100, 200)));
     }
 
     #[test]

@@ -82,10 +82,17 @@ impl VizPanel for XyScatterPanel {
             return;
         }
         // Anchor on the store clock so the live scrub slider / replay position
-        // pick which window is paired, not always the newest samples.
-        let end_ns = store.now_ns();
-        let span = (effective_window_s(ui.ctx(), self.time_window_s) * 1e9) as i64;
-        let window = TimeWindow { start_ns: end_ns - span, end_ns: end_ns + 1 };
+        // pick which window is paired, not always the newest samples. In sync
+        // mode the shared zoom window governs so the pairing covers the zoomed
+        // range.
+        let window = match crate::viz::common::linked_window(ui.ctx()) {
+            Some((start_ns, end_ns)) => TimeWindow { start_ns, end_ns: end_ns + 1 },
+            None => {
+                let end_ns = store.now_ns();
+                let span = (effective_window_s(ui.ctx(), self.time_window_s) * 1e9) as i64;
+                TimeWindow { start_ns: end_ns - span, end_ns: end_ns + 1 }
+            }
+        };
         let xs = store.snapshot(xid, window);
         let ys = store.snapshot(yid, window);
         let (Some((_, xv)), Some((_, yv))) = (snapshot_to_f64(&xs), snapshot_to_f64(&ys)) else {

@@ -102,7 +102,12 @@ impl VizPanel for NumericPanel {
             );
             return;
         }
-        let text = match store.latest_at(id, store.now_ns()) {
+        // In sync mode the shared zoom window's end selects which sample to
+        // show, so the readout matches the zoomed waveform's right edge.
+        let at = crate::viz::common::linked_window(ui.ctx())
+            .map(|(_, end)| end)
+            .unwrap_or_else(|| store.now_ns());
+        let text = match store.latest_at(id, at) {
             Some((_, Sample::Float(v))) => format!("{v:.3}"),
             Some((_, Sample::Int(v))) => v.to_string(),
             Some((_, Sample::Bool(b))) => if b { "ON" } else { "OFF" }.to_string(),

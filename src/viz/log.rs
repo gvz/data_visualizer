@@ -86,13 +86,17 @@ impl VizPanel for LogPanel {
             ui.label(egui::RichText::new("Drop channels here").weak());
             return;
         }
+        // In sync mode only show lines within the shared zoom window.
+        let (start_ns, end_ns) = crate::viz::common::linked_window(ui.ctx())
+            .map(|(s, e)| (s, e + 1))
+            .unwrap_or((i64::MIN, i64::MAX));
         let mut sets = Vec::new();
         for b in &self.bound {
             if binding_error(ui, b, TYPE_NAME) {
                 continue;
             }
             let id = b.id.expect("checked by binding_error");
-            let snap = store.snapshot(id, TimeWindow { start_ns: i64::MIN, end_ns: i64::MAX });
+            let snap = store.snapshot(id, TimeWindow { start_ns, end_ns });
             if let ChannelSnapshot::Text { lines } = snap {
                 sets.push(lines);
             }

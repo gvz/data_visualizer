@@ -127,9 +127,12 @@ impl VizPanel for SpectrumPanel {
             return;
         }
         // Anchor on the store clock so the live scrub slider / replay position
-        // select which window is analyzed, not always the newest sample.
-        let end_ns = store.now_ns();
-        let snap = store.snapshot(id, TimeWindow { start_ns: i64::MIN, end_ns: end_ns + 1 });
+        // select which window is analyzed, not always the newest sample. In sync
+        // mode the shared zoom window bounds it so the FFT is computed over the
+        // data in the zoomed range.
+        let (start_ns, end_ns) = crate::viz::common::linked_window(ui.ctx())
+            .unwrap_or((i64::MIN, store.now_ns()));
+        let snap = store.snapshot(id, TimeWindow { start_ns, end_ns: end_ns + 1 });
         let Some((ts, vals)) = snapshot_to_f64(&snap) else {
             return;
         };
