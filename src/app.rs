@@ -754,6 +754,13 @@ impl eframe::App for DataVisApp {
             self.live_view_ns.store(v, Ordering::Relaxed);
         }
 
+        // Publish the active store's clock once per frame so every panel shares
+        // one time base: equal live windows start at the same time and grid
+        // lines coincide. `self.store` is the active store in both modes (the
+        // playback store during replay), read after the live view/playback
+        // clock is settled above.
+        crate::viz::common::set_frame_clock(ctx, self.store.now_ns());
+
         // Refresh the discovered-MQTT-topic snapshot (throttled) and let panels
         // re-bind channels that were unknown at layout-load time — e.g. a
         // drop-created (dynamic) MQTT channel whose topic has just reappeared
