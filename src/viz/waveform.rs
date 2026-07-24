@@ -42,11 +42,6 @@ pub struct WaveformPanel {
     /// Cursor positions in absolute ns so they stay put while the plot scrolls.
     cursor_a_ns: Option<i64>,
     cursor_b_ns: Option<i64>,
-    /// Fixed x-origin (absolute ns, whole second) picked once. Plotting relative
-    /// to this constant — rather than the per-frame window start — keeps grid
-    /// lines anchored to absolute time (they scroll with the data) while still
-    /// fitting the samples' small offsets in f64 without precision loss.
-    epoch_ns: Option<i64>,
     /// Channel names toggled off via the legend (left-click). In-memory only.
     hidden: std::collections::HashSet<String>,
     /// Active horizontal time-zoom as an absolute-ns [start, end] range. When
@@ -80,7 +75,6 @@ pub fn ctor(
         y_unit: opt_str(cfg, "y_unit"),
         cursor_a_ns: None,
         cursor_b_ns: None,
-        epoch_ns: None,
         hidden: std::collections::HashSet::new(),
         zoom: None,
         y_zoom: None,
@@ -240,6 +234,12 @@ impl VizPanel for WaveformPanel {
         // edge tracks the store clock so the live scrub slider (and replay
         // position) drive the view instead of pinning to the newest sample.
         let win_s = effective_window_s(ui.ctx(), self.time_window_s);
+        // One shared clock per frame, published by the app, so every waveform
+        // uses the same live end and the same grid origin: equal windows then
+        // start at the same time and grid lines coincide. Fall back to this
+        // store when unpublished (e.g. headless panel tests).
+        let clock =
+            crate::viz::common::frame_clock(ui.ctx()).unwrap_or_else(|| store.now_ns());
         // When the toolbar link is armed, a shared time window (once any
         // waveform has zoomed) overrides this panel's own zoom; before the
         // first shared zoom (`linked == None`) the panel keeps its own view.
@@ -250,19 +250,17 @@ impl VizPanel for WaveformPanel {
         };
         let (t0, end_ns) = match linked.or(self.zoom) {
             Some((a, b)) => (a, b),
-            None => {
-                let end = store.now_ns();
-                (end - (win_s * 1e9) as i64, end)
-            }
+            None => (clock - (win_s * 1e9) as i64, clock),
         };
         let window = TimeWindow { start_ns: t0, end_ns: end_ns + 1 };
 
-        // Fixed plot origin (whole second) chosen on first render. All x values
-        // are (ns - anchor)/1e9, so grid lines sit at absolute times and scroll
-        // with the data instead of staying pinned to the screen.
-        let anchor = *self
-            .epoch_ns
-            .get_or_insert(end_ns - end_ns.rem_euclid(1_000_000_000));
+        // Grid origin: the whole-second floor of the shared clock, recomputed
+        // each frame. Because the clock is identical across panels this frame,
+        // the origin is identical, so grid lines fall at the same absolute
+        // times in every waveform. All x values are (ns - anchor)/1e9; the
+        // include_x bounds, sample positions, and x-axis formatter all add the
+        // origin back, so the visible window and tick labels are unchanged.
+        let anchor = clock - clock.rem_euclid(1_000_000_000);
         let x_of = move |ns: i64| (ns - anchor) as f64 / 1e9;
 
         // Snapshots kept for the stats table below the plot.
@@ -678,7 +676,6 @@ channels = ["demo.sine"]"#,
             y_unit: String::new(),
             cursor_a_ns: None,
             cursor_b_ns: None,
-            epoch_ns: None,
             hidden: std::collections::HashSet::new(),
             // Frozen sub-range in the middle of the written data.
             zoom: Some((200_000_000, 400_000_000)),
@@ -759,7 +756,6 @@ channels = ["demo.sine", "demo.log", "does.not.exist"]"#,
             y_unit: String::new(),
             cursor_a_ns: None,
             cursor_b_ns: None,
-            epoch_ns: None,
             hidden: std::collections::HashSet::new(),
             zoom: None,
             // Vertical zoom set; horizontal scroll stays live.
@@ -816,7 +812,6 @@ channels = ["demo.sine", "demo.log", "does.not.exist"]"#,
             y_unit: String::new(),
             cursor_a_ns: None,
             cursor_b_ns: None,
-            epoch_ns: None,
             hidden: std::collections::HashSet::new(),
             zoom: None,
             y_zoom: None,
@@ -824,5 +819,45 @@ channels = ["demo.sine", "demo.log", "does.not.exist"]"#,
         };
         p.freeze_time_zoom((5, 9));
         assert_eq!(p.zoom, Some((5, 9)));
+    }
+
+    #[test]
+    fn shared_frame_clock_render_without_panic() {
+        let channels = registry();
+        let store = LiveStore::from_registry(&channels);
+        let id = channels.id("demo.sine").unwrap();
+        for i in 0..100i64 {
+            store.write_numeric(id, i * 1_000_000, NumericVal::Float((i as f64).sin()));
+        }
+        let reg = PanelRegistry::with_builtins();
+        let e: PanelEntry =
+            toml::from_str("type = \"waveform\"\nchannels = [\"demo.sine\"]").unwrap();
+        let mut p = reg.build(&e, &channels).unwrap();
+
+        let ctx = egui::Context::default();
+        crate::viz::common::set_frame_clock(&ctx, 1_700_000_000_500_000_000);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| p.render(ui, &store));
+        });
+        // A pure render must not disturb the published clock.
+        assert_eq!(
+            crate::viz::common::frame_clock(&ctx),
+            Some(1_700_000_000_500_000_000)
+        );
+    }
+
+    #[test]
+    fn shared_grid_origin_is_whole_second_and_step_preserving() {
+        // The grid origin is the whole-second floor of the shared clock. Two clocks
+        // one whole second apart floor to origins one whole second apart, and any
+        // origin is itself a whole second — the property that makes grid lines
+        // coincide across panels sharing one clock.
+        let floor = |c: i64| c - c.rem_euclid(1_000_000_000);
+        let a = 1_700_000_000_500_000_000i64;
+        let b = a + 1_000_000_000;
+        assert_eq!(floor(a) % 1_000_000_000, 0);
+        assert_eq!(floor(b) - floor(a), 1_000_000_000);
+        // Sub-second jitter does not move the origin.
+        assert_eq!(floor(a), floor(a + 123_456));
     }
 }
