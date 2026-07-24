@@ -21,6 +21,10 @@ const ACCEPTED: &[SampleType] = &[SampleType::Float, SampleType::Int, SampleType
 /// Points fed to egui_plot per channel; ~2 per horizontal pixel is plenty.
 const MAX_PLOT_BUCKETS: usize = 1000;
 
+/// Minimum drag travel (screen pixels) on an axis before a box-drag zooms it,
+/// so a barely-dragged click doesn't collapse the view to a near-zero span.
+const MIN_DRAG_PX: f32 = 5.0;
+
 /// Scrolling time-series plot with optional measurement cursors.
 pub struct WaveformPanel {
     title: String,
@@ -76,6 +80,22 @@ pub fn ctor(
         zoom: None,
         zoom_drag_x0: None,
     }))
+}
+
+/// Decide which axes a completed zoom-drag box applies to.
+///
+/// `dx`/`dy` are the box's pixel width/height; `free` is true when Shift is
+/// held. Plain drags snap to the dominant axis (X on a tie); free drags zoom
+/// each axis independently. An axis only zooms if its travel clears
+/// `MIN_DRAG_PX`. Returns `(zoom_x, zoom_y)`.
+fn zoom_axes(dx: f32, dy: f32, free: bool) -> (bool, bool) {
+    if free {
+        (dx >= MIN_DRAG_PX, dy >= MIN_DRAG_PX)
+    } else if dx >= dy {
+        (dx >= MIN_DRAG_PX, false)
+    } else {
+        (false, dy >= MIN_DRAG_PX)
+    }
 }
 
 /// Nearest actual sample timestamp to `ts` across all plotted channels, so
@@ -635,5 +655,21 @@ channels = ["demo.sine", "demo.log", "does.not.exist"]"#,
                 });
             });
         }
+    }
+
+    #[test]
+    fn zoom_axes_snap_and_free() {
+        // Plain drag snaps to the dominant axis only.
+        assert_eq!(zoom_axes(20.0, 3.0, false), (true, false)); // horizontal
+        assert_eq!(zoom_axes(3.0, 20.0, false), (false, true)); // vertical
+        // Tie resolves to X.
+        assert_eq!(zoom_axes(10.0, 10.0, false), (true, false));
+        // Dominant axis under threshold → nothing zooms.
+        assert_eq!(zoom_axes(3.0, 2.0, false), (false, false));
+        // Free drag zooms each axis independently over threshold.
+        assert_eq!(zoom_axes(20.0, 20.0, true), (true, true));
+        // Free drag with one axis under threshold zooms only the other.
+        assert_eq!(zoom_axes(20.0, 2.0, true), (true, false));
+        assert_eq!(zoom_axes(2.0, 20.0, true), (false, true));
     }
 }
