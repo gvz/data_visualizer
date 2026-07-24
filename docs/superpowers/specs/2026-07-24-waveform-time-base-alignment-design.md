@@ -35,19 +35,22 @@ Give every waveform one shared time base per frame:
   its live window end, so equal `time_window_s` yields an identical
   `[start, end]`. This also covers replay (all panels read the one published
   playback position).
-- **Shared grid origin.** Each waveform derives its grid origin from that
-  same shared clock — `clock - clock.rem_euclid(1_000_000_000)` (whole-second
-  floor) — every frame. Because the input is identical across panels, the
-  origin is identical, so grid lines coincide regardless of when a panel was
-  created or what window length it shows. The per-panel `epoch_ns` field is
-  removed.
+- **Shared grid origin.** A single whole-second origin, seeded once from the
+  shared clock and stored in `ctx.data` (`shared_epoch_ns`), is reused by
+  every waveform for the rest of the session. It must be BOTH shared and
+  frozen. Shared so all panels plot against the same origin and their grid
+  lines coincide regardless of when a panel was created or what window length
+  it shows. Frozen so the origin never moves between frames. The per-panel
+  `epoch_ns` field is removed.
 
-Recomputing the origin each frame (instead of freezing it) is safe: it is a
-consistent reparametrization within the frame — the plot's `include_x`
-bounds, the sample x-positions, and the x-axis tick formatter all add the
-same origin back, so the visible window and the absolute tick labels are
-unchanged. The origin stays near the current data, so f64 precision is at
-least as good as the frozen scheme.
+The origin must not be recomputed each frame. A per-frame whole-second floor
+of an advancing clock jumps by one second at each whole-second boundary; for
+grid steps that do not divide one second (2 s, 5 s, ...) that shifts every
+grid line to a different absolute time, so the grid appears to change. A
+fixed origin keeps grid lines pinned to absolute time. The tick labels add
+the origin back, so they read as correct wall-clock time regardless of the
+origin's phase, and f64 precision stays fine because realistic data sits
+within days of the seed.
 
 ## Scope of alignment
 

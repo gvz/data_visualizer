@@ -254,13 +254,15 @@ impl VizPanel for WaveformPanel {
         };
         let window = TimeWindow { start_ns: t0, end_ns: end_ns + 1 };
 
-        // Grid origin: the whole-second floor of the shared clock, recomputed
-        // each frame. Because the clock is identical across panels this frame,
-        // the origin is identical, so grid lines fall at the same absolute
-        // times in every waveform. All x values are (ns - anchor)/1e9; the
-        // include_x bounds, sample positions, and x-axis formatter all add the
-        // origin back, so the visible window and tick labels are unchanged.
-        let anchor = clock - clock.rem_euclid(1_000_000_000);
+        // Grid origin: a whole-second value shared by every waveform and frozen
+        // for the session (seeded once from the shared clock). Shared so grid
+        // lines coincide across panels; frozen so they never move — a per-frame
+        // origin would jump a second at each whole-second boundary and shift the
+        // grid for steps that do not divide one second. All x values are
+        // (ns - anchor)/1e9; the include_x bounds, sample positions, and x-axis
+        // formatter all add the origin back, so the visible window and tick
+        // labels stay correct regardless of the origin's phase.
+        let anchor = crate::viz::common::shared_epoch_ns(ui.ctx(), clock);
         let x_of = move |ns: i64| (ns - anchor) as f64 / 1e9;
 
         // Snapshots kept for the stats table below the plot.

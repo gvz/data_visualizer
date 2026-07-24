@@ -326,6 +326,33 @@ pub fn set_frame_clock(ctx: &egui::Context, ns: i64) {
     ctx.data_mut(|d| d.insert_temp(frame_clock_id(), ns));
 }
 
+fn shared_epoch_id() -> egui::Id {
+    egui::Id::new("datavis_shared_epoch_ns")
+}
+
+/// A whole-second plot origin shared by every waveform and frozen for the
+/// session: seeded once from `seed` (the first caller's clock, floored to a
+/// whole second) and returned unchanged thereafter.
+///
+/// It must be BOTH shared and frozen. Shared so all panels plot against the
+/// same origin and their grid lines coincide. Frozen so the origin never moves
+/// between frames: a per-frame origin would jump by one second at each
+/// whole-second boundary, and for grid steps that do not divide one second
+/// (2 s, 5 s, ...) that shifts every grid line to a different absolute time —
+/// the grid appears to change. A fixed origin keeps grid lines pinned to
+/// absolute time; the tick labels add the origin back, so they stay correct
+/// regardless of the origin's phase. Absent (headless tests) → seeded on first
+/// call.
+pub fn shared_epoch_ns(ctx: &egui::Context, seed: i64) -> i64 {
+    let id = shared_epoch_id();
+    if let Some(v) = ctx.data(|d| d.get_temp::<i64>(id)) {
+        return v;
+    }
+    let anchor = seed - seed.rem_euclid(1_000_000_000);
+    ctx.data_mut(|d| d.insert_temp(id, anchor));
+    anchor
+}
+
 /// Effective window for a panel: its explicit override, else the global default.
 pub fn effective_window_s(ctx: &egui::Context, override_s: Option<f64>) -> f64 {
     override_s.unwrap_or_else(|| global_window_s(ctx))
@@ -595,5 +622,19 @@ b = true"#).unwrap();
         assert_eq!(frame_clock(&ctx), None);
         set_frame_clock(&ctx, 1_700_000_000_000_000_000);
         assert_eq!(frame_clock(&ctx), Some(1_700_000_000_000_000_000));
+    }
+
+    #[test]
+    fn shared_epoch_seeds_once_floors_and_freezes() {
+        let ctx = egui::Context::default();
+        // First call seeds from the whole-second floor of the seed.
+        let seed = 1_700_000_000_500_000_000i64;
+        let epoch = shared_epoch_ns(&ctx, seed);
+        assert_eq!(epoch, 1_700_000_000_000_000_000);
+        assert_eq!(epoch.rem_euclid(1_000_000_000), 0);
+        // Later calls with a different (advanced) seed return the frozen value,
+        // so the grid origin never moves between frames.
+        assert_eq!(shared_epoch_ns(&ctx, seed + 3_000_000_000), epoch);
+        assert_eq!(shared_epoch_ns(&ctx, seed - 9_999), epoch);
     }
 }
