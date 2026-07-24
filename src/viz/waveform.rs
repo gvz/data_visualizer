@@ -240,7 +240,15 @@ impl VizPanel for WaveformPanel {
         // edge tracks the store clock so the live scrub slider (and replay
         // position) drive the view instead of pinning to the newest sample.
         let win_s = effective_window_s(ui.ctx(), self.time_window_s);
-        let (t0, end_ns) = match self.zoom {
+        // When the toolbar link is armed, a shared time window (once any
+        // waveform has zoomed) overrides this panel's own zoom; before the
+        // first shared zoom (`linked == None`) the panel keeps its own view.
+        let linked = if crate::viz::common::linked_zoom_enabled(ui.ctx()) {
+            crate::viz::common::linked_zoom_range(ui.ctx())
+        } else {
+            None
+        };
+        let (t0, end_ns) = match linked.or(self.zoom) {
             Some((a, b)) => (a, b),
             None => {
                 let end = store.now_ns();
@@ -408,7 +416,14 @@ impl VizPanel for WaveformPanel {
                                 as i64
                     };
                     let (a, b) = (ns_at(x0), ns_at(x1));
-                    self.zoom = Some((a.min(b), a.max(b)));
+                    let new = Some((a.min(b), a.max(b)));
+                    // While linked, propagate to every participant instead of
+                    // zooming this panel alone.
+                    if crate::viz::common::linked_zoom_enabled(ui.ctx()) {
+                        crate::viz::common::set_linked_zoom_range(ui.ctx(), new);
+                    } else {
+                        self.zoom = new;
+                    }
                 }
                 if zy {
                     let val_at =
@@ -421,8 +436,14 @@ impl VizPanel for WaveformPanel {
             }
         }
         if inner.response.double_clicked() {
-            self.zoom = None;
-            self.y_zoom = None;
+            // While linked, releasing clears the shared window so every
+            // participant returns to its own view together.
+            if crate::viz::common::linked_zoom_enabled(ui.ctx()) {
+                crate::viz::common::set_linked_zoom_range(ui.ctx(), None);
+            } else {
+                self.zoom = None;
+            }
+            self.y_zoom = None; // Y is always local
         }
 
         if self.cursors && inner.response.clicked() {
@@ -514,6 +535,10 @@ impl VizPanel for WaveformPanel {
         for b in &mut self.bound {
             refresh_binding(b, ACCEPTED, ctx);
         }
+    }
+
+    fn freeze_time_zoom(&mut self, range: (i64, i64)) {
+        self.zoom = Some(range);
     }
 
     fn reset_zoom(&mut self) {
@@ -747,5 +772,57 @@ channels = ["demo.sine", "demo.log", "does.not.exist"]"#,
         });
         // Y zoom is independent of the store clock, so it survives a render.
         assert_eq!(p.y_zoom, Some((-0.5, 0.5)));
+    }
+
+    #[test]
+    fn linked_window_render_uses_shared_range_without_panic() {
+        let channels = registry();
+        let store = LiveStore::from_registry(&channels);
+        let id = channels.id("demo.sine").unwrap();
+        for i in 0..100i64 {
+            store.write_numeric(id, i * 1_000_000, NumericVal::Float((i as f64).sin()));
+        }
+        let reg = PanelRegistry::with_builtins();
+        let e: PanelEntry = toml::from_str(
+            "type = \"waveform\"\nchannels = [\"demo.sine\"]",
+        )
+        .unwrap();
+        let mut p = reg.build(&e, &channels).unwrap();
+
+        let ctx = egui::Context::default();
+        crate::viz::common::set_linked_zoom_enabled(&ctx, true);
+        crate::viz::common::set_linked_zoom_range(&ctx, Some((10_000_000, 50_000_000)));
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                p.render(ui, &store);
+            });
+        });
+        // A pure render must not disturb the shared range.
+        assert_eq!(
+            crate::viz::common::linked_zoom_range(&ctx),
+            Some((10_000_000, 50_000_000))
+        );
+    }
+
+    #[test]
+    fn freeze_time_zoom_sets_local_zoom() {
+        let mut p = WaveformPanel {
+            title: String::new(),
+            label: None,
+            bound: Vec::new(),
+            time_window_s: None,
+            cursors: false,
+            dots: false,
+            y_unit: String::new(),
+            cursor_a_ns: None,
+            cursor_b_ns: None,
+            epoch_ns: None,
+            hidden: std::collections::HashSet::new(),
+            zoom: None,
+            y_zoom: None,
+            zoom_drag_origin: None,
+        };
+        p.freeze_time_zoom((5, 9));
+        assert_eq!(p.zoom, Some((5, 9)));
     }
 }
