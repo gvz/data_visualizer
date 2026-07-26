@@ -438,8 +438,8 @@ impl egui_tiles::Behavior<usize> for TreeBehavior<'_> {
             slot.panel.render(ui, self.store);
         }
 
-        // Highlight when a channel is dragged over this panel.
-        if resp.dnd_hover_payload::<String>().is_some() {
+        // Highlight when one or more channels are dragged over this panel.
+        if resp.dnd_hover_payload::<Vec<String>>().is_some() {
             ui.painter().rect_stroke(
                 pane_rect,
                 2.0_f32,
@@ -447,17 +447,20 @@ impl egui_tiles::Behavior<usize> for TreeBehavior<'_> {
             );
         }
 
-        // Accept a dropped channel name or MQTT topic. Configured channels
-        // resolve directly; an unconfigured but discovered MQTT topic is
-        // registered on the fly (new store slot + routing). Drops that resolve
-        // to nothing are silently ignored.
-        if let Some(dropped) = resp.dnd_release_payload::<String>() {
-            let raw: &str = dropped.as_str();
-            if let Some(name) =
-                resolve_or_register_drop(raw, self.channels, self.store, self.mqtt)
-            {
-                if let Some(slot) = self.panels.get_mut(*pane) {
-                    slot.panel.drop_channel(&name, self.channels);
+        // Accept dropped channel names or MQTT topics. The payload carries every
+        // selected leaf (one for a plain drag). Configured channels resolve
+        // directly; an unconfigured but discovered MQTT topic is registered on
+        // the fly (new store slot + routing). Names that resolve to nothing are
+        // silently skipped; multi-channel panels accumulate them in order while
+        // single-value panels keep the last.
+        if let Some(dropped) = resp.dnd_release_payload::<Vec<String>>() {
+            for raw in dropped.iter() {
+                if let Some(name) =
+                    resolve_or_register_drop(raw, self.channels, self.store, self.mqtt)
+                {
+                    if let Some(slot) = self.panels.get_mut(*pane) {
+                        slot.panel.drop_channel(&name, self.channels);
+                    }
                 }
             }
         }
