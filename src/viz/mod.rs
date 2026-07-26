@@ -70,6 +70,7 @@ impl PanelRegistry {
         reg.register(spectrum::TYPE_NAME, spectrum::ctor);
         reg.register(waveform::TYPE_NAME, waveform::ctor);
         reg.register(state_graph::TYPE_NAME, state_graph::ctor);
+        reg.register(status::TYPE_NAME, status::ctor);
         reg.register(xy_scatter::TYPE_NAME, xy_scatter::ctor);
         reg
     }
