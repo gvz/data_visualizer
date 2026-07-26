@@ -4,7 +4,7 @@ use crate::config::ChannelRegistry;
 use crate::store::ChannelStore;
 use crate::types::SampleType;
 use crate::viz::common::{
-    bind, binding_error, label_config_row, opt_f64, opt_label, opt_str, outlined_text,
+    bind, binding_error, is_light, label_config_row, opt_f64, opt_label, opt_str, outlined_text,
     refresh_binding, sample_as_f64, serialize_label, Binding, ColorThresholds, RebindCtx,
 };
 use crate::viz::VizPanel;
@@ -40,12 +40,6 @@ pub fn ctor(
         max,
         colors: ColorThresholds::from_config(cfg),
     }))
-}
-
-/// Perceived luminance (0..1) via Rec. 601 weights; picks readable text color.
-fn is_light(c: Color32) -> bool {
-    let l = 0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32;
-    l > 140.0
 }
 
 pub(crate) fn fraction(v: f64, min: f64, max: f64) -> f32 {

@@ -255,6 +255,13 @@ impl ColorThresholds {
     }
 }
 
+/// Perceived luminance via Rec. 601 weights; true when light enough that black
+/// text reads better than white on top of it.
+pub(crate) fn is_light(c: Color32) -> bool {
+    let l = 0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32;
+    l > 140.0
+}
+
 /// Draw centered text with a one-pixel contrasting outline so it stays legible
 /// on any background color (e.g. over a gauge bar of arbitrary fill).
 pub fn outlined_text(
