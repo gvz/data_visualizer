@@ -15,6 +15,7 @@ pub mod measure;
 pub mod numeric;
 pub mod spectrum;
 pub mod state_graph;
+pub mod status;
 pub mod waveform;
 pub mod xy_scatter;
 
