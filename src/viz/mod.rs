@@ -13,6 +13,7 @@ pub mod gauge;
 pub mod log;
 pub mod measure;
 pub mod numeric;
+pub mod placeholder;
 pub mod spectrum;
 pub mod state_graph;
 pub mod status;
@@ -67,6 +68,7 @@ impl PanelRegistry {
         reg.register(gauge::TYPE_NAME, gauge::ctor);
         reg.register(log::TYPE_NAME, log::ctor);
         reg.register(numeric::TYPE_NAME, numeric::ctor);
+        reg.register(placeholder::TYPE_NAME, placeholder::ctor);
         reg.register(spectrum::TYPE_NAME, spectrum::ctor);
         reg.register(waveform::TYPE_NAME, waveform::ctor);
         reg.register(state_graph::TYPE_NAME, state_graph::ctor);
@@ -84,6 +86,15 @@ impl PanelRegistry {
         let mut v: Vec<&'static str> = self.ctors.keys().copied().collect();
         v.sort_unstable();
         v
+    }
+
+    /// Type names a user can choose for a panel, excluding the internal
+    /// `placeholder` type used for freshly-split, not-yet-defined panes.
+    pub fn pickable_type_names(&self) -> Vec<&'static str> {
+        self.type_names()
+            .into_iter()
+            .filter(|t| *t != placeholder::TYPE_NAME)
+            .collect()
     }
 
     pub fn build(

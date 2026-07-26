@@ -211,7 +211,7 @@ impl DataVisApp {
             mqtt_topic_map,
         } = DerivedIngest::from_handles(sources);
         let panel_type = registry
-            .type_names()
+            .pickable_type_names()
             .first()
             .map(|s| s.to_string())
             .unwrap_or_default();
@@ -618,7 +618,7 @@ impl DataVisApp {
                 egui::ComboBox::from_id_source("sidebar_panel_type")
                     .selected_text(&self.add_panel.panel_type)
                     .show_ui(ui, |ui| {
-                        for t in self.registry.type_names() {
+                        for t in self.registry.pickable_type_names() {
                             ui.selectable_value(
                                 &mut self.add_panel.panel_type,
                                 t.to_string(),
@@ -659,7 +659,7 @@ impl DataVisApp {
                 egui::ComboBox::from_label("type")
                     .selected_text(&self.add_panel.panel_type)
                     .show_ui(ui, |ui| {
-                        for t in self.registry.type_names() {
+                        for t in self.registry.pickable_type_names() {
                             ui.selectable_value(&mut self.add_panel.panel_type, t.to_string(), t);
                         }
                     });

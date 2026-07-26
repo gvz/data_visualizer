@@ -9,7 +9,7 @@ use crate::config::{ChannelRegistry, LayoutConfig, PanelEntry, ScreenConfig};
 use crate::dynamic_channel::{resolve_or_register_drop, MqttTopicMap};
 use crate::store::ChannelStore;
 use crate::types::SampleType;
-use crate::viz::{PanelRegistry, VizPanel};
+use crate::viz::{placeholder, PanelRegistry, VizPanel};
 
 /// Drop-time context for registering discovered MQTT topics on the fly:
 /// the shared routing table and the current discovered-topic snapshot.
@@ -129,22 +129,41 @@ impl ScreenState {
         }
     }
 
-    /// Split `target` (a pane) into a new linear container laid out along
-    /// `dir`, keeping the existing panel and adding a fresh, unconfigured panel
-    /// of `type_name` beside it. The target's TileId is reused for the new
-    /// container so its position in the parent (or the root pointer) is intact,
-    /// which sidesteps parent-kind-specific child rewiring.
-    fn split_panel(
+    /// Split `target` (a pane) into a new linear container laid out along `dir`,
+    /// keeping the existing panel and adding a fresh *undefined* pane beside it.
+    /// The undefined pane renders type-picker buttons until the user chooses a
+    /// type (see [`Self::define_panel`]). The target's TileId is reused for the
+    /// new container so its position in the parent (or the root pointer) is
+    /// intact, which sidesteps parent-kind-specific child rewiring.
+    fn split_panel(&mut self, target: TileId, dir: LinearDir) {
+        let old_idx = match self.tree.tiles.get(target) {
+            Some(Tile::Pane(i)) => *i,
+            _ => return,
+        };
+        let new_idx = self.panels.len();
+        self.panels.push(PanelSlot {
+            type_name: placeholder::TYPE_NAME.to_string(),
+            panel: Box::new(placeholder::PlaceholderPanel),
+        });
+        let moved = self.tree.tiles.insert_pane(old_idx);
+        let added = self.tree.tiles.insert_pane(new_idx);
+        if let Some(tile) = self.tree.tiles.get_mut(target) {
+            *tile = Tile::Container(Container::new_linear(dir, vec![moved, added]));
+        }
+    }
+
+    /// Replace the pane at `idx` (typically an undefined placeholder) with a
+    /// fresh, unconfigured panel of `type_name`. Binding-less build failures
+    /// fall back to an inline error panel, matching [`Self::from_screen_config`].
+    fn define_panel(
         &mut self,
-        target: TileId,
-        dir: LinearDir,
+        idx: usize,
         type_name: &str,
         reg: &PanelRegistry,
         channels: &ChannelRegistry,
     ) {
-        let old_idx = match self.tree.tiles.get(target) {
-            Some(Tile::Pane(i)) => *i,
-            _ => return,
+        let Some(slot) = self.panels.get_mut(idx) else {
+            return;
         };
         let entry = PanelEntry { panel_type: type_name.to_string(), config: toml::Table::new() };
         let panel = reg.build(&entry, channels).unwrap_or_else(|e| {
@@ -154,13 +173,8 @@ impl ScreenState {
                 orig: entry.config.clone(),
             })
         });
-        let new_idx = self.panels.len();
-        self.panels.push(PanelSlot { type_name: type_name.to_string(), panel });
-        let moved = self.tree.tiles.insert_pane(old_idx);
-        let added = self.tree.tiles.insert_pane(new_idx);
-        if let Some(tile) = self.tree.tiles.get_mut(target) {
-            *tile = Tile::Container(Container::new_linear(dir, vec![moved, added]));
-        }
+        slot.type_name = type_name.to_string();
+        slot.panel = panel;
     }
 
     fn from_screen_config(
@@ -266,7 +280,7 @@ impl Workspace {
         reg: &PanelRegistry,
         mqtt: Option<MqttDropCtx>,
     ) {
-        let type_names = reg.type_names();
+        let type_names = reg.pickable_type_names();
         let Some(st) = self.screens.get_mut(&self.active) else {
             return;
         };
@@ -275,6 +289,7 @@ impl Workspace {
             panels: &mut st.panels,
             pending_remove: None,
             pending_split: None,
+            pending_define: None,
             pending_settings: None,
             type_names: &type_names,
             channels,
@@ -283,6 +298,7 @@ impl Workspace {
         st.tree.ui(&mut behavior, ui);
         let pending_remove = behavior.pending_remove;
         let pending_split = behavior.pending_split;
+        let pending_define = behavior.pending_define;
         let pending_settings = behavior.pending_settings;
         if let Some(pane) = pending_settings {
             st.settings_open = Some(pane);
@@ -290,8 +306,11 @@ impl Workspace {
         if let Some(tile_id) = pending_remove {
             st.remove_panel(tile_id);
         }
-        if let Some((tile_id, dir, type_name)) = pending_split {
-            st.split_panel(tile_id, dir, &type_name, reg, channels);
+        if let Some((tile_id, dir)) = pending_split {
+            st.split_panel(tile_id, dir);
+        }
+        if let Some((idx, type_name)) = pending_define {
+            st.define_panel(idx, &type_name, reg, channels);
         }
 
         // Floating settings window for the panel picked via the context menu.
@@ -396,6 +415,22 @@ impl Workspace {
     }
 }
 
+/// A phosphor glyph that visually hints at each panel type, shown on the
+/// undefined-pane type picker. Unknown types fall back to a plain square.
+fn type_pictogram(type_name: &str) -> &'static str {
+    match type_name {
+        "gauge" => icon::GAUGE,
+        "waveform" => icon::WAVE_SINE,
+        "numeric" => icon::HASH,
+        "spectrum" => icon::CHART_BAR,
+        "state_graph" => icon::WAVE_SQUARE,
+        "status" => icon::TAG,
+        "log" => icon::SCROLL,
+        "xy_scatter" => icon::CHART_SCATTER,
+        _ => icon::SQUARE,
+    }
+}
+
 /// egui_tiles glue: renders a pane by delegating to its panel; tab drag &
 /// drop and splitting come free from egui_tiles.
 struct TreeBehavior<'a> {
@@ -403,11 +438,14 @@ struct TreeBehavior<'a> {
     channels: &'a ChannelRegistry,
     panels: &'a mut Vec<PanelSlot>,
     pending_remove: Option<TileId>,
-    /// Requested split: (target pane, layout direction, new panel type).
-    pending_split: Option<(TileId, LinearDir, String)>,
+    /// Requested split: (target pane, layout direction). The new pane starts
+    /// undefined and shows type-picker buttons.
+    pending_split: Option<(TileId, LinearDir)>,
+    /// Requested definition of an undefined pane: (pane index, chosen type).
+    pending_define: Option<(usize, String)>,
     /// Pane index whose settings window was just requested via context menu.
     pending_settings: Option<usize>,
-    /// Panel type names offered in the split submenus.
+    /// Panel type names offered by the undefined-pane picker.
     type_names: &'a [&'static str],
     mqtt: Option<MqttDropCtx<'a>>,
 }
@@ -428,7 +466,40 @@ impl egui_tiles::Behavior<usize> for TreeBehavior<'_> {
         let resp =
             ui.interact(pane_rect, ui.id().with("pane_ctx"), egui::Sense::hover());
 
-        if let Some(slot) = self.panels.get_mut(*pane) {
+        let is_undefined = self
+            .panels
+            .get(*pane)
+            .map(|s| s.type_name == placeholder::TYPE_NAME)
+            .unwrap_or(false);
+        if is_undefined {
+            // Freshly-split pane: show a grid of pictogram tiles, one per panel
+            // type. Choosing one replaces this slot with that panel type.
+            let type_names = self.type_names;
+            let mut chosen: Option<String> = None;
+            ui.vertical_centered(|ui| {
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("Choose a panel type").weak());
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    for t in type_names {
+                        ui.allocate_ui(egui::vec2(64.0, 74.0), |ui| {
+                            ui.vertical_centered(|ui| {
+                                let glyph = type_pictogram(t);
+                                let btn = egui::Button::new(egui::RichText::new(glyph).size(30.0))
+                                    .min_size(egui::vec2(52.0, 52.0));
+                                if ui.add(btn).on_hover_text(*t).clicked() {
+                                    chosen = Some(t.to_string());
+                                }
+                                ui.label(egui::RichText::new(*t).small());
+                            });
+                        });
+                    }
+                });
+            });
+            if let Some(t) = chosen {
+                self.pending_define = Some((*pane, t));
+            }
+        } else if let Some(slot) = self.panels.get_mut(*pane) {
             // Panel label, always shown above the content (the tab bar is not
             // visible for single panes or grid layouts).
             let title = slot.panel.title().to_string();
@@ -477,22 +548,14 @@ impl egui_tiles::Behavior<usize> for TreeBehavior<'_> {
                 ui.close_menu();
             }
             ui.separator();
-            ui.menu_button(format!("{} Split horizontal", icon::COLUMNS), |ui| {
-                for t in self.type_names {
-                    if ui.button(*t).clicked() {
-                        self.pending_split = Some((tile_id, LinearDir::Horizontal, t.to_string()));
-                        ui.close_menu();
-                    }
-                }
-            });
-            ui.menu_button(format!("{} Split vertical", icon::ROWS), |ui| {
-                for t in self.type_names {
-                    if ui.button(*t).clicked() {
-                        self.pending_split = Some((tile_id, LinearDir::Vertical, t.to_string()));
-                        ui.close_menu();
-                    }
-                }
-            });
+            if ui.button(format!("{} Split horizontal", icon::COLUMNS)).clicked() {
+                self.pending_split = Some((tile_id, LinearDir::Horizontal));
+                ui.close_menu();
+            }
+            if ui.button(format!("{} Split vertical", icon::ROWS)).clicked() {
+                self.pending_split = Some((tile_id, LinearDir::Vertical));
+                ui.close_menu();
+            }
             ui.separator();
             if ui.button(format!("{} Delete panel", icon::TRASH)).clicked() {
                 self.pending_remove = Some(tile_id);
@@ -712,7 +775,40 @@ setting = 42
     }
 
     #[test]
-    fn split_panel_adds_pane_and_survives_round_trip() {
+    fn undefined_pane_picker_renders_headless_without_panic() {
+        let (ch, reg, mut ws) = build();
+        // Split a pane so the active screen holds an undefined placeholder pane
+        // that renders the pictogram type picker.
+        let st = ws.screens.get_mut("main").unwrap();
+        let target = st
+            .tree
+            .tiles
+            .iter()
+            .find_map(|(id, t)| matches!(t, Tile::Pane(0)).then_some(*id))
+            .unwrap();
+        st.split_panel(target, LinearDir::Vertical);
+        ws.active = "main".to_string();
+        let store = LiveStore::from_registry(&ch);
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ws.ui(ui, &store, &ch, &reg, None);
+            });
+        });
+    }
+
+    #[test]
+    fn every_pickable_type_has_a_pictogram() {
+        // A non-fallback glyph for every user-choosable panel type keeps the
+        // picker meaningful as new panel types are added.
+        let reg = PanelRegistry::with_builtins();
+        for t in reg.pickable_type_names() {
+            assert_ne!(type_pictogram(t), icon::SQUARE, "no pictogram for `{t}`");
+        }
+    }
+
+    #[test]
+    fn split_panel_adds_undefined_pane_and_survives_round_trip() {
         let (ch, reg, mut ws) = build();
         let st = ws.screens.get_mut("main").unwrap();
         assert_eq!(pane_count(st), 2);
@@ -723,15 +819,34 @@ setting = 42
             .iter()
             .find_map(|(id, t)| matches!(t, Tile::Pane(0)).then_some(*id))
             .unwrap();
-        st.split_panel(target, LinearDir::Vertical, "gauge", &reg, &ch);
+        st.split_panel(target, LinearDir::Vertical);
         assert_eq!(pane_count(st), 3);
         assert_eq!(st.panels.len(), 3);
-        assert_eq!(st.panels[2].type_name, "gauge");
+        // New pane starts undefined until the user picks a type.
+        assert_eq!(st.panels[2].type_name, placeholder::TYPE_NAME);
         // Tree stays valid (panes are exactly {0,1,2}) so it round-trips.
         assert!(tree_panes_valid(&st.tree, st.panels.len()));
         let cfg = ws.to_config();
         let ws2 = Workspace::from_config(&cfg, &reg, &ch);
         assert_eq!(pane_count(&ws2.screens["main"]), 3);
+        // The undefined pane survives save/reload as a placeholder.
+        assert_eq!(ws2.screens["main"].panels[2].type_name, placeholder::TYPE_NAME);
+    }
+
+    #[test]
+    fn define_panel_replaces_undefined_pane_with_chosen_type() {
+        let (ch, reg, mut ws) = build();
+        let st = ws.screens.get_mut("main").unwrap();
+        let target = st
+            .tree
+            .tiles
+            .iter()
+            .find_map(|(id, t)| matches!(t, Tile::Pane(0)).then_some(*id))
+            .unwrap();
+        st.split_panel(target, LinearDir::Vertical);
+        assert_eq!(st.panels[2].type_name, placeholder::TYPE_NAME);
+        st.define_panel(2, "gauge", &reg, &ch);
+        assert_eq!(st.panels[2].type_name, "gauge");
     }
 
     #[test]
