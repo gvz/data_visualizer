@@ -185,7 +185,7 @@ impl VizPanel for WaveformPanel {
                     .on_hover_text("prefix shared by all channels");
             }
             for (i, b) in self.bound.iter().enumerate() {
-                let color = binding_color(b, i);
+                let color = binding_color(b);
                 let hidden = self.hidden.contains(&b.name);
                 let swatch = if hidden { Color32::GRAY } else { color };
                 let text = egui::RichText::new(&shorts[i]).color(swatch);
@@ -328,7 +328,7 @@ impl VizPanel for WaveformPanel {
                     continue;
                 }
                 let points = decimate_minmax(ts, vals, anchor, MAX_PLOT_BUCKETS);
-                let color = binding_color(b, *i);
+                let color = binding_color(b);
                 plot_ui.line(Line::new(PlotPoints::from(points)).color(color).name(&b.name));
                 if self.dots {
                     // Marker on each real sample in the window.

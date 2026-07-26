@@ -105,7 +105,7 @@ impl VizPanel for XyScatterPanel {
                 plot_ui.points(
                     Points::new(PlotPoints::from(pts))
                         .radius(1.5_f32)
-                        .color(crate::viz::common::binding_color(&self.y, 0)),
+                        .color(crate::viz::common::binding_color(&self.y)),
                 );
             });
     }

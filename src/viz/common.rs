@@ -44,10 +44,12 @@ pub fn palette_color(i: usize) -> Color32 {
 const DEFAULT_CHANNEL_COLOR: &str = "#cccccc";
 
 /// Resolve a binding's line color: its explicit config color, or a palette
-/// color keyed by `series` when the channel left the color at the default.
-pub fn binding_color(b: &Binding, series: usize) -> Color32 {
+/// color keyed by the channel's stable id when the color is left at the
+/// default. Keying on the id (not a per-panel series index) gives one channel
+/// the same auto color in every panel. Unresolved channels fall back to slot 0.
+pub fn binding_color(b: &Binding) -> Color32 {
     if b.auto_color {
-        palette_color(series)
+        palette_color(b.id.map(|c| c.0 as usize).unwrap_or(0))
     } else {
         b.color
     }

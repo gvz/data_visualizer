@@ -164,7 +164,7 @@ impl VizPanel for SpectrumPanel {
             .show(ui, |plot_ui| {
                 plot_ui.line(
                     Line::new(PlotPoints::from(bins))
-                        .color(crate::viz::common::binding_color(&self.bound, 0)),
+                        .color(crate::viz::common::binding_color(&self.bound)),
                 );
             });
     }
