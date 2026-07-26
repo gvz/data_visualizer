@@ -132,6 +132,8 @@ impl StateMap {
             self.entries.remove(i);
         }
         if ui.button("+ state").clicked() {
+            // A fresh editable swatch; Color32::GRAY (from_gray 128) is a visible
+            // starting color, deliberately distinct from the runtime UNMAPPED_COLOR.
             self.entries.push(StateEntry {
                 match_key: String::new(),
                 label: None,
@@ -193,7 +195,9 @@ impl VizPanel for StatusPanel {
         let sample = store.latest_at(id, at).map(|(_, s)| s);
         let key = sample.as_ref().and_then(sample_to_key);
         // Matched entry → its label+color; unmapped value → raw text on gray;
-        // no sample → dash on gray.
+        // no sample → dash on gray. `key` is None only when there is no sample:
+        // Float is rejected at bind time (ACCEPTED), so it never reaches
+        // sample_to_key here.
         let (text, color) = match &key {
             Some(k) => match self.states.lookup(k) {
                 Some(e) => (e.display().to_string(), e.color),

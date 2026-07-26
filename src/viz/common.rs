@@ -47,6 +47,9 @@ const DEFAULT_CHANNEL_COLOR: &str = "#cccccc";
 /// color keyed by the channel's stable id when the color is left at the
 /// default. Keying on the id (not a per-panel series index) gives one channel
 /// the same auto color in every panel. Unresolved channels fall back to slot 0.
+/// Trade-off: two channels whose ids collide mod `PALETTE.len()` share a color
+/// even within one panel — accepted for cross-panel consistency (10 slots make
+/// collisions rare).
 pub fn binding_color(b: &Binding) -> Color32 {
     if b.auto_color {
         palette_color(b.id.map(|c| c.0 as usize).unwrap_or(0))
