@@ -2,6 +2,8 @@
 name = "datavis"
 version = "0.1.0"
 edition = "2021"
+description = "Desktop tool for watching streaming telemetry in real time"
+license = "GPL-3.0"
 
 [dependencies]
 eframe = "0.28"
@@ -27,3 +29,32 @@ tungstenite = "0.21"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Cargo subcommand binaries used for dependency hygiene. These are installed
+# tools, not library dependencies — install with:
+#   cargo install cargo-machete
+#   cargo install cargo-udeps   # requires a nightly toolchain
+# and run with:
+#   cargo machete
+#   cargo +nightly udeps
+[package.metadata.dev-tools]
+cargo-machete = "0.9"
+cargo-udeps = "0.1"
+
+# Debian packaging (cargo-deb). Runtime library dependencies are resolved
+# automatically from the linked binary via dpkg-shlibdeps ($auto). The .deb
+# is built inside each target distro's container so the shared-library
+# versions it depends on match that release.
+[package.metadata.deb]
+section = "science"
+priority = "optional"
+assets = [
+    ["target/release/datavis", "usr/bin/", "755"],
+    ["config.toml", "usr/share/datavis/config.toml", "644"],
+    ["README.md", "usr/share/doc/datavis/README.md", "644"],
+]
+extended-description = """\
+Pulls in live telemetry over MQTT, WebSocket, ZeroMQ and InfluxDB line \
+protocol, decodes it (Protobuf schemas picked up at runtime) and draws it \
+in a workspace of panels you arrange yourself. Sessions can be recorded to \
+MCAP and scrubbed back through the same panels."""
