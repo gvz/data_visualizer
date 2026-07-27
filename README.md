@@ -52,3 +52,11 @@ under `[package.metadata.dev-tools]`. Install and run them separately:
 cargo machete          # quick heuristic scan
 cargo +nightly udeps   # slower, compiles the crate to be sure
 ```
+
+## A note on AI
+
+Large chunks of this project were written with an AI assistant, this README
+included. Expect the usual: confident-looking code that hasn't met every edge
+case, comments that are a little too pleased with themselves, and the odd bit
+of slop that slipped past review. Read it with that in mind, and don't trust
+anything here you wouldn't check yourself.
