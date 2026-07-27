@@ -107,6 +107,24 @@ impl ScreenState {
         }
     }
 
+    /// When a screen has no panels — a freshly-added screen, or one whose
+    /// panels were all deleted — seed a single undefined pane so the type-picker
+    /// is shown instead of a blank screen. Choosing a type defines this pane
+    /// into the screen's first real panel (see [`Self::define_panel`]). The
+    /// placeholder is a real registered type, so an empty screen that is saved
+    /// and reloaded still comes back to the picker.
+    fn ensure_undefined_pane(&mut self) {
+        if !self.panels.is_empty() {
+            return;
+        }
+        self.panels.push(PanelSlot {
+            type_name: placeholder::TYPE_NAME.to_string(),
+            panel: Box::new(placeholder::PlaceholderPanel),
+        });
+        let pane = self.tree.tiles.insert_pane(0);
+        self.tree.root = Some(pane);
+    }
+
     fn remove_panel(&mut self, tile_id: TileId) {
         let pane_idx = match self.tree.tiles.get(tile_id) {
             Some(Tile::Pane(i)) => *i,
@@ -284,6 +302,8 @@ impl Workspace {
         let Some(st) = self.screens.get_mut(&self.active) else {
             return;
         };
+        // No panels (fresh screen, or all deleted) → show the type-picker.
+        st.ensure_undefined_pane();
         let mut behavior = TreeBehavior {
             store,
             panels: &mut st.panels,
@@ -847,6 +867,25 @@ setting = 42
         assert_eq!(st.panels[2].type_name, placeholder::TYPE_NAME);
         st.define_panel(2, "gauge", &reg, &ch);
         assert_eq!(st.panels[2].type_name, "gauge");
+    }
+
+    #[test]
+    fn empty_screen_seeds_undefined_pane_defineable_into_first_panel() {
+        let (ch, reg, _ws) = build();
+        let mut st = ScreenState::empty("blank");
+        assert_eq!(st.panels.len(), 0);
+        // A blank screen gains a single undefined pane so the picker shows.
+        st.ensure_undefined_pane();
+        assert_eq!(pane_count(&st), 1);
+        assert_eq!(st.panels.len(), 1);
+        assert_eq!(st.panels[0].type_name, placeholder::TYPE_NAME);
+        assert!(st.tree.root.is_some());
+        // Idempotent: a screen that already has a pane is left untouched.
+        st.ensure_undefined_pane();
+        assert_eq!(pane_count(&st), 1);
+        // Picking a type defines the seeded pane into the first real panel.
+        st.define_panel(0, "gauge", &reg, &ch);
+        assert_eq!(st.panels[0].type_name, "gauge");
     }
 
     #[test]
