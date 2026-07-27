@@ -535,6 +535,27 @@ impl DataVisApp {
                             }
                         };
                         ui.colored_label(color, label);
+
+                        // Pause/resume the live view.
+                        let (pause_icon, pause_hint) = if self.live_paused {
+                            (icon::PLAY, "Resume")
+                        } else {
+                            (icon::PAUSE, "Pause")
+                        };
+                        if ui.button(pause_icon).on_hover_text(pause_hint).clicked() {
+                            if self.live_paused {
+                                self.live_paused = false;
+                            } else {
+                                // Freeze whatever is on screen: the scrubbed instant
+                                // if scrolled back, otherwise the current wall clock.
+                                self.live_pause_ns = if self.live_view_offset_ns != 0 {
+                                    crate::types::now_ns() + self.live_view_offset_ns
+                                } else {
+                                    crate::types::now_ns()
+                                };
+                                self.live_paused = true;
+                            }
+                        }
                         ui.separator();
 
                         // Record controls
@@ -567,6 +588,74 @@ impl DataVisApp {
                                 }
                             }
                         }
+                        ui.separator();
+
+                        // Live scrub slider — drag back through buffered history.
+                        // Reserve exactly the readout's measured width so the
+                        // label always stays flush against the slider's right
+                        // edge, whatever the window size or offset magnitude.
+                        let readout_str = {
+                            let pos = if self.live_view_offset_ns == 0 {
+                                "live".to_string()
+                            } else {
+                                format!("{:.1}s", self.live_view_offset_ns as f64 / 1e9)
+                            };
+                            format!("{pos} / {:.0}s", self.live_history_s)
+                        };
+                        let readout_w = ui.fonts(|f| {
+                            f.layout_no_wrap(
+                                readout_str,
+                                egui::TextStyle::Small.resolve(ui.style()),
+                                egui::Color32::PLACEHOLDER,
+                            )
+                            .size()
+                            .x
+                        });
+                        let slider_w = (ui.available_width()
+                            - readout_w
+                            - ui.spacing().item_spacing.x * 2.0)
+                            .max(120.0);
+                        let mut offset_secs = self.live_view_offset_ns as f64 / 1e9;
+                        // Scrubbing is disabled while paused (the view is frozen).
+                        // Drive the rail length via `slider_width` so the bar
+                        // actually fills the reserved space — `add_sized` would
+                        // only center a fixed-width rail, leaving a gap that grows
+                        // with the window. Restore it so no other slider inherits.
+                        let saved_slider_w = ui.spacing().slider_width;
+                        ui.spacing_mut().slider_width = slider_w;
+                        let mut changed = false;
+                        ui.add_enabled_ui(!self.live_paused, |ui| {
+                            changed = ui
+                                .add(
+                                    egui::Slider::new(&mut offset_secs, -self.live_history_s..=0.0)
+                                        .show_value(false),
+                                )
+                                .changed();
+                        });
+                        ui.spacing_mut().slider_width = saved_slider_w;
+                        if changed {
+                            // Snap to live within 100 ms of the right edge.
+                            self.live_view_offset_ns = if offset_secs > -0.1 {
+                                0
+                            } else {
+                                (offset_secs * 1e9) as i64
+                            };
+                        }
+                        // Position within the window / total span the slider covers.
+                        let pos_txt = if self.live_view_offset_ns == 0 {
+                            "live".to_string()
+                        } else {
+                            format!("{:.1}s", self.live_view_offset_ns as f64 / 1e9)
+                        };
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{pos_txt} / {:.0}s",
+                                self.live_history_s
+                            ))
+                            .small()
+                            .weak(),
+                        )
+                        .on_hover_text("scrub position / history covered by slider");
                     }
                     AppMode::Replay(_) => {
                         ui.colored_label(egui::Color32::LIGHT_BLUE, "REPLAY");
@@ -778,59 +867,6 @@ impl eframe::App for DataVisApp {
 
         self.menu_bar(ctx);
         self.toolbar(ctx);
-
-        // Live timeline — always visible in live mode so the user can scrub history.
-        if let AppMode::Live = self.mode {
-            egui::TopBottomPanel::bottom("live_timeline").show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    let (pause_icon, pause_hint) =
-                        if self.live_paused { (icon::PLAY, "Resume") } else { (icon::PAUSE, "Pause") };
-                    if ui.button(pause_icon).on_hover_text(pause_hint).clicked() {
-                        if self.live_paused {
-                            self.live_paused = false;
-                        } else {
-                            // Freeze whatever is on screen: the scrubbed instant
-                            // if scrolled back, otherwise the current wall clock.
-                            self.live_pause_ns = if self.live_view_offset_ns != 0 {
-                                crate::types::now_ns() + self.live_view_offset_ns
-                            } else {
-                                crate::types::now_ns()
-                            };
-                            self.live_paused = true;
-                        }
-                    }
-                    let right_reserved = 70.0;
-                    let slider_w = (ui.available_width() - right_reserved).max(60.0);
-                    let mut offset_secs = self.live_view_offset_ns as f64 / 1e9;
-                    // Scrubbing is disabled while paused (the view is frozen).
-                    let mut changed = false;
-                    ui.add_enabled_ui(!self.live_paused, |ui| {
-                        changed = ui
-                            .add_sized(
-                                [slider_w, ui.spacing().interact_size.y],
-                                egui::Slider::new(&mut offset_secs, -self.live_history_s..=0.0)
-                                    .show_value(false),
-                            )
-                            .changed();
-                    });
-                    if changed {
-                        // Snap to live within 100 ms of the right edge.
-                        self.live_view_offset_ns = if offset_secs > -0.1 {
-                            0
-                        } else {
-                            (offset_secs * 1e9) as i64
-                        };
-                    }
-                    if self.live_paused {
-                        ui.colored_label(egui::Color32::YELLOW, "PAUSED");
-                    } else if self.live_view_offset_ns == 0 {
-                        ui.colored_label(egui::Color32::LIGHT_GREEN, "LIVE");
-                    } else {
-                        ui.label(format!("{:.1}s", self.live_view_offset_ns as f64 / 1e9));
-                    }
-                });
-            });
-        }
 
         // Timeline bottom panel — close_replay flag defers the borrow-conflicting call.
         let mut close_replay = false;
