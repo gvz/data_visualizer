@@ -8,8 +8,8 @@ use crate::types::{now_ns, ChannelId, NumericVal, SampleType};
 
 /// Dev-only synthetic data source (~1 kHz): sine → float channels,
 /// wrapping counter → int, slow toggle → bool, periodic lines → text.
-/// Runs until process exit.
-pub fn spawn_demo(store: Arc<LiveStore>, reg: &ChannelRegistry) -> JoinHandle<()> {
+/// `freq_hz` sets the sine frequency. Runs until process exit.
+pub fn spawn_demo(store: Arc<LiveStore>, reg: &ChannelRegistry, freq_hz: f64) -> JoinHandle<()> {
     let targets: Vec<(ChannelId, SampleType)> = reg
         .iter_ids()
         .map(|id| (id, reg.meta(id).sample_type))
@@ -23,7 +23,7 @@ pub fn spawn_demo(store: Arc<LiveStore>, reg: &ChannelRegistry) -> JoinHandle<()
             for &(id, sample_type) in &targets {
                 match sample_type {
                     SampleType::Float => {
-                        let v = (2.0 * std::f64::consts::PI * t).sin() * 10.0;
+                        let v = (2.0 * std::f64::consts::PI * freq_hz * t).sin() * 10.0;
                         store.write_numeric(id, ts, NumericVal::Float(v));
                     }
                     SampleType::Int => {
@@ -73,7 +73,7 @@ type = "text"
         )
         .unwrap();
         let store = Arc::new(LiveStore::from_registry(&reg));
-        let _handle = spawn_demo(store.clone(), &reg);
+        let _handle = spawn_demo(store.clone(), &reg, 1.0);
         std::thread::sleep(std::time::Duration::from_millis(300));
         let sine = reg.id("demo.sine").unwrap();
         let log = reg.id("demo.log").unwrap();

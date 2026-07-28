@@ -14,6 +14,7 @@
 //!   --url <ws-url>        default ws://127.0.0.1:9001
 //!   --channels <N>        number of channels/fields per frame (default 8)
 //!   --freq <HZ>           frames per second (default 2.0)
+//!   --sine-freq <HZ>      sine wave frequency of the field values (default 0.2)
 //!   --measurement <name>  Influx measurement name (default "load")
 //!   --duration <SECS>     stop after this many seconds (default 0 = run forever)
 
@@ -28,6 +29,9 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(8);
     let freq: f64 = arg(&args, "--freq").and_then(|s| s.parse().ok()).unwrap_or(2.0);
+    let sine_freq: f64 = arg(&args, "--sine-freq")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.2);
     let measurement = arg(&args, "--measurement").unwrap_or_else(|| "load".to_string());
     let duration: f64 = arg(&args, "--duration")
         .and_then(|s| s.parse().ok())
@@ -50,7 +54,7 @@ fn main() {
         }
     };
     println!(
-        "connected to {url}: {channels} channels @ {freq} Hz on measurement '{measurement}'{}",
+        "connected to {url}: {channels} channels @ {freq} Hz, {sine_freq} Hz sine on measurement '{measurement}'{}",
         if duration > 0.0 { format!(" for {duration}s") } else { " (forever, Ctrl-C to stop)".to_string() }
     );
 
@@ -65,7 +69,7 @@ fn main() {
             break;
         }
 
-        let line = build_line(&measurement, channels, elapsed);
+        let line = build_line(&measurement, channels, elapsed, sine_freq);
         if let Err(e) = ws.send(Message::Text(line)) {
             eprintln!("send failed: {e}");
             break;
@@ -85,14 +89,14 @@ fn main() {
 }
 
 /// One Influx line: `measurement ch0=<v>,ch1=<v>,… <ts_ns>`.
-fn build_line(measurement: &str, channels: usize, elapsed: f64) -> String {
+fn build_line(measurement: &str, channels: usize, elapsed: f64, sine_freq: f64) -> String {
     let mut fields = String::new();
     for i in 0..channels {
         if i > 0 {
             fields.push(',');
         }
-        // Distinct sine per channel: 0.2 Hz base, phase-shifted by index.
-        let v = (elapsed * 0.2 * std::f64::consts::TAU + i as f64 * 0.7).sin();
+        // Distinct sine per channel: `sine_freq` base, phase-shifted by index.
+        let v = (elapsed * sine_freq * std::f64::consts::TAU + i as f64 * 0.7).sin();
         fields.push_str(&format!("ch{i}={v:.4}"));
     }
     format!("{measurement} {fields} {}", now_ns())
