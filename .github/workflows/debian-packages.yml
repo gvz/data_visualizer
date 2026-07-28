@@ -1,8 +1,10 @@
-name: Debian packages
+name: Packages
 
-# Build .deb packages for several Debian/Ubuntu releases. Each job runs inside
-# the target distro's own container so the binary links against — and the
-# package depends on — that release's shared-library versions.
+# Build distributable packages: .deb for several Debian/Ubuntu releases (each
+# inside the target distro's own container so the binary links against — and
+# the package depends on — that release's shared-library versions), plus a
+# portable Windows .exe bundle. libzmq/libsodium are vendored and built from
+# source by zeromq-src, so no system ZeroMQ is needed on any platform.
 
 on:
   push:
@@ -67,9 +69,43 @@ jobs:
           path: target/debian/*.deb
           if-no-files-found: error
 
+  build-windows:
+    name: windows-x64
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Build release binary
+        run: cargo build --release --locked
+        # zeromq-src builds libzmq + libsodium from source via CMake; the
+        # windows-latest image ships MSVC and CMake, so no extra setup is
+        # needed. The resulting .exe links libzmq statically.
+
+      - name: Stage portable bundle
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/datavis | Out-Null
+          Copy-Item target/release/datavis.exe dist/datavis/
+          Copy-Item config.toml dist/datavis/
+          Copy-Item README.md dist/datavis/
+          Compress-Archive -Path dist/datavis/* -DestinationPath datavis-windows-x64.zip -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: datavis-windows-x64
+          path: datavis-windows-x64.zip
+          if-no-files-found: error
+
   release:
     name: Attach to release
-    needs: build-deb
+    needs: [build-deb, build-windows]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
@@ -84,4 +120,6 @@ jobs:
       - name: Publish to GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: packages/*.deb
+          files: |
+            packages/*.deb
+            packages/*.zip
