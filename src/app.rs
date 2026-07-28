@@ -688,7 +688,7 @@ impl DataVisApp {
                 let channels = &self.channels;
                 egui::ScrollArea::vertical()
                     .id_source("ch_tree_scroll")
-                    .max_height((avail_h - 90.0).max(60.0))
+                    .max_height(avail_h)
                     .show(ui, |ui| {
                         self.channel_tree.ui(ui, &self.mqtt_snapshot, |name| {
                             let id = channels.id(name)?;
@@ -696,43 +696,6 @@ impl DataVisApp {
                             Some(fmt_sample(&sample))
                         });
                     });
-
-                ui.separator();
-
-                ui.label(match self.add_panel.panel_type.as_str() {
-                    "xy_scatter" => "select exactly 2 channels",
-                    "waveform" | "log" => "select 1 or more channels",
-                    _ => "select 1 channel",
-                });
-                egui::ComboBox::from_id_source("sidebar_panel_type")
-                    .selected_text(&self.add_panel.panel_type)
-                    .show_ui(ui, |ui| {
-                        for t in self.registry.pickable_type_names() {
-                            ui.selectable_value(
-                                &mut self.add_panel.panel_type,
-                                t.to_string(),
-                                t,
-                            );
-                        }
-                    });
-                ui.horizontal(|ui| {
-                    let entry = build_panel_entry(
-                        &self.add_panel.panel_type,
-                        &self.add_panel.selected,
-                    )
-                    .unwrap_or_else(|| crate::config::PanelEntry {
-                        panel_type: self.add_panel.panel_type.clone(),
-                        config: toml::Table::new(),
-                    });
-                    if ui.button(format!("{} Add", icon::PLUS)).clicked() {
-                        if let Err(err) =
-                            self.workspace.add_panel(&entry, &self.registry, &self.channels)
-                        {
-                            self.status = format!("add panel failed: {err}");
-                        }
-                        self.add_panel.selected.clear();
-                    }
-                });
             });
     }
 
