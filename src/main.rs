@@ -1,10 +1,10 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 
 use datavis::app::DataVisApp;
-use datavis::config::{ChannelRegistry, LayoutConfig};
+use datavis::config::{ChannelRegistry, LayoutConfig, DEFAULT_CONFIG_TOML};
 use datavis::ingest::{
     DataSource, IngestConfig, MqttConfig, MqttSource, WsConfig, WsSource, ZmqSource,
 };
@@ -19,15 +19,24 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let demo = args.iter().any(|a| a == "--demo");
+    let demo_freq = arg_value(&args, "--demo-freq")
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(1.0);
     let endpoint =
         arg_value(&args, "--endpoint").unwrap_or_else(|| "tcp://localhost:5555".to_string());
     let schema_path =
         arg_value(&args, "--schema").unwrap_or_else(|| "schema.proto".to_string());
     let mqtt_endpoint = arg_value(&args, "--mqtt-endpoint");
-    let layout_path = PathBuf::from("config.toml");
+    let mut layout_path = PathBuf::from("config.toml");
 
-    let channels = ChannelRegistry::load(&layout_path)?;
-    let layout = LayoutConfig::load(&layout_path)?;
+    let (channels, layout) = if layout_path.exists() {
+        (ChannelRegistry::load(&layout_path)?, LayoutConfig::load(&layout_path)?)
+    } else {
+        // No config in the working directory: fall back to the hardcoded
+        // default, but first ask whether to save it, load a different file,
+        // or just run with the defaults this once.
+        resolve_missing_config(&mut layout_path)?
+    };
 
     let store = Arc::new(LiveStore::from_registry(&channels));
     let live_view_ns = store.view_override.clone();
@@ -42,7 +51,7 @@ fn main() -> anyhow::Result<()> {
     let mut sources: Vec<datavis::ingest::SourceHandle> = Vec::new();
 
     if demo {
-        datavis::demo::spawn_demo(store.clone(), &channels);
+        datavis::demo::spawn_demo(store.clone(), &channels, demo_freq);
     } else {
         let config = IngestConfig {
             endpoint,
@@ -96,6 +105,67 @@ fn main() -> anyhow::Result<()> {
     .map_err(|e| anyhow!("eframe: {e}"))
 }
 
+/// Load both halves of a config file (channels + layout) from one path.
+fn load_config(path: &Path) -> anyhow::Result<(ChannelRegistry, LayoutConfig)> {
+    Ok((ChannelRegistry::load(path)?, LayoutConfig::load(path)?))
+}
+
+/// The hardcoded default config, parsed straight from the embedded template.
+fn default_config() -> anyhow::Result<(ChannelRegistry, LayoutConfig)> {
+    Ok((
+        ChannelRegistry::from_toml_str(DEFAULT_CONFIG_TOML)?,
+        LayoutConfig::from_toml_str(DEFAULT_CONFIG_TOML)?,
+    ))
+}
+
+/// No `config.toml` in the working directory. Ask the user whether to save the
+/// built-in default there, load a different file, or run with the defaults
+/// without saving. On save or load, `layout_path` is pointed at the file the
+/// app should persist layout changes back into.
+fn resolve_missing_config(
+    layout_path: &mut PathBuf,
+) -> anyhow::Result<(ChannelRegistry, LayoutConfig)> {
+    use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
+
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+    let choice = MessageDialog::new()
+        .set_level(MessageLevel::Info)
+        .set_title("datavis — no config found")
+        .set_description(format!(
+            "No config.toml was found in {cwd}.\n\n\
+             Yes\u{2003}— save the built-in default here and use it\n\
+             No\u{2003}— load a different config file\n\
+             Cancel\u{2003}— start with default settings (nothing saved)"
+        ))
+        .set_buttons(MessageButtons::YesNoCancel)
+        .show();
+
+    match choice {
+        MessageDialogResult::Yes => {
+            std::fs::write(&*layout_path, DEFAULT_CONFIG_TOML)
+                .with_context(|| format!("writing {}", layout_path.display()))?;
+            load_config(layout_path)
+        }
+        MessageDialogResult::No => match FileDialog::new()
+            .add_filter("TOML config", &["toml"])
+            .set_title("Load config")
+            .pick_file()
+        {
+            Some(picked) => {
+                let cfg = load_config(&picked)?;
+                *layout_path = picked;
+                Ok(cfg)
+            }
+            // Picker dismissed — fall back to in-memory defaults.
+            None => default_config(),
+        },
+        // Cancel or window closed.
+        _ => default_config(),
+    }
+}
+
 fn arg_value(args: &[String], flag: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
 }
@@ -109,6 +179,7 @@ USAGE:
 
 OPTIONS:
     --demo                    Run with the built-in demo source (no live inputs).
+    --demo-freq <HZ>          Sine frequency for the demo source. [default: 1.0]
     --endpoint <ADDR>         ZMQ SUB endpoint for live proto data.
                               [default: tcp://localhost:5555]
     --schema <PATH>           Proto schema file for the ZMQ source.

@@ -1,0 +1,13 @@
+# datavis configuration
+#
+# Created from the built-in default. It has no channels or panels yet — open
+# the app and use the panel type picker to add a visualisation, or list your
+# data channels below. The panel layout is written back into this file
+# automatically as you arrange it.
+#
+# Channels look like:
+#   [channels."load/ch0"]
+#   sample_type = "f64"
+#   unit = "V"
+
+default_window_s = 10.0
