@@ -150,6 +150,9 @@ pub struct DataVisApp {
     add_panel: AddPanelDialog,
     new_screen_name: String,
     status: String,
+    /// When set, `status` is cleared once this instant passes. Used for
+    /// transient confirmations (e.g. "layout saved") that should not linger.
+    status_clear_at: Option<Instant>,
     conn_states: Vec<Arc<std::sync::atomic::AtomicU8>>,
     mode: AppMode,
     // Recording state
@@ -226,6 +229,7 @@ impl DataVisApp {
             add_panel: AddPanelDialog { panel_type, ..Default::default() },
             new_screen_name: String::new(),
             status: String::new(),
+            status_clear_at: None,
             conn_states,
             mode: AppMode::Live,
             record_handle: None,
@@ -262,6 +266,8 @@ impl DataVisApp {
             Ok(()) => format!("layout saved to {}", self.layout_path.display()),
             Err(e) => format!("layout save failed: {e}"),
         };
+        // Auto-clear this confirmation after 2s so it does not linger.
+        self.status_clear_at = Some(Instant::now() + Duration::from_secs(2));
     }
 
     fn load_layout(&mut self) {
@@ -773,6 +779,15 @@ impl eframe::App for DataVisApp {
             }
         };
         ctx.request_repaint_after(Duration::from_millis(if animating { 16 } else { 200 }));
+
+        // Expire transient status messages (e.g. "layout saved"). The heartbeat
+        // repaint above guarantees this runs within ~200ms of the deadline.
+        if let Some(deadline) = self.status_clear_at {
+            if Instant::now() >= deadline {
+                self.status.clear();
+                self.status_clear_at = None;
+            }
+        }
 
         // Publish the app-wide default window so panels can read it this frame.
         crate::viz::common::set_global_window_s(ctx, self.default_window_s);
