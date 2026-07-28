@@ -3,7 +3,7 @@ name: Packages
 # Build distributable packages: .deb for several Debian/Ubuntu releases (each
 # inside the target distro's own container so the binary links against — and
 # the package depends on — that release's shared-library versions), plus a
-# portable Windows .exe bundle. libzmq/libsodium are vendored and built from
+# standalone Windows .exe. libzmq/libsodium are vendored and built from
 # source by zeromq-src, so no system ZeroMQ is needed on any platform.
 
 on:
@@ -85,22 +85,14 @@ jobs:
         run: cargo build --release --locked
         # zeromq-src builds libzmq + libsodium from source via CMake; the
         # windows-latest image ships MSVC and CMake, so no extra setup is
-        # needed. The resulting .exe links libzmq statically.
-
-      - name: Stage portable bundle
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist/datavis | Out-Null
-          Copy-Item target/release/datavis.exe dist/datavis/
-          Copy-Item config.toml dist/datavis/
-          Copy-Item README.md dist/datavis/
-          Compress-Archive -Path dist/datavis/* -DestinationPath datavis-windows-x64.zip -Force
+        # needed. The resulting .exe links libzmq statically and runs
+        # standalone — with no config.toml it starts from built-in defaults.
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: datavis-windows-x64
-          path: datavis-windows-x64.zip
+          path: target/release/datavis.exe
           if-no-files-found: error
 
   release:
@@ -122,4 +114,4 @@ jobs:
         with:
           files: |
             packages/*.deb
-            packages/*.zip
+            packages/*.exe
