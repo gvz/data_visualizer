@@ -20,15 +20,30 @@ pub use mqtt::{MqttConfig, MqttSource};
 pub use source::{DataSource, Discovery, SourceHandle};
 pub use websocket::{WsConfig, WsSource};
 
+/// Source is attempting to connect; no data has been received yet.
 pub const CONNECTING: u8 = 0;
+/// Source is connected and receiving data within the expected heartbeat window.
 pub const LIVE: u8 = 1;
+/// Source was live but has not received data within the timeout window.
 pub const TIMEOUT: u8 = 2;
 
+/// Configuration for the ZeroMQ Protobuf source.
 pub struct IngestConfig {
+    /// ZMQ SUB socket endpoint, e.g. `"tcp://localhost:5555"`.
     pub endpoint: String,
+    /// Path to the `.proto` schema file that describes the message format.
     pub proto_path: PathBuf,
 }
 
+/// ZeroMQ SUB source that decodes Protobuf-framed channel samples.
+///
+/// Each message is a two-part ZMQ frame: the topic string followed by a
+/// serialised Protobuf payload decoded against the schema loaded from
+/// [`IngestConfig::proto_path`]. The schema is also serialised into
+/// [`SourceHandle::schema_bytes`] for embedding in MCAP recording headers.
+///
+/// Build with [`ZmqSource::build`], then call [`DataSource::spawn`] to start
+/// the background receive loop.
 pub struct ZmqSource {
     endpoint: String,
     router: router::TopicRouter,
@@ -36,6 +51,12 @@ pub struct ZmqSource {
 }
 
 impl ZmqSource {
+    /// Parse the `.proto` schema at `config.proto_path`, build a topic router
+    /// from the registry, and return a ready-to-spawn source.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the schema file cannot be read or parsed.
     pub fn build(config: IngestConfig, registry: &ChannelRegistry) -> anyhow::Result<Self> {
         let schema = loader::ProtoSchema::from_path(&config.proto_path)?;
         let schema_bytes = schema.schema_bytes().to_vec();

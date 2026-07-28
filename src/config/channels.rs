@@ -57,11 +57,11 @@ fn default_max_lines() -> usize {
     500
 }
 
-/// Resolve a static channel's max_rate: channel value, else [defaults], else 1000.
+/// Resolve a static channel's max_rate: channel value, else `[defaults]`, else 1000.
 fn resolve_static_rate(cfg: Option<u32>, def: Option<u32>) -> u32 {
     cfg.or(def).unwrap_or(1000)
 }
-/// Resolve a static channel's history_s: channel value, else [defaults], else 10.0.
+/// Resolve a static channel's history_s: channel value, else `[defaults]`, else 10.0.
 fn resolve_static_history(cfg: Option<f64>, def: Option<f64>) -> f64 {
     cfg.or(def).unwrap_or(10.0)
 }
@@ -99,7 +99,7 @@ pub struct ChannelRegistry {
     ids: HashMap<String, ChannelId>,
     configs: Vec<ChannelConfig>,
     metas: Vec<ChannelMeta>,
-    /// Parsed [defaults]; applied to runtime-registered dynamic channels.
+    /// Parsed `[defaults]`; applied to runtime-registered dynamic channels.
     defaults: ChannelDefaults,
     /// Runtime-added name → id. Written only from the UI thread on drop.
     dyn_ids: RwLock<HashMap<String, ChannelId>>,
@@ -108,7 +108,7 @@ pub struct ChannelRegistry {
 }
 
 /// Defaults for a runtime-registered MQTT channel. Rate/history come from the
-/// file's [defaults] when present, else the hardcoded dynamic fallbacks
+/// file's `[defaults]` when present, else the hardcoded dynamic fallbacks
 /// (100 Hz / 30 s — MQTT is low-rate).
 fn dynamic_channel(
     name: String,

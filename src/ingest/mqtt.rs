@@ -12,18 +12,35 @@ use crate::ingest::{CONNECTING, LIVE};
 use crate::record::RecordMsg;
 use crate::store::ChannelStore;
 
+/// Configuration for the MQTT source.
 pub struct MqttConfig {
-    /// Broker address as "host:port" or "host" (defaults to port 1883).
+    /// Broker address as `"host:port"` or `"host"` (default port 1883).
+    /// IPv6 bracket notation is supported: `"[::1]:1883"`.
     pub broker_url: String,
+    /// MQTT client identifier. Must be unique per broker; `"datavis"` by
+    /// default when launched from the CLI.
     pub client_id: String,
 }
 
+/// MQTT source that subscribes to `#` and decodes InfluxDB line-protocol
+/// payloads into channel samples.
+///
+/// Topics are discovered at runtime: every received topic is added to
+/// [`Discovery::discovered`] so it appears in the sidebar. When a topic is
+/// dragged onto a panel the app registers it as a dynamic channel and extends
+/// the internal topic map so subsequent messages route to it.
+///
+/// Channels declared in `config.toml` with an `mqtt_topic` field are
+/// pre-seeded into the topic map at construction time and bind immediately
+/// without requiring a drag-and-drop.
 pub struct MqttSource {
     config: MqttConfig,
     pub(crate) topic_map: Arc<MqttTopicMap>,
 }
 
 impl MqttSource {
+    /// Create a new MQTT source from `config`, pre-seeding the topic map from
+    /// any `mqtt_topic` channels already in `registry`.
     pub fn new(config: MqttConfig, registry: &ChannelRegistry) -> Self {
         Self { config, topic_map: crate::ingest::source::topic_map_from_registry(registry) }
     }
@@ -102,7 +119,7 @@ fn run_loop(
 }
 
 /// Parse "host:port" or "host" (default port 1883).
-/// Handles IPv6 bracket notation: "[::1]:1883".
+/// Handles IPv6 bracket notation: `"[::1]:1883"`.
 fn parse_broker_url(url: &str) -> (String, u16) {
     if url.starts_with('[') {
         if let Some(bracket_end) = url.find(']') {

@@ -14,17 +14,31 @@ use crate::ingest::{CONNECTING, LIVE};
 use crate::record::RecordMsg;
 use crate::store::ChannelStore;
 
+/// Configuration for the WebSocket InfluxDB line-protocol source.
 pub struct WsConfig {
-    /// Bind address as "host:port", e.g. "0.0.0.0:9001".
+    /// TCP bind address as `"host:port"`, e.g. `"0.0.0.0:9001"`.
     pub listen: String,
 }
 
+/// WebSocket server that accepts InfluxDB line-protocol frames and writes
+/// samples to the shared channel store.
+///
+/// Each WebSocket connection sends newline-delimited InfluxDB line-protocol
+/// lines; the measurement name is used as the channel topic. Topic discovery
+/// works the same way as [`MqttSource`](crate::ingest::MqttSource): every
+/// received measurement name is added to [`Discovery::discovered`] and can be
+/// bound to a panel via drag-and-drop.
+///
+/// Multiple simultaneous client connections are accepted; each is handled on
+/// its own thread.
 pub struct WsSource {
     config: WsConfig,
     pub(crate) topic_map: Arc<MqttTopicMap>,
 }
 
 impl WsSource {
+    /// Create a new WebSocket source from `config`, pre-seeding the topic map
+    /// from any `mqtt_topic` channels already in `registry`.
     pub fn new(config: WsConfig, registry: &ChannelRegistry) -> Self {
         Self { config, topic_map: topic_map_from_registry(registry) }
     }

@@ -20,49 +20,120 @@ pub mod status;
 pub mod waveform;
 pub mod xy_scatter;
 
-/// A visualization panel. Panels only see the ChannelStore trait — live vs
-/// replay is transparent here.
+/// A single visualization panel: one cell in the workspace grid that reads
+/// channel samples and draws them.
+///
+/// Panels observe data exclusively through the [`ChannelStore`] trait, so a
+/// panel cannot tell whether it is showing a live feed or a replayed
+/// recording — the same `render` call serves both. This is the extension
+/// point for new visualizations: implement this trait, expose a `TYPE_NAME`
+/// and a [`PanelCtor`], and register both in [`PanelRegistry::with_builtins`].
+///
+/// # Lifecycle
+///
+/// A panel is built from a [`PanelEntry`] by its [`PanelCtor`], lives for as
+/// long as the pane exists, and is persisted back to `layout.toml` via
+/// [`serialize`](VizPanel::serialize). Each frame the workspace calls
+/// [`render`](VizPanel::render); [`config_ui`](VizPanel::config_ui) is called
+/// only while the panel's settings popup is open.
+///
+/// # Implementing
+///
+/// The five methods above the defaults are required. The default methods are
+/// opt-in hooks for interactive behaviour (drag-and-drop rebinding, dynamic
+/// channel discovery, linked zoom) — override only the ones a panel needs.
+///
+/// A binding problem (unknown channel, wrong sample type) must never abort
+/// construction: the [`PanelCtor`] returns a panel that draws an inline error,
+/// and `render` keeps working. See [`PanelCtor`] for the `Err` contract.
 pub trait VizPanel {
+    /// Human-readable panel title, shown in the pane header. Usually the bound
+    /// channel name, or a fixed label for channel-less panels.
     fn title(&self) -> &str;
+
+    /// Sample types this panel can display. Used to gate drag-and-drop and the
+    /// channel picker so incompatible channels cannot be bound.
     fn accepted_types(&self) -> &[SampleType];
-    /// Panel settings UI (shown in a config popup/side area).
+
+    /// Draw the panel's configuration controls into `ui`.
+    ///
+    /// Shown in the panel's settings popup/side area, not in the main view.
+    /// Mutations take effect on the next [`render`](VizPanel::render).
     fn config_ui(&mut self, ui: &mut egui::Ui);
+
+    /// Draw the panel for the current frame, reading samples from `store`.
+    ///
+    /// Called once per frame while the pane is visible. `store` abstracts over
+    /// live and replay sources, so the same code path serves both. Must render
+    /// an inline message rather than panic when its channel is unresolved.
     fn render(&mut self, ui: &mut egui::Ui, store: &dyn ChannelStore);
-    /// Panel-specific config keys for layout.toml. Must NOT include "type" —
-    /// PanelEntry carries that.
+
+    /// The panel's own config keys, to be written under its entry in
+    /// `layout.toml`.
+    ///
+    /// Must round-trip: feeding this table back through the panel's
+    /// [`PanelCtor`] reconstructs an equivalent panel. Must **not** include the
+    /// `"type"` key — [`PanelEntry`] carries the type separately.
     fn serialize(&self) -> toml::Table;
-    /// Called when a channel name is dragged and dropped onto this panel.
-    /// Single-channel panels replace their channel; multi-channel panels append.
+
+    /// Bind a channel dropped onto this panel via drag-and-drop.
+    ///
+    /// Single-channel panels replace their current channel; multi-channel
+    /// panels append. `name` is the dropped channel; `reg` resolves it to an
+    /// id and metadata. Default no-op for panels that take no channels.
     fn drop_channel(&mut self, _name: &str, _reg: &crate::config::ChannelRegistry) {}
-    /// Re-attempt to resolve any currently-unknown channels. Called when new
-    /// MQTT topics are discovered, so a panel loaded from a layout before its
-    /// (dynamic) MQTT topic reappeared can bind once it does. Default no-op.
+
+    /// Re-attempt to resolve channels that were unknown at construction time.
+    ///
+    /// Called when new (dynamic) MQTT topics are discovered, letting a panel
+    /// restored from a layout bind once its topic reappears. Default no-op for
+    /// panels whose channels are always known up front.
     fn refresh_bindings(&mut self, _ctx: &common::RebindCtx) {}
-    /// Clear any interactive zoom and resume the default/live view. Default
-    /// no-op; panels with a zoom state (e.g. waveform) override. Driven by the
-    /// global "reset zoom" toolbar action across every panel.
+
+    /// Clear any interactive zoom and resume the default/live view.
+    ///
+    /// Driven by the global "reset zoom" toolbar action, which fans out to
+    /// every panel. Default no-op; panels with a zoom state (e.g. waveform)
+    /// override.
     fn reset_zoom(&mut self) {}
-    /// Freeze a linked time-window into this panel's own zoom state so it stays
-    /// put after the link is released. Default no-op; waveform and state_graph
-    /// override. Only called for participating panels when a shared linked zoom
-    /// is active.
+
+    /// Freeze a shared linked time-window into this panel's own zoom state so
+    /// it stays put after the link is released.
+    ///
+    /// Called only for panels participating in an active linked zoom, with
+    /// `range` as the `(start, end)` timestamps in nanoseconds. Default no-op;
+    /// waveform and state_graph override.
     fn freeze_time_zoom(&mut self, _range: (i64, i64)) {}
 }
 
-/// Constructor: panel-specific toml table + channel registry (for resolving
-/// channel names to ids) → boxed panel. Binding problems (unknown channel,
-/// wrong type) must produce a panel that renders an inline error, not Err —
-/// Err is for malformed config only (e.g. missing required key).
+/// Builds a [`VizPanel`] from its serialized form.
+///
+/// The [`toml::Table`] is the panel's own config (the same shape
+/// [`VizPanel::serialize`] produces); the [`ChannelRegistry`] resolves channel
+/// names to ids and metadata.
+///
+/// # Errors
+///
+/// Return `Err` **only** for malformed config — e.g. a missing required key or
+/// a value of the wrong TOML type. A *binding* problem (unknown channel name,
+/// channel whose sample type the panel does not accept) is not an error: build
+/// a panel that renders an inline message, so the pane survives and can rebind
+/// later via [`VizPanel::drop_channel`] or [`VizPanel::refresh_bindings`].
 pub type PanelCtor =
     fn(&toml::Table, &ChannelRegistry) -> anyhow::Result<Box<dyn VizPanel>>;
 
-/// Maps layout.toml `type` strings to constructors. Later plans call
-/// `register` for each new panel type.
+/// Registry mapping `layout.toml` `type` strings to their [`PanelCtor`].
+///
+/// Populated once at startup by [`with_builtins`](PanelRegistry::with_builtins)
+/// and consulted by [`build`](PanelRegistry::build) to instantiate panels from
+/// a saved layout. Call [`register`](PanelRegistry::register) to add a new
+/// panel type.
 pub struct PanelRegistry {
     ctors: HashMap<&'static str, PanelCtor>,
 }
 
 impl PanelRegistry {
+    /// A registry pre-loaded with every panel type the app ships.
     pub fn with_builtins() -> Self {
         let mut reg = Self { ctors: HashMap::new() };
         reg.register(gauge::TYPE_NAME, gauge::ctor);
@@ -77,11 +148,13 @@ impl PanelRegistry {
         reg
     }
 
+    /// Register `ctor` under the `layout.toml` `type` string `name`,
+    /// overwriting any existing entry with the same name.
     pub fn register(&mut self, name: &'static str, ctor: PanelCtor) {
         self.ctors.insert(name, ctor);
     }
 
-    /// Registered panel type strings, sorted for stable UI listings.
+    /// All registered panel type strings, sorted for stable UI listings.
     pub fn type_names(&self) -> Vec<&'static str> {
         let mut v: Vec<&'static str> = self.ctors.keys().copied().collect();
         v.sort_unstable();
@@ -97,6 +170,14 @@ impl PanelRegistry {
             .collect()
     }
 
+    /// Build a panel from a saved [`PanelEntry`], dispatching on its
+    /// `panel_type`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if `panel_type` is not registered, or if the matched
+    /// [`PanelCtor`] rejects the config (see [`PanelCtor`] for its error
+    /// contract).
     pub fn build(
         &self,
         entry: &PanelEntry,

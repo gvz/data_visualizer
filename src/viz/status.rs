@@ -100,7 +100,7 @@ impl StateMap {
         self.entries.iter().find(|e| e.match_key == key)
     }
 
-    /// Editable rows: [match][label][color][remove], plus an add button.
+    /// Editable rows: `[match][label][color][remove]`, plus an add button.
     pub(crate) fn config_ui(&mut self, ui: &mut egui::Ui) {
         ui.label("states (value \u{2192} color):");
         let mut remove = None;
