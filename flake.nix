@@ -86,7 +86,9 @@
             # TLS / crypto (transitive dep of several crates)
             openssl
             mqttx
-            (python3.withPackages (ps: with ps; [ numba numpy ]))
+            # Pin 3.13: nixpkgs default python3 is now 3.14, which exceeds
+            # PyO3 0.22's supported ceiling (and numba lags new releases too).
+            (python313.withPackages (ps: with ps; [ numba numpy ]))
           ];
 
           # Paths the dynamic linker must find at `cargo run` time.

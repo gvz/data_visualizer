@@ -1,5 +1,5 @@
 use crate::config::ChannelRegistry;
-use crate::script::types::{CompiledScript, InputWindow, OutputBatch, OutputSpec, ScriptMeta};
+use crate::script::types::{CompiledScript, InputWindow, ScriptMeta};
 use crate::store::ChannelStore;
 use crate::types::{ChannelId, ChannelSnapshot, NumericVal, SampleType, TimeWindow};
 
@@ -162,6 +162,7 @@ impl ScriptRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::script::types::{OutputBatch, OutputSpec};
     use crate::store::LiveStore;
     use crate::types::Sample;
 
