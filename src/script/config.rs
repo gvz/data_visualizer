@@ -33,8 +33,6 @@ fn default_true() -> bool {
 pub struct ScriptsConfig {
     /// Directory holding `*.py` scripts, relative to config.toml.
     pub dir: String,
-    /// Script stems (filename without `.py`) that are active.
-    pub enabled: Vec<String>,
     /// Seconds of history handed to each script per tick.
     pub window_s: f64,
     /// Script instances.
@@ -43,7 +41,7 @@ pub struct ScriptsConfig {
 
 impl Default for ScriptsConfig {
     fn default() -> Self {
-        Self { dir: "scripts".to_string(), enabled: Vec::new(), window_s: 10.0, instances: Vec::new() }
+        Self { dir: "scripts".to_string(), window_s: 10.0, instances: Vec::new() }
     }
 }
 
@@ -56,8 +54,6 @@ struct DocWrapper {
 #[serde(deny_unknown_fields)]
 struct RawScripts {
     dir: Option<String>,
-    #[serde(default)]
-    enabled: Vec<String>,
     window_s: Option<f64>,
     #[serde(default)]
     instances: Vec<ScriptInstance>,
@@ -73,7 +69,6 @@ impl ScriptsConfig {
             None => def,
             Some(raw) => ScriptsConfig {
                 dir: raw.dir.unwrap_or(def.dir),
-                enabled: raw.enabled,
                 window_s: raw.window_s.unwrap_or(def.window_s),
                 instances: raw.instances,
             },
@@ -211,7 +206,6 @@ mod tests {
                     enabled: false,
                 },
             ],
-            enabled: Vec::new(),
         };
         cfg.save(&path).unwrap();
 
@@ -234,18 +228,16 @@ mod tests {
 
         let cfg = ScriptsConfig {
             dir: "scripts".into(),
-            enabled: vec!["accel_mag".into()],
             window_s: 4.0,
             instances: Vec::new(),
         };
         cfg.save(&path).unwrap();
 
         let text = std::fs::read_to_string(&path).unwrap();
-        // Round-trips through the parser (note: enabled list is not persisted).
+        // Round-trips through the parser.
         let reparsed = ScriptsConfig::from_toml_str(&text).unwrap();
         let expected = ScriptsConfig {
             dir: "scripts".into(),
-            enabled: Vec::new(), // enabled list is not saved/loaded anymore
             window_s: 4.0,
             instances: Vec::new(),
         };

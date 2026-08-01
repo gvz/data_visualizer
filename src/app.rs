@@ -14,7 +14,8 @@ use crate::record::{start_recording, RecordHandle};
 use crate::store::ChannelStore;
 use crate::viz::PanelRegistry;
 use crate::workspace::Workspace;
-use crate::script::{ScriptCommand, SharedStatus};
+use crate::script::config::ScriptInstance;
+use crate::script::{ScriptCommand, SharedMetas, SharedStatus};
 
 /// State for the "Add panel" modal.
 #[derive(Default)]
@@ -195,7 +196,8 @@ pub struct DataVisApp {
     link_zoom: bool,
     // Scripting panel
     available_scripts: Vec<String>,
-    script_enabled: Vec<String>,
+    script_instances: Vec<ScriptInstance>,
+    script_metas: SharedMetas,
     script_status: SharedStatus,
     script_commands: crossbeam_channel::Sender<ScriptCommand>,
     script_disabled: Arc<Mutex<Option<String>>>,
@@ -213,10 +215,11 @@ impl DataVisApp {
         live_history_s: f64,
         default_window_s: f64,
         available_scripts: Vec<String>,
-        script_enabled: Vec<String>,
+        script_instances: Vec<ScriptInstance>,
         script_status: SharedStatus,
         script_commands: crossbeam_channel::Sender<ScriptCommand>,
         script_disabled: Arc<Mutex<Option<String>>>,
+        script_metas: SharedMetas,
     ) -> Self {
         let DerivedIngest {
             conn_states,
@@ -264,7 +267,8 @@ impl DataVisApp {
             default_window_s,
             link_zoom: false,
             available_scripts,
-            script_enabled,
+            script_instances,
+            script_metas,
             script_status,
             script_commands,
             script_disabled,
@@ -726,35 +730,44 @@ impl DataVisApp {
                 ui.separator();
                 {
                     let disabled = self.script_disabled.lock().unwrap().clone();
-                    let toggles = crate::script::panel::draw_script_panel(
+                    let cmds = crate::script::panel::draw_script_panel(
                         ui,
-                        &self.available_scripts,
-                        &self.script_enabled,
+                        &self.script_instances,
                         &self.script_status,
                         &disabled,
                     );
-                    for t in toggles {
-                        if t.enable {
-                            if !self.script_enabled.contains(&t.name) {
-                                self.script_enabled.push(t.name.clone());
-                            }
-                            let _ = self.script_commands.send(ScriptCommand::Enable(t.name.clone()));
-                        } else {
-                            self.script_enabled.retain(|n| n != &t.name);
-                            let _ = self.script_commands.send(ScriptCommand::Disable(t.name.clone()));
-                        }
-                        self.persist_scripts();
+                    for cmd in cmds {
+                        self.apply_panel_command(cmd);
                     }
                 }
             });
     }
 
-    /// Write the current enabled-script set back to config.toml, preserving the
+    fn apply_panel_command(&mut self, cmd: crate::script::panel::PanelCommand) {
+        use crate::script::panel::PanelCommand;
+        use crate::script::ScriptCommand;
+        match cmd {
+            PanelCommand::Upsert(inst) => {
+                match self.script_instances.iter_mut().find(|i| i.id == inst.id) {
+                    Some(slot) => *slot = inst.clone(),
+                    None => self.script_instances.push(inst.clone()),
+                }
+                let _ = self.script_commands.send(ScriptCommand::Upsert(inst));
+            }
+            PanelCommand::Remove(id) => {
+                self.script_instances.retain(|i| i.id != id);
+                let _ = self.script_commands.send(ScriptCommand::Remove(id));
+            }
+            PanelCommand::SaveConfig => self.persist_scripts(),
+        }
+    }
+
+    /// Write the current script instances back to config.toml, preserving the
     /// dir and window_s already on disk.
     fn persist_scripts(&mut self) {
         let existing = std::fs::read_to_string(&self.layout_path).unwrap_or_default();
         let mut cfg = crate::script::config::ScriptsConfig::from_toml_str(&existing).unwrap_or_default();
-        cfg.enabled = self.script_enabled.clone();
+        cfg.instances = self.script_instances.clone();
         self.status = match cfg.save(&self.layout_path) {
             Ok(()) => "scripts saved".to_string(),
             Err(e) => format!("scripts save failed: {e}"),

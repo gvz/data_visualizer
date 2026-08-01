@@ -1,41 +1,42 @@
 use eframe::egui;
 
+use crate::script::config::ScriptInstance;
 use crate::script::runner::ScriptState;
 use crate::script::{ScriptStatus, SharedStatus};
 
-/// A requested enable/disable from a checkbox click.
+/// A committed panel action for the app to forward to the engine / config.
 #[derive(Debug, Clone, PartialEq)]
-pub struct PanelToggle {
-    pub name: String,
-    pub enable: bool,
+pub enum PanelCommand {
+    Upsert(ScriptInstance),
+    Remove(String),
+    SaveConfig,
 }
 
-/// Draw the script list. `available` is every `*.py` stem found in the scripts
-/// dir; `enabled` is the currently-active set. Returns any checkbox toggles.
+/// Minimal instance list: per-instance enable toggle + status. The full editor
+/// (add/remove, input/output binding) lands in a later task.
 pub fn draw_script_panel(
     ui: &mut egui::Ui,
-    available: &[String],
-    enabled: &[String],
+    instances: &[ScriptInstance],
     status: &SharedStatus,
     disabled: &Option<String>,
-) -> Vec<PanelToggle> {
-    let mut toggles = Vec::new();
+) -> Vec<PanelCommand> {
+    let mut cmds = Vec::new();
     ui.heading("Scripts");
     if let Some(reason) = disabled {
         ui.colored_label(egui::Color32::from_rgb(0xB0, 0x60, 0x00), reason);
-        return toggles;
+        return cmds;
     }
     let states = status.lock().unwrap().clone();
-    for name in available {
-        let mut on = enabled.iter().any(|e| e == name);
-        if ui.checkbox(&mut on, name).changed() {
-            toggles.push(PanelToggle { name: name.clone(), enable: on });
+    for inst in instances {
+        let mut on = inst.enabled;
+        if ui.checkbox(&mut on, &inst.id).changed() {
+            cmds.push(PanelCommand::Upsert(ScriptInstance { enabled: on, ..inst.clone() }));
         }
-        if let Some(s) = states.iter().find(|s| &s.name == name) {
+        if let Some(s) = states.iter().find(|s| s.name == inst.id) {
             ui.small(status_line(s));
         }
     }
-    toggles
+    cmds
 }
 
 fn status_line(s: &ScriptStatus) -> String {

@@ -91,10 +91,10 @@ fn main() -> anyhow::Result<()> {
     let available_scripts = datavis::script::discover_scripts(&scripts_dir);
 
     #[cfg(feature = "scripting")]
-    let (script_status, script_commands, script_disabled) = {
+    let (script_status, script_commands, script_disabled, script_metas) = {
         let engine = datavis::script::ScriptEngine::new(
             scripts_dir.clone(),
-            scripts_cfg.enabled.clone(),
+            scripts_cfg.instances.clone(),
             scripts_cfg.window_s,
             Box::new(datavis::script::python::PyScriptLoader),
             channels.clone(),
@@ -103,12 +103,13 @@ fn main() -> anyhow::Result<()> {
         let script_status = engine.status();
         let script_commands = engine.commands();
         let script_disabled = engine.disabled_reason();
+        let script_metas = engine.script_metas();
         sources.push(Box::new(engine).spawn(store.clone()));
-        (script_status, script_commands, script_disabled)
+        (script_status, script_commands, script_disabled, script_metas)
     };
 
     #[cfg(not(feature = "scripting"))]
-    let (script_status, script_commands, script_disabled) = {
+    let (script_status, script_commands, script_disabled, script_metas) = {
         let status: datavis::script::SharedStatus =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let (tx, _rx) = crossbeam_channel::unbounded::<datavis::script::ScriptCommand>();
@@ -116,7 +117,9 @@ fn main() -> anyhow::Result<()> {
             std::sync::Arc::new(std::sync::Mutex::new(Some(
                 "scripting feature not enabled".to_string(),
             )));
-        (status, tx, disabled)
+        let script_metas: datavis::script::SharedMetas =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        (status, tx, disabled, script_metas)
     };
 
     let registry = PanelRegistry::with_builtins();
@@ -133,10 +136,11 @@ fn main() -> anyhow::Result<()> {
         live_history_s,
         layout.default_window_s,
         available_scripts,
-        scripts_cfg.enabled,
+        scripts_cfg.instances,
         script_status,
         script_commands,
         script_disabled,
+        script_metas,
     );
 
     // On Windows the interpreter ships beside the exe under `python/`. Point the

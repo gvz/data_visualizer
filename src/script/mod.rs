@@ -19,7 +19,7 @@ pub mod panel;
 
 pub use runner::ScriptState;
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,8 +29,11 @@ use crossbeam_channel::{Receiver, Sender};
 
 use crate::config::ChannelRegistry;
 use crate::ingest::{DataSource, SourceHandle, CONNECTING, LIVE, TIMEOUT};
+use crate::script::config::ScriptInstance;
 use crate::script::runner::ScriptRunner;
-use crate::script::types::{validate_meta, ScriptLoader};
+use crate::script::types::{
+    expand_output_name, parse_sample_type, validate_meta, OutputSpec, ScriptLoader, ScriptMeta,
+};
 use crate::store::ChannelStore;
 use crate::types::TimeWindow;
 
@@ -44,25 +47,33 @@ pub struct ScriptStatus {
 /// Shared per-script status list, updated by the engine thread each tick.
 pub type SharedStatus = Arc<Mutex<Vec<ScriptStatus>>>;
 
+/// Stem → default `ScriptMeta`, peeked from each discovered script for the GUI editor.
+pub type SharedMetas = Arc<Mutex<HashMap<String, ScriptMeta>>>;
+
 /// GUI → engine live control.
 pub enum ScriptCommand {
-    Enable(String),
-    Disable(String),
+    /// Add a new instance or replace an existing one with the same id.
+    Upsert(ScriptInstance),
+    /// Remove the instance with this id.
+    Remove(String),
 }
 
 /// Background engine that loads, compiles, and ticks scripts.
 pub struct ScriptEngine {
     dir: PathBuf,
-    enabled: Vec<String>,
+    instances: Vec<ScriptInstance>,
     window_s: f64,
     loader: Box<dyn ScriptLoader>,
     registry: Arc<ChannelRegistry>,
     status: SharedStatus,
     commands: (Sender<ScriptCommand>, Receiver<ScriptCommand>),
     disabled: Arc<Mutex<Option<String>>>,
-    /// Output names this engine has registered, to distinguish a re-enable
-    /// (reuse the slot) from a real collision with a non-script channel.
-    script_outputs: Arc<Mutex<HashSet<String>>>,
+    /// Per-instance owned output names (id → output channel names). Used to
+    /// distinguish a rebuild (reuse the slot) from a real collision with a
+    /// non-script channel.
+    owned_outputs: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    /// Stem → default `ScriptMeta`, peeked on startup for the GUI editor.
+    metas: SharedMetas,
     /// Capability probe run before ticking. Real engine uses numba; tests pass
     /// `|| Ok(())` or `|| Err(..)`.
     probe: Box<dyn Fn() -> Result<(), String> + Send>,
@@ -71,7 +82,7 @@ pub struct ScriptEngine {
 impl ScriptEngine {
     pub fn new(
         dir: PathBuf,
-        enabled: Vec<String>,
+        instances: Vec<ScriptInstance>,
         window_s: f64,
         loader: Box<dyn ScriptLoader>,
         registry: Arc<ChannelRegistry>,
@@ -79,14 +90,15 @@ impl ScriptEngine {
     ) -> Self {
         Self {
             dir,
-            enabled,
+            instances,
             window_s,
             loader,
             registry,
             status: Arc::new(Mutex::new(Vec::new())),
             commands: crossbeam_channel::unbounded(),
             disabled: Arc::new(Mutex::new(None)),
-            script_outputs: Arc::new(Mutex::new(HashSet::new())),
+            owned_outputs: Arc::new(Mutex::new(HashMap::new())),
+            metas: Arc::new(Mutex::new(HashMap::new())),
             probe,
         }
     }
@@ -103,39 +115,80 @@ impl ScriptEngine {
         self.disabled.clone()
     }
 
+    pub fn script_metas(&self) -> SharedMetas {
+        self.metas.clone()
+    }
+
     /// Read a script's source from `dir/<name>.py`.
     fn read_source(&self, name: &str) -> Result<String, String> {
         let path = self.dir.join(format!("{name}.py"));
         std::fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))
     }
 
-    /// Load, validate, register, and build a runner for one script.
-    fn build_runner(
+    /// Load, validate, register, and build a runner for one instance.
+    pub fn build_runner(
         &self,
-        name: &str,
+        inst: &ScriptInstance,
         store: &dyn ChannelStore,
     ) -> Result<ScriptRunner, ScriptStatus> {
-        let fail = |e: String| ScriptStatus { name: name.into(), state: ScriptState::Failed(e) };
-        let source = self.read_source(name).map_err(&fail)?;
-        let loaded = self.loader.load(&source, name).map_err(&fail)?;
+        let fail = |e: String| ScriptStatus { name: inst.id.clone(), state: ScriptState::Failed(e) };
+        let source = self.read_source(&inst.script).map_err(&fail)?;
+        let loaded = self.loader.load(&source, &inst.script).map_err(&fail)?;
 
-        // Collision check: an output name already known and NOT one of ours is a
-        // real clash with a non-script channel.
-        let mut owned = self.script_outputs.lock().unwrap();
-        let exists = |n: &str| self.registry.id(n).is_some() && !owned.contains(n);
-        validate_meta(&loaded.meta, exists).map_err(&fail)?;
-        for o in &loaded.meta.outputs {
-            owned.insert(o.name.clone());
+        // Resolve inputs: instance override, else the file's declared inputs.
+        let inputs = inst.inputs.clone().unwrap_or_else(|| loaded.meta.inputs.clone());
+        if inputs.len() != loaded.meta.inputs.len() {
+            return Err(fail(format!(
+                "instance binds {} inputs but script '{}' declares {}",
+                inputs.len(),
+                inst.script,
+                loaded.meta.inputs.len()
+            )));
         }
+
+        // Resolve outputs: instance override (parsed), else the file's outputs.
+        let raw_outputs: Vec<OutputSpec> = match &inst.outputs {
+            Some(obs) => {
+                let mut v = Vec::with_capacity(obs.len());
+                for o in obs {
+                    v.push(OutputSpec {
+                        name: o.name.clone(),
+                        sample_type: parse_sample_type(&o.ty).map_err(&fail)?,
+                        unit: o.unit.clone(),
+                    });
+                }
+                v
+            }
+            None => loaded.meta.outputs.clone(),
+        };
+
+        // Expand output-name templates against the resolved inputs.
+        let mut outputs = Vec::with_capacity(raw_outputs.len());
+        for o in raw_outputs {
+            outputs.push(OutputSpec {
+                name: expand_output_name(&o.name, &inputs).map_err(&fail)?,
+                sample_type: o.sample_type,
+                unit: o.unit,
+            });
+        }
+
+        let meta = ScriptMeta { inputs, outputs };
+
+        // Collision check: an output name already known and owned by NO instance is a
+        // real clash with a non-script channel. Names this same id already owns are
+        // fine (rebuild reuses the slot).
+        let mut owned = self.owned_outputs.lock().unwrap();
+        let owned_by_others: std::collections::HashSet<&str> = owned
+            .iter()
+            .filter(|(k, _)| k.as_str() != inst.id)
+            .flat_map(|(_, v)| v.iter().map(String::as_str))
+            .collect();
+        let exists = |n: &str| self.registry.id(n).is_some() && !owned_by_others.contains(n);
+        validate_meta(&meta, exists).map_err(&fail)?;
+        owned.insert(inst.id.clone(), meta.outputs.iter().map(|o| o.name.clone()).collect());
         drop(owned);
 
-        Ok(ScriptRunner::new(
-            name.to_string(),
-            loaded.meta,
-            loaded.compiled,
-            store,
-            &self.registry,
-        ))
+        Ok(ScriptRunner::new(inst.id.clone(), meta, loaded.compiled, store, &self.registry))
     }
 
     /// Publish the current runners' states plus any load failures into the
@@ -149,27 +202,37 @@ impl ScriptEngine {
         *status.lock().unwrap() = out;
     }
 
-    /// Load one script into `runners`, or record it in `failed`.
-    ///
-    /// Split out of `run_loop` as an inherent method rather than a closure so it
-    /// can capture `self` by shared reference while `run_loop`'s body
-    /// independently borrows `self.commands`, `self.status`, etc. See the
-    /// borrow-checker note in the report; behavior is identical to the brief.
+    /// Load/reload one instance into `runners`, removing any prior version.
+    /// Disabled instances are skipped (removed from active set but not failed).
     fn load_into(
         &self,
-        name: &str,
+        inst: &ScriptInstance,
         store: &dyn ChannelStore,
         runners: &mut Vec<ScriptRunner>,
         failed: &mut Vec<ScriptStatus>,
     ) {
-        if runners.iter().any(|r| r.name() == name) {
-            return; // already loaded
+        runners.retain(|r| r.name() != inst.id);
+        failed.retain(|f| f.name != inst.id);
+        self.owned_outputs.lock().unwrap().remove(&inst.id);
+        if !inst.enabled {
+            return;
         }
-        failed.retain(|f| f.name != name);
-        match self.build_runner(name, store) {
+        match self.build_runner(inst, store) {
             Ok(runner) => runners.push(runner),
             Err(status) => failed.push(status),
         }
+    }
+
+    /// Remove an instance entirely from the active set.
+    fn remove_instance(
+        &self,
+        id: &str,
+        runners: &mut Vec<ScriptRunner>,
+        failed: &mut Vec<ScriptStatus>,
+    ) {
+        runners.retain(|r| r.name() != id);
+        failed.retain(|f| f.name != id);
+        self.owned_outputs.lock().unwrap().remove(id);
     }
 
     fn run_loop(self, store: Arc<dyn ChannelStore>, conn_state: Arc<AtomicU8>) {
@@ -180,25 +243,34 @@ impl ScriptEngine {
             return;
         }
 
-        let mut runners: Vec<ScriptRunner> = Vec::new();
-        // Scripts that failed to load — kept for the GUI as Failed entries.
-        let mut failed: Vec<ScriptStatus> = Vec::new();
+        // Peek each discovered script's default meta for the GUI editor.
+        {
+            let mut metas = self.metas.lock().unwrap();
+            for stem in discover_scripts(&self.dir) {
+                if let Ok(src) = self.read_source(&stem) {
+                    if let Ok(meta) = self.loader.peek_meta(&src, &stem) {
+                        metas.insert(stem, meta);
+                    }
+                }
+            }
+        }
 
-        for name in self.enabled.clone() {
-            self.load_into(&name, store.as_ref(), &mut runners, &mut failed);
+        let mut runners: Vec<ScriptRunner> = Vec::new();
+        let mut failed: Vec<ScriptStatus> = Vec::new();
+        for inst in self.instances.clone() {
+            self.load_into(&inst, store.as_ref(), &mut runners, &mut failed);
         }
         conn_state.store(LIVE, Ordering::Relaxed);
 
         let tick = Duration::from_millis(16);
         loop {
-            // Drain one command, blocking up to a tick so toggles are prompt.
+            // Drain one command, blocking up to a tick so updates are prompt.
             match self.commands.1.recv_timeout(tick) {
-                Ok(ScriptCommand::Enable(name)) => {
-                    self.load_into(&name, store.as_ref(), &mut runners, &mut failed)
+                Ok(ScriptCommand::Upsert(inst)) => {
+                    self.load_into(&inst, store.as_ref(), &mut runners, &mut failed)
                 }
-                Ok(ScriptCommand::Disable(name)) => {
-                    runners.retain(|r| r.name() != name);
-                    failed.retain(|f| f.name != name);
+                Ok(ScriptCommand::Remove(id)) => {
+                    self.remove_instance(&id, &mut runners, &mut failed)
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -296,6 +368,36 @@ mod tests {
         }
     }
 
+    struct TemplateDoublerLoader;
+    impl ScriptLoader for TemplateDoublerLoader {
+        fn load(&self, _s: &str, _n: &str) -> Result<LoadedScript, String> {
+            Ok(LoadedScript {
+                meta: ScriptMeta {
+                    inputs: vec!["in.a".into()],
+                    outputs: vec![OutputSpec {
+                        name: "{in0}.double".into(),
+                        sample_type: SampleType::Float,
+                        unit: String::new(),
+                    }],
+                },
+                compiled: Box::new(Doubler),
+            })
+        }
+        fn peek_meta(&self, _s: &str, _n: &str) -> Result<ScriptMeta, String> {
+            self.load("", "").map(|l| l.meta)
+        }
+    }
+
+    fn instance(id: &str, script: &str, inputs: Option<Vec<&str>>) -> crate::script::config::ScriptInstance {
+        crate::script::config::ScriptInstance {
+            id: id.into(),
+            script: script.into(),
+            inputs: inputs.map(|v| v.into_iter().map(String::from).collect()),
+            outputs: None,
+            enabled: true,
+        }
+    }
+
     #[test]
     fn engine_ticks_and_writes_outputs() {
         let reg = Arc::new(
@@ -317,7 +419,7 @@ mod tests {
 
         let engine = ScriptEngine::new(
             dir.path().to_path_buf(),
-            vec!["dbl".into()],
+            vec![instance("dbl", "dbl", None)],
             10.0,
             Box::new(DoublerLoader),
             reg.clone(),
@@ -367,6 +469,86 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(disabled.lock().unwrap().as_ref().unwrap().contains("no numba"));
+    }
+
+    #[test]
+    fn build_runner_uses_instance_id_and_input_override() {
+        // Registry has two inputs; TemplateDoublerLoader declares arity 1 with a templated
+        // default output. An instance overrides the input to "in.b".
+        let reg = Arc::new(
+            ChannelRegistry::from_toml_str(
+                "[channels.\"in.a\"]\ntype=\"float\"\nmax_rate=100\nhistory_s=1.0\n\
+                 [channels.\"in.b\"]\ntype=\"float\"\nmax_rate=100\nhistory_s=1.0\n",
+            )
+            .unwrap(),
+        );
+        let store: Arc<dyn ChannelStore> = Arc::new(LiveStore::from_registry(&reg));
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("dbl.py"), "# fake").unwrap();
+
+        let engine = ScriptEngine::new(
+            dir.path().to_path_buf(),
+            vec![instance("first", "dbl", Some(vec!["in.b"]))],
+            10.0,
+            Box::new(TemplateDoublerLoader),
+            reg.clone(),
+            Box::new(|| Ok(())),
+        );
+        let runner = engine.build_runner(&instance("first", "dbl", Some(vec!["in.b"])), store.as_ref()).unwrap();
+        assert_eq!(runner.name(), "first");                 // keyed by id, not stem
+        assert!(reg.id("in.b.double").is_some());           // {in0}.double expanded from in.b
+    }
+
+    #[test]
+    fn build_runner_rejects_arity_mismatch() {
+        let reg = Arc::new(
+            ChannelRegistry::from_toml_str(
+                "[channels.\"in.a\"]\ntype=\"float\"\nmax_rate=100\nhistory_s=1.0\n",
+            )
+            .unwrap(),
+        );
+        let store: Arc<dyn ChannelStore> = Arc::new(LiveStore::from_registry(&reg));
+        let dir = tempfile::tempdir().unwrap();
+        let engine = ScriptEngine::new(
+            dir.path().to_path_buf(),
+            vec![],
+            10.0,
+            Box::new(TemplateDoublerLoader),
+            reg,
+            Box::new(|| Ok(())),
+        );
+        // Loader declares arity 1; instance binds two inputs.
+        let bad = instance("x", "dbl", Some(vec!["in.a", "in.a"]));
+        let result = engine.build_runner(&bad, store.as_ref());
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(matches!(err.state, ScriptState::Failed(_)));
+    }
+
+    #[test]
+    fn two_instances_of_one_script_make_distinct_channels() {
+        let reg = Arc::new(
+            ChannelRegistry::from_toml_str(
+                "[channels.\"in.a\"]\ntype=\"float\"\nmax_rate=100\nhistory_s=1.0\n\
+                 [channels.\"in.b\"]\ntype=\"float\"\nmax_rate=100\nhistory_s=1.0\n",
+            )
+            .unwrap(),
+        );
+        let store: Arc<dyn ChannelStore> = Arc::new(LiveStore::from_registry(&reg));
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("dbl.py"), "# fake").unwrap();
+        let engine = ScriptEngine::new(
+            dir.path().to_path_buf(),
+            vec![],
+            10.0,
+            Box::new(TemplateDoublerLoader),
+            reg.clone(),
+            Box::new(|| Ok(())),
+        );
+        engine.build_runner(&instance("a", "dbl", Some(vec!["in.a"])), store.as_ref()).unwrap();
+        engine.build_runner(&instance("b", "dbl", Some(vec!["in.b"])), store.as_ref()).unwrap();
+        assert!(reg.id("in.a.double").is_some());
+        assert!(reg.id("in.b.double").is_some());
     }
 
     fn loop_until<T>(mut f: impl FnMut() -> Option<T>, ms: u64) -> T {
