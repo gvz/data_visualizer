@@ -1,3 +1,15 @@
+//! Python scripting engine: run numba-compiled user scripts that read
+//! channels, compute, and publish new channels.
+//!
+//! [`ScriptEngine`] is a [`crate::ingest::DataSource`] that ticks every enabled
+//! script on a background thread at ~60 Hz. Each script self-declares `INPUTS`
+//! and `OUTPUTS` and provides a `@numba.njit` `compute(ts, vals)`; the engine
+//! marshals per-input `(ts, vals)` numpy arrays in, appends the `(ts, vals)`
+//! pairs it returns (deduped by timestamp), and registers its outputs as
+//! ordinary channels. numba is required — without it the engine disables
+//! itself. See the crate-level "Writing a Python script" guide for the script
+//! contract, and [`config::ScriptsConfig`] for the `[scripts]` config.
+
 pub mod config;
 pub mod types;
 pub mod runner;
