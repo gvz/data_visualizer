@@ -26,6 +26,12 @@ rumqttc = "0.24"
 boxcar = "0.2.14"
 egui-phosphor = "0.6"
 tungstenite = "0.21"
+pyo3 = { version = "0.22", features = ["auto-initialize"], optional = true }
+numpy = { version = "0.22", optional = true }
+
+[features]
+default = ["scripting"]
+scripting = ["dep:pyo3", "dep:numpy"]
 
 [dev-dependencies]
 tempfile = "3"

@@ -2,8 +2,8 @@
   description = "datavis — real-time data visualization tool (egui + ZMQ + Zarr)";
 
   nixConfig = {
-    extra-substituters = [];
-    extra-trusted-public-keys = [];
+    extra-substituters = [ ];
+    extra-trusted-public-keys = [ ];
   };
 
   inputs = {
@@ -21,11 +21,24 @@
       rust-overlay,
     }:
     let
-      systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
-      forEachSystem = f: builtins.listToAttrs (map (system: { name = system; value = f system; }) systems);
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
+        "x86_64-darwin"
+        "aarch64-darwin"
+      ];
+      forEachSystem =
+        f:
+        builtins.listToAttrs (
+          map (system: {
+            name = system;
+            value = f system;
+          }) systems
+        );
     in
     {
-      devShells = forEachSystem (system:
+      devShells = forEachSystem (
+        system:
         let
           overlays = [ (import rust-overlay) ];
           pkgs = import nixpkgs { inherit system overlays; };
@@ -40,11 +53,18 @@
             ];
           };
 
+          # Nightly Rust for cargo-fuzz: libFuzzer needs unstable flags and
+          # rust-src to rebuild std with sanitizer coverage instrumentation.
+          nightlyRust = pkgs.rust-bin.nightly.latest.default.override {
+            extensions = [ "rust-src" ];
+          };
+
           # System libraries required at link time by eframe (X11 + Wayland +
           # OpenGL) and by the czmq/pzmq bindings for the ZMQ ingest layer.
           nativeBuildInputs = with pkgs; [
             rust
             pkg-config
+            cargo-vet
           ];
 
           buildInputs = with pkgs; [
@@ -66,6 +86,7 @@
             # TLS / crypto (transitive dep of several crates)
             openssl
             mqttx
+            (python3.withPackages (ps: with ps; [ numba numpy ]))
           ];
 
           # Paths the dynamic linker must find at `cargo run` time.
@@ -79,6 +100,23 @@
               export LD_LIBRARY_PATH="${ldLibraryPath}:$LD_LIBRARY_PATH"
               export RUST_BACKTRACE=1
               echo "datavis dev shell — $(rustc --version)"
+            '';
+          };
+
+          # `nix develop .#fuzz` — nightly toolchain plus cargo-fuzz for the
+          # fuzz targets under fuzz/. See fuzz/README.md for usage.
+          fuzz = pkgs.mkShell {
+            nativeBuildInputs = with pkgs; [
+              nightlyRust
+              pkg-config
+              cargo-fuzz
+            ];
+            inherit buildInputs;
+
+            shellHook = ''
+              export LD_LIBRARY_PATH="${ldLibraryPath}:$LD_LIBRARY_PATH"
+              export RUST_BACKTRACE=1
+              echo "datavis fuzz shell — $(rustc --version)"
             '';
           };
         }
