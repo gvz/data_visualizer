@@ -19,7 +19,7 @@ script = "sine_squared"
 enabled = true
 
 [[scripts.instances]]
-id = "ch0_rms"
+id = "ch1_rms"
 script = "sine_rms"
 inputs = ["load/ch1"]
 enabled = true
