@@ -19,10 +19,15 @@ existing panel (waveform, spectrum, gauge, status, …) works on them unchanged.
 - **Channel binding:** each `.py` self-declares `INPUTS` and `OUTPUTS`.
 - **Selection:** a GUI panel lists available scripts with checkboxes; the
   enabled set persists in `config.toml`.
+- **Runtime requirement:** scripting is available **only** when Python *and*
+  numba import successfully. numba (which requires numpy) is the baseline, not
+  an optional accelerator — on a system without it, the feature is absent, not
+  degraded to pure Python.
 - **Failure mode:** graceful degradation with a visible warning. A missing
-  Python runtime, a compile error, or a `compute()` exception disables only the
-  affected script (or the whole engine, if Python is absent) and surfaces the
-  message in the GUI. Core telemetry visualization is never blocked.
+  Python runtime, a missing numba, a compile error, or a `compute()` exception
+  disables the engine (numba/Python absent) or only the affected script
+  (compile/runtime error) and surfaces the message in the GUI. Core telemetry
+  visualization is never blocked.
 - **Packaging:** Linux resolves Python + numba + numpy through `.deb`
   dependencies; Windows bundles a self-contained interpreter in the zip.
 
@@ -34,8 +39,16 @@ WebSocket sources. `DataSource::spawn` takes `Arc<dyn ChannelStore>` and returns
 a `SourceHandle`, so the engine plugs into the app's source-wiring path with no
 new integration surface.
 
-`spawn` starts **one** background thread that owns the Python interpreter (via
-PyO3). The thread runs a fixed-cadence loop:
+Before doing any work, `spawn`'s thread runs a **capability probe**: it
+initializes the interpreter and attempts `import numba`. If either the
+interpreter or the import fails, the engine records the reason, marks itself
+disabled, and the thread exits — no scripts are loaded and no ticks run. numba
+is the gate; because numba depends on numpy, a successful `import numba` proves
+the whole numeric stack is present. On systems without numba the feature is
+simply not available.
+
+When the probe succeeds, `spawn` starts **one** background thread that owns the
+Python interpreter (via PyO3). The thread runs a fixed-cadence loop:
 
 ```
 loop every ~16 ms (~60 Hz):
@@ -175,7 +188,8 @@ failure is caught and surfaced:
 
 | Failure                                   | Behavior                                                                 |
 | ----------------------------------------- | ------------------------------------------------------------------------ |
-| Python runtime / numpy import unavailable | Engine disables itself; GUI shows "Python runtime unavailable." App runs. |
+| Python runtime unavailable                | Engine disables itself; GUI shows "Python runtime unavailable." App runs. |
+| numba (or numpy) import fails             | Engine disables itself; GUI shows "numba not installed — scripting unavailable." App runs. |
 | Script compile error / bad INPUTS/OUTPUTS | That script marked failed with the exception text; others keep running.  |
 | Output name collides with a channel       | That script marked failed with a clear message; not loaded.              |
 | Input channel absent                      | Script healthy but "waiting for `<name>`"; skipped until it appears.     |
@@ -242,20 +256,19 @@ watch.
   output channel receives the expected values.
 - A `compute()` that raises is caught; the script is paused, the engine survives,
   a sibling script keeps producing output.
-- A script referencing a missing module (simulating absent numba) is flagged
-  failed without aborting the engine.
+**Graceful-disable tests:**
 
-**Graceful-disable test:**
-
+- With numba unavailable (import fails), the capability probe disables the whole
+  engine, the GUI reports it, and the rest of the app initializes normally.
 - With the interpreter unavailable, the engine reports disabled and the rest of
   the app initializes normally.
 
 ## Out of Scope (v1)
 
 - Text-typed inputs and outputs (numeric only).
-- `@numba.njit`-decorated scalar-loop JIT is *available* to scripts where numba
-  is installed, but the engine does not require or warm it; numpy vectorized math
-  is the baseline.
+- Auto-warming `@numba.njit` functions at load. numba is a hard requirement so
+  scripts *may* use `@njit`, but the engine does not itself warm any JIT; numpy
+  vectorized math is the baseline and needs no warmup.
 - Sub-interpreters / parallel per-script threads (numpy does not support
   sub-interpreters yet). One engine thread runs all scripts sequentially.
 - Live editing inside the app; scripts are edited in an external editor and
