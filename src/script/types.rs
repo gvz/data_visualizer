@@ -102,6 +102,11 @@ pub struct LoadedScript {
 /// the PyO3 layer; faked in tests.
 pub trait ScriptLoader: Send {
     fn load(&self, source: &str, name: &str) -> Result<LoadedScript, String>;
+
+    /// Read a script's declared `INPUTS`/`OUTPUTS` without compiling `compute`.
+    /// Output names are returned as their raw templates. Used by the GUI editor
+    /// to prefill an instance's fields when a script is chosen.
+    fn peek_meta(&self, source: &str, name: &str) -> Result<ScriptMeta, String>;
 }
 
 /// Validate a script's declared bindings before registering its channels.

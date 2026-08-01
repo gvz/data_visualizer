@@ -284,6 +284,16 @@ mod tests {
                 compiled: Box::new(Doubler),
             })
         }
+        fn peek_meta(&self, _source: &str, _name: &str) -> Result<ScriptMeta, String> {
+            Ok(ScriptMeta {
+                inputs: vec!["in.a".into()],
+                outputs: vec![OutputSpec {
+                    name: "in.a.double".into(),
+                    sample_type: SampleType::Float,
+                    unit: String::new(),
+                }],
+            })
+        }
     }
 
     #[test]

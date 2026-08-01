@@ -29,6 +29,34 @@ fn output_sample_type(ty: &str) -> Result<SampleType, String> {
     crate::script::types::parse_sample_type(ty)
 }
 
+/// Extract `INPUTS`/`OUTPUTS` from an executed module into a `ScriptMeta`.
+fn extract_meta(module: &Bound<'_, PyModule>) -> Result<ScriptMeta, String> {
+    let inputs: Vec<String> = module
+        .getattr("INPUTS")
+        .map_err(|_| "script is missing INPUTS".to_string())?
+        .extract()
+        .map_err(|e| format!("INPUTS must be a list of strings: {e}"))?;
+
+    let outputs_obj = module
+        .getattr("OUTPUTS")
+        .map_err(|_| "script is missing OUTPUTS".to_string())?;
+    let mut outputs = Vec::new();
+    for item in outputs_obj.iter().map_err(|e| e.to_string())? {
+        let item = item.map_err(|e| e.to_string())?;
+        let out_name: String = item
+            .get_item("name")
+            .and_then(|v| v.extract())
+            .map_err(|_| "each OUTPUTS entry needs a string 'name'".to_string())?;
+        let ty: String = item
+            .get_item("type")
+            .and_then(|v| v.extract())
+            .map_err(|_| "each OUTPUTS entry needs a string 'type'".to_string())?;
+        let unit: String = item.get_item("unit").and_then(|v| v.extract()).unwrap_or_default();
+        outputs.push(OutputSpec { name: out_name, sample_type: output_sample_type(&ty)?, unit });
+    }
+    Ok(ScriptMeta { inputs, outputs })
+}
+
 impl ScriptLoader for PyScriptLoader {
     fn load(&self, source: &str, name: &str) -> Result<LoadedScript, String> {
         Python::with_gil(|py| {
@@ -36,34 +64,7 @@ impl ScriptLoader for PyScriptLoader {
             let module = PyModule::from_code_bound(py, source, &format!("{name}.py"), name)
                 .map_err(|e| e.to_string())?;
 
-            // INPUTS: list[str].
-            let inputs: Vec<String> = module
-                .getattr("INPUTS")
-                .map_err(|_| "script is missing INPUTS".to_string())?
-                .extract()
-                .map_err(|e| format!("INPUTS must be a list of strings: {e}"))?;
-
-            // OUTPUTS: list[dict] with name/type and optional unit.
-            let outputs_obj = module
-                .getattr("OUTPUTS")
-                .map_err(|_| "script is missing OUTPUTS".to_string())?;
-            let mut outputs = Vec::new();
-            for item in outputs_obj.iter().map_err(|e| e.to_string())? {
-                let item = item.map_err(|e| e.to_string())?;
-                let out_name: String = item
-                    .get_item("name")
-                    .and_then(|v| v.extract())
-                    .map_err(|_| "each OUTPUTS entry needs a string 'name'".to_string())?;
-                let ty: String = item
-                    .get_item("type")
-                    .and_then(|v| v.extract())
-                    .map_err(|_| "each OUTPUTS entry needs a string 'type'".to_string())?;
-                let unit: String = item
-                    .get_item("unit")
-                    .and_then(|v| v.extract())
-                    .unwrap_or_default();
-                outputs.push(OutputSpec { name: out_name, sample_type: output_sample_type(&ty)?, unit });
-            }
+            let meta = extract_meta(&module)?;
 
             // compute must be a numba dispatcher (has a `.compile` method).
             let compute = module
@@ -76,14 +77,21 @@ impl ScriptLoader for PyScriptLoader {
             // Eagerly compile now: force numba to specialise compute by calling
             // it once with length-1 dummy tuples matching the input arity. This
             // compiles to native code at load, so the first real tick is warm.
-            let n = inputs.len();
-            warm_up(py, &compute, n).map_err(|e| format!("numba compile failed: {e}"))?;
+            warm_up(py, &compute, meta.inputs.len())
+                .map_err(|e| format!("numba compile failed: {e}"))?;
 
-            let n_outputs = outputs.len();
-            let meta = ScriptMeta { inputs, outputs };
+            let n_outputs = meta.outputs.len();
             let compiled: Box<dyn CompiledScript> =
                 Box::new(PyScript { compute: compute.unbind(), n_outputs });
             Ok(LoadedScript { meta, compiled })
+        })
+    }
+
+    fn peek_meta(&self, source: &str, name: &str) -> Result<ScriptMeta, String> {
+        Python::with_gil(|py| {
+            let module = PyModule::from_code_bound(py, source, &format!("{name}.py"), name)
+                .map_err(|e| e.to_string())?;
+            extract_meta(&module)
         })
     }
 }
@@ -287,6 +295,16 @@ def compute(ts, vals):
     v = vals[0]
     return (ts[0][-1:], np.array([np.sqrt(np.mean(v**2))]))
 "#;
+
+    #[test]
+    fn peek_meta_reads_bindings_without_compile() {
+        let src = "INPUTS=[\"load/ch0\"]\nOUTPUTS=[{\"name\":\"{in0.stem}.rms\",\"type\":\"float\",\"unit\":\"g\"}]\n# no compute at all\n";
+        let meta = PyScriptLoader.peek_meta(src, "m").unwrap();
+        assert_eq!(meta.inputs, vec!["load/ch0".to_string()]);
+        assert_eq!(meta.outputs.len(), 1);
+        assert_eq!(meta.outputs[0].name, "{in0.stem}.rms"); // template kept verbatim
+        assert_eq!(meta.outputs[0].unit, "g");
+    }
 
     #[test]
     fn runs_reduction_single_sample() {
