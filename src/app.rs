@@ -14,6 +14,7 @@ use crate::record::{start_recording, RecordHandle};
 use crate::store::ChannelStore;
 use crate::viz::PanelRegistry;
 use crate::workspace::Workspace;
+use crate::script::{ScriptCommand, SharedStatus};
 
 /// State for the "Add panel" modal.
 #[derive(Default)]
@@ -143,7 +144,7 @@ fn aggregate_conn_state(states: &[Arc<std::sync::atomic::AtomicU8>]) -> Option<u
 pub struct DataVisApp {
     store: Arc<dyn ChannelStore>,
     live_store: Arc<dyn ChannelStore>,
-    channels: ChannelRegistry,
+    channels: Arc<ChannelRegistry>,
     registry: PanelRegistry,
     workspace: Workspace,
     layout_path: PathBuf,
@@ -192,12 +193,18 @@ pub struct DataVisApp {
     /// Whether the toolbar "link time zoom" checkbox is on. In-memory only;
     /// published to egui ctx data each frame so time-based panels follow it.
     link_zoom: bool,
+    // Scripting panel
+    available_scripts: Vec<String>,
+    script_enabled: Vec<String>,
+    script_status: SharedStatus,
+    script_commands: crossbeam_channel::Sender<ScriptCommand>,
+    script_disabled: Arc<Mutex<Option<String>>>,
 }
 
 impl DataVisApp {
     pub fn new(
         store: Arc<dyn ChannelStore>,
-        channels: ChannelRegistry,
+        channels: Arc<ChannelRegistry>,
         registry: PanelRegistry,
         workspace: Workspace,
         layout_path: PathBuf,
@@ -205,6 +212,11 @@ impl DataVisApp {
         live_view_ns: Arc<AtomicI64>,
         live_history_s: f64,
         default_window_s: f64,
+        available_scripts: Vec<String>,
+        script_enabled: Vec<String>,
+        script_status: SharedStatus,
+        script_commands: crossbeam_channel::Sender<ScriptCommand>,
+        script_disabled: Arc<Mutex<Option<String>>>,
     ) -> Self {
         let DerivedIngest {
             conn_states,
@@ -218,7 +230,7 @@ impl DataVisApp {
             .first()
             .map(|s| s.to_string())
             .unwrap_or_default();
-        let channel_tree = ChannelTree::build(&channels);
+        let channel_tree = ChannelTree::build(channels.as_ref());
         Self {
             live_store: store.clone(),
             store,
@@ -251,6 +263,11 @@ impl DataVisApp {
             last_write_seq: 0,
             default_window_s,
             link_zoom: false,
+            available_scripts,
+            script_enabled,
+            script_status,
+            script_commands,
+            script_disabled,
         }
     }
 
@@ -702,7 +719,44 @@ impl DataVisApp {
                             Some(fmt_sample(&sample))
                         });
                     });
+
+                ui.separator();
+                {
+                    let disabled = self.script_disabled.lock().unwrap().clone();
+                    let toggles = crate::script::panel::draw_script_panel(
+                        ui,
+                        &self.available_scripts,
+                        &self.script_enabled,
+                        &self.script_status,
+                        &disabled,
+                    );
+                    for t in toggles {
+                        if t.enable {
+                            if !self.script_enabled.contains(&t.name) {
+                                self.script_enabled.push(t.name.clone());
+                            }
+                            let _ = self.script_commands.send(ScriptCommand::Enable(t.name.clone()));
+                        } else {
+                            self.script_enabled.retain(|n| n != &t.name);
+                            let _ = self.script_commands.send(ScriptCommand::Disable(t.name.clone()));
+                        }
+                        self.persist_scripts();
+                    }
+                }
             });
+    }
+
+    /// Write the current enabled-script set back to config.toml, preserving the
+    /// dir and window_s already on disk.
+    fn persist_scripts(&mut self) {
+        let existing = std::fs::read_to_string(&self.layout_path).unwrap_or_default();
+        let mut cfg = crate::script::config::ScriptsConfig::from_toml_str(&existing).unwrap_or_default();
+        cfg.enabled = self.script_enabled.clone();
+        self.status = match cfg.save(&self.layout_path) {
+            Ok(()) => "scripts saved".to_string(),
+            Err(e) => format!("scripts save failed: {e}"),
+        };
+        self.status_clear_at = Some(Instant::now() + Duration::from_secs(2));
     }
 
     fn add_panel_window(&mut self, ctx: &egui::Context) {

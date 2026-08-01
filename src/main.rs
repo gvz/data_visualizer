@@ -38,11 +38,13 @@ fn main() -> anyhow::Result<()> {
         resolve_missing_config(&mut layout_path)?
     };
 
-    let store = Arc::new(LiveStore::from_registry(&channels));
+    let channels = Arc::new(channels);
+
+    let store = Arc::new(LiveStore::from_registry(channels.as_ref()));
     let live_view_ns = store.view_override.clone();
     let live_history_s = channels
         .iter_ids()
-        .map(|id| channels.meta(id).history_s)
+        .map(|id| channels.as_ref().meta(id).history_s)
         .fold(5.0_f64, f64::max);
 
     // The status indicator aggregates every source's conn_state (LIVE if any
@@ -51,13 +53,13 @@ fn main() -> anyhow::Result<()> {
     let mut sources: Vec<datavis::ingest::SourceHandle> = Vec::new();
 
     if demo {
-        datavis::demo::spawn_demo(store.clone(), &channels, demo_freq);
+        datavis::demo::spawn_demo(store.clone(), channels.as_ref(), demo_freq);
     } else {
         let config = IngestConfig {
             endpoint,
             proto_path: PathBuf::from(&schema_path),
         };
-        match ZmqSource::build(config, &channels) {
+        match ZmqSource::build(config, channels.as_ref()) {
             Ok(src) => sources.push(Box::new(src).spawn(store.clone())),
             Err(e) => eprintln!("ingest: failed to start ({e}); running without live data"),
         }
@@ -66,18 +68,59 @@ fn main() -> anyhow::Result<()> {
     if let Some(broker) = mqtt_endpoint {
         let src = MqttSource::new(
             MqttConfig { broker_url: broker, client_id: "datavis".to_string() },
-            &channels,
+            channels.as_ref(),
         );
         sources.push(Box::new(src).spawn(store.clone()));
     }
 
     if let Some(listen) = arg_value(&args, "--ws-listen") {
-        let src = WsSource::new(WsConfig { listen }, &channels);
+        let src = WsSource::new(WsConfig { listen }, channels.as_ref());
         sources.push(Box::new(src).spawn(store.clone()));
     }
 
+    // Scripting engine: load the [scripts] section, discover *.py in its dir,
+    // and spawn the numba-backed engine (disabled gracefully if numba is absent).
+    let scripts_cfg = datavis::script::config::ScriptsConfig::from_toml_str(
+        &std::fs::read_to_string(&layout_path).unwrap_or_default(),
+    )
+    .unwrap_or_default();
+    let scripts_dir = layout_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(&scripts_cfg.dir);
+    let available_scripts = datavis::script::discover_scripts(&scripts_dir);
+
+    #[cfg(feature = "scripting")]
+    let (script_status, script_commands, script_disabled) = {
+        let engine = datavis::script::ScriptEngine::new(
+            scripts_dir.clone(),
+            scripts_cfg.enabled.clone(),
+            scripts_cfg.window_s,
+            Box::new(datavis::script::python::PyScriptLoader),
+            channels.clone(),
+            Box::new(datavis::script::python::probe_numba),
+        );
+        let script_status = engine.status();
+        let script_commands = engine.commands();
+        let script_disabled = engine.disabled_reason();
+        sources.push(Box::new(engine).spawn(store.clone()));
+        (script_status, script_commands, script_disabled)
+    };
+
+    #[cfg(not(feature = "scripting"))]
+    let (script_status, script_commands, script_disabled) = {
+        let status: datavis::script::SharedStatus =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, _rx) = crossbeam_channel::unbounded::<datavis::script::ScriptCommand>();
+        let disabled: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Some(
+                "scripting feature not enabled".to_string(),
+            )));
+        (status, tx, disabled)
+    };
+
     let registry = PanelRegistry::with_builtins();
-    let workspace = Workspace::from_config(&layout, &registry, &channels);
+    let workspace = Workspace::from_config(&layout, &registry, channels.as_ref());
     let dyn_store: Arc<dyn ChannelStore> = store;
     let app = DataVisApp::new(
         dyn_store,
@@ -89,6 +132,11 @@ fn main() -> anyhow::Result<()> {
         live_view_ns,
         live_history_s,
         layout.default_window_s,
+        available_scripts,
+        scripts_cfg.enabled,
+        script_status,
+        script_commands,
+        script_disabled,
     );
 
     eframe::run_native(

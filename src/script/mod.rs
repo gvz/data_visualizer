@@ -3,6 +3,7 @@ pub mod types;
 pub mod runner;
 #[cfg(feature = "scripting")]
 pub mod python;
+pub mod panel;
 
 pub use runner::ScriptState;
 
@@ -221,6 +222,23 @@ impl DataSource for ScriptEngine {
             schema_bytes: None,
         }
     }
+}
+
+/// Every `*.py` stem in `dir` (sorted). Missing dir → empty.
+pub fn discover_scripts(dir: &std::path::Path) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("py") {
+                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                    names.push(stem.to_string());
+                }
+            }
+        }
+    }
+    names.sort();
+    names
 }
 
 #[cfg(test)]
