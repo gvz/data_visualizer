@@ -139,6 +139,21 @@ fn main() -> anyhow::Result<()> {
         script_disabled,
     );
 
+    // On Windows the interpreter ships beside the exe under `python/`. Point the
+    // embedded runtime at it before any Python is initialised. On Linux the system
+    // python3 (a .deb dependency) is used, so nothing is set.
+    #[cfg(all(windows, feature = "scripting"))]
+    {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let py_home = dir.join("python");
+                if py_home.is_dir() {
+                    std::env::set_var("PYTHONHOME", &py_home);
+                }
+            }
+        }
+    }
+
     eframe::run_native(
         "datavis",
         eframe::NativeOptions { vsync: false, ..Default::default() },
