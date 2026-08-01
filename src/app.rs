@@ -195,12 +195,15 @@ pub struct DataVisApp {
     /// published to egui ctx data each frame so time-based panels follow it.
     link_zoom: bool,
     // Scripting panel
-    available_scripts: Vec<String>,
+    // Kept for future use (e.g. offline display without meta peek); the panel
+    // currently builds the script list from `script_metas` which is richer.
+    _available_scripts: Vec<String>,
     script_instances: Vec<ScriptInstance>,
     script_metas: SharedMetas,
     script_status: SharedStatus,
     script_commands: crossbeam_channel::Sender<ScriptCommand>,
     script_disabled: Arc<Mutex<Option<String>>>,
+    script_panel_state: crate::script::panel::ScriptPanelState,
 }
 
 impl DataVisApp {
@@ -266,12 +269,13 @@ impl DataVisApp {
             last_write_seq: 0,
             default_window_s,
             link_zoom: false,
-            available_scripts,
+            _available_scripts: available_scripts,
             script_instances,
             script_metas,
             script_status,
             script_commands,
             script_disabled,
+            script_panel_state: Default::default(),
         }
     }
 
@@ -729,10 +733,16 @@ impl DataVisApp {
 
                 ui.separator();
                 {
+                    let channel_names: Vec<String> =
+                        self.channels.iter_ids().map(|id| self.channels.meta(id).name.clone()).collect();
+                    let metas = self.script_metas.lock().unwrap().clone();
                     let disabled = self.script_disabled.lock().unwrap().clone();
                     let cmds = crate::script::panel::draw_script_panel(
                         ui,
+                        &mut self.script_panel_state,
                         &self.script_instances,
+                        &metas,
+                        &channel_names,
                         &self.script_status,
                         &disabled,
                     );
