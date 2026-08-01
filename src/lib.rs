@@ -4,8 +4,9 @@
 //! carry timestamped scalar or text samples from one or more live sources;
 //! panels render those samples in various ways inside a tiled workspace.
 //!
-//! This document covers the two main extension points: adding a new
-//! **visualization panel** and adding a new **data source**.
+//! This document covers the main extension points: adding a new
+//! **visualization panel**, adding a new **data source**, and writing a
+//! **Python script** that derives new channels from existing ones.
 //!
 //! ---
 //!
@@ -79,6 +80,54 @@
 //!
 //! ---
 //!
+//! ## Writing a Python script
+//!
+//! Scripts read channels, compute, and publish new channels at native speed —
+//! each is compiled with numba when loaded. The engine is [`script::ScriptEngine`]
+//! (a [`ingest::DataSource`] that ticks every script on a background thread);
+//! numba is required, and the feature disables itself with a visible warning
+//! when it is absent.
+//!
+//! Put `.py` files in a `scripts/` directory beside `config.toml` and enable
+//! them from the **Scripts** sidebar panel. The active set persists in the
+//! `[scripts]` table (`dir`, `enabled`, `window_s` — the seconds of history a
+//! script sees each tick). See [`script::config::ScriptsConfig`].
+//!
+//! A script self-declares its bindings and provides a numba-compiled `compute`:
+//!
+//! ```python
+//! import numpy as np
+//! import numba
+//!
+//! INPUTS  = ["accel.x", "accel.y", "accel.z"]
+//! OUTPUTS = [{"name": "accel.magnitude", "type": "float", "unit": "m/s2"}]
+//!
+//! @numba.njit
+//! def compute(ts, vals):
+//!     t = ts[0]                            # timestamps of accel.x (int64 ns)
+//!     x, y, z = vals[0], vals[1], vals[2]  # one value array per input
+//!     return (t, np.sqrt(x**2 + y**2 + z**2))
+//! ```
+//!
+//! - `ts[i]` / `vals[i]` are the timestamp and value arrays of input `i` (in
+//!   `INPUTS` order) over the last `window_s` seconds. They are **tuples of
+//!   separate 1‑D arrays**, not a 2‑D array: each input keeps its own length
+//!   and its own timestamps, so aligning different-rate inputs (e.g. with
+//!   `np.interp`) is the script's job — the engine never resamples.
+//! - Return **one `(ts, vals)` pair per output** (a bare pair for a single
+//!   output, or a tuple of pairs in `OUTPUTS` order). Return arrays the length
+//!   of `ts` for a per-sample transform, or length‑1 arrays for one reduced
+//!   value per tick. Output `type` is `"float"`, `"int"`, or `"bool"`; keep
+//!   arrays `int64`/`float64`.
+//!
+//! The engine appends only samples newer than the last it wrote, so overlapping
+//! windows never duplicate output. A compile error or an exception in `compute`
+//! fails only that script (shown in the Scripts panel); the app and other
+//! scripts keep running. Outputs are ordinary channels — drop them onto any
+//! panel like live data. See [`script`] for the full module.
+//!
+//! ---
+//!
 //! ## Key types
 //!
 //! | Type | Where | Role |
@@ -90,6 +139,7 @@
 //! | [`store::ChannelStore`] | `store` | Read/write interface panels and sources share |
 //! | [`types::SampleType`] | `types` | Float / Int / Bool / Text discriminant |
 //! | [`config::ChannelRegistry`] | `config` | Channel name → id + metadata at startup |
+//! | [`script::ScriptEngine`] | `script` | Runs numba-compiled user scripts as a data source |
 
 pub mod app;
 pub mod channel_tree;
@@ -98,6 +148,7 @@ pub mod demo;
 pub mod dynamic_channel;
 pub mod ingest;
 pub mod record;
+pub mod script;
 pub mod store;
 pub mod types;
 pub mod viz;
