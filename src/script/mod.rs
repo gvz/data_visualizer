@@ -174,16 +174,17 @@ impl ScriptEngine {
 
         let meta = ScriptMeta { inputs, outputs };
 
-        // Collision check: an output name already known and owned by NO instance is a
-        // real clash with a non-script channel. Names this same id already owns are
-        // fine (rebuild reuses the slot).
+        // Collision check: a name that exists in the registry is a real clash
+        // ONLY if it is not one of this same id's already-registered outputs.
+        // A rebuild (enable→disable→enable, or edit-then-apply) must be able to
+        // reuse the channels it already registered. Names owned by *other*
+        // instances are still registry entries, so they correctly collide.
         let mut owned = self.owned_outputs.lock().unwrap();
-        let owned_by_others: std::collections::HashSet<&str> = owned
-            .iter()
-            .filter(|(k, _)| k.as_str() != inst.id)
-            .flat_map(|(_, v)| v.iter().map(String::as_str))
-            .collect();
-        let exists = |n: &str| self.registry.id(n).is_some() && !owned_by_others.contains(n);
+        let owned_by_self: std::collections::HashSet<&str> = owned
+            .get(&inst.id)
+            .map(|v| v.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        let exists = |n: &str| self.registry.id(n).is_some() && !owned_by_self.contains(n);
         validate_meta(&meta, exists).map_err(&fail)?;
         owned.insert(inst.id.clone(), meta.outputs.iter().map(|o| o.name.clone()).collect());
         drop(owned);
@@ -204,6 +205,13 @@ impl ScriptEngine {
 
     /// Load/reload one instance into `runners`, removing any prior version.
     /// Disabled instances are skipped (removed from active set but not failed).
+    ///
+    /// Note: this deliberately does NOT clear this id's `owned_outputs` entry.
+    /// `build_runner`'s collision check exempts names the same id already owns,
+    /// so keeping the entry lets a re-Upsert (enable→disable→enable, or an edit
+    /// then re-apply) reuse its already-registered output channels instead of
+    /// spuriously colliding with them. On success `build_runner` overwrites the
+    /// entry. The real teardown happens in `remove_instance`.
     fn load_into(
         &self,
         inst: &ScriptInstance,
@@ -213,7 +221,6 @@ impl ScriptEngine {
     ) {
         runners.retain(|r| r.name() != inst.id);
         failed.retain(|f| f.name != inst.id);
-        self.owned_outputs.lock().unwrap().remove(&inst.id);
         if !inst.enabled {
             return;
         }
@@ -509,6 +516,7 @@ mod tests {
         );
         let store: Arc<dyn ChannelStore> = Arc::new(LiveStore::from_registry(&reg));
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("dbl.py"), "# fake").unwrap();
         let engine = ScriptEngine::new(
             dir.path().to_path_buf(),
             vec![],
@@ -523,6 +531,36 @@ mod tests {
         assert!(result.is_err());
         let err = result.err().unwrap();
         assert!(matches!(err.state, ScriptState::Failed(_)));
+    }
+
+    #[test]
+    fn re_upsert_of_running_instance_does_not_self_collide() {
+        // Registering an instance's outputs and then rebuilding the SAME id with
+        // the same inputs must succeed: the id's own already-registered output
+        // channels are exempt from the collision check (they are not "external").
+        let reg = Arc::new(
+            ChannelRegistry::from_toml_str(
+                "[channels.\"in.a\"]\ntype=\"float\"\nmax_rate=100\nhistory_s=1.0\n",
+            )
+            .unwrap(),
+        );
+        let store: Arc<dyn ChannelStore> = Arc::new(LiveStore::from_registry(&reg));
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("dbl.py"), "# fake").unwrap();
+        let engine = ScriptEngine::new(
+            dir.path().to_path_buf(),
+            vec![],
+            10.0,
+            Box::new(TemplateDoublerLoader),
+            reg.clone(),
+            Box::new(|| Ok(())),
+        );
+        let inst = instance("first", "dbl", Some(vec!["in.a"]));
+        // First build registers in.a.double and records ownership under "first".
+        assert!(engine.build_runner(&inst, store.as_ref()).is_ok());
+        assert!(reg.id("in.a.double").is_some());
+        // Rebuilding the same id + inputs must NOT report a spurious collision.
+        assert!(engine.build_runner(&inst, store.as_ref()).is_ok());
     }
 
     #[test]
