@@ -713,6 +713,9 @@ impl DataVisApp {
                     .id_source("ch_tree_scroll")
                     .max_height(avail_h)
                     .show(ui, |ui| {
+                        // Pick up channels registered since build (script
+                        // outputs, dropped MQTT topics) before rendering.
+                        self.channel_tree.sync(channels);
                         self.channel_tree.ui(ui, &self.mqtt_snapshot, |name| {
                             let id = channels.id(name)?;
                             let (_, sample) = store.latest_at(id, now)?;

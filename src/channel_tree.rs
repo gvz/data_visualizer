@@ -96,6 +96,21 @@ impl ChannelTree {
         Self { names, selected: HashSet::new(), anchor: None }
     }
 
+    /// Refresh the channel name list from the registry, keeping the current
+    /// selection and anchor. The registry only grows (dynamic channels are
+    /// appended), so a length change is a reliable "something new" trigger —
+    /// this is how script outputs and dropped MQTT topics appear in the tree
+    /// after `build` snapshotted the original names.
+    pub fn sync(&mut self, registry: &ChannelRegistry) {
+        if registry.len() == self.names.len() {
+            return;
+        }
+        self.names = registry
+            .iter_ids()
+            .map(|id| registry.meta(id).name.clone())
+            .collect();
+    }
+
     /// Update the selection for a click on leaf `name`. `toggle` is the
     /// Ctrl/Cmd modifier, `range` is Shift. `order` is the current flattened
     /// leaf order (from [`flat_leaf_order`]).
@@ -407,6 +422,23 @@ mod tests {
             ("c", "float"),
             ("d", "float"),
         ]))
+    }
+
+    #[test]
+    fn sync_picks_up_dynamic_channels_and_keeps_selection() {
+        let r = reg(&[("alpha", "float")]);
+        let mut t = ChannelTree::build(&r);
+        let o = order(&t);
+        t.apply_click("alpha", false, false, &o);
+
+        // A script output / dropped MQTT topic registers after build.
+        let r2 = reg(&[("alpha", "float"), ("scripts/out", "float")]);
+        t.sync(&r2);
+
+        let roots = t.assemble(&BTreeMap::new(), &|_| None);
+        let labels: Vec<&str> = roots.iter().map(node_label).collect();
+        assert!(labels.contains(&"scripts")); // new channel now in the tree
+        assert!(t.selected.contains("alpha")); // selection survived
     }
 
     #[test]

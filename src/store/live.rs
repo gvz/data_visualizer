@@ -70,6 +70,17 @@ impl LiveStore {
         self.channels.get(id.0 as usize).expect("channel id out of range")
     }
 
+    /// Like [`Self::slot`] but tolerant of an id the registry has already
+    /// handed out while this store's matching slot is still being appended.
+    /// Dynamic registration grows the registry then the store (see
+    /// `resolve_or_register_drop`), so a reader on another thread — the script
+    /// engine, the channel tree's value lookup — can resolve an id one step
+    /// ahead of its slot. Read paths treat that as "no data yet" instead of
+    /// panicking; the slot lands a moment later.
+    fn try_slot(&self, id: ChannelId) -> Option<&ChannelSlot> {
+        self.channels.get(id.0 as usize)
+    }
+
     fn count_type_error(&self) {
         self.type_errors.fetch_add(1, Ordering::Relaxed);
     }
@@ -104,7 +115,11 @@ impl ChannelStore for LiveStore {
     }
 
     fn snapshot(&self, channel: ChannelId, window: TimeWindow) -> ChannelSnapshot {
-        match &self.slot(channel).data {
+        let Some(slot) = self.try_slot(channel) else {
+            // Slot not appended yet (see `try_slot`): empty window.
+            return ChannelSnapshot::Float { ts: Vec::new(), vals: Vec::new() };
+        };
+        match &slot.data {
             ChannelData::Float(r) => {
                 let (mut ts, mut vals) = (Vec::new(), Vec::new());
                 r.read_window(window, &mut ts, &mut vals);
@@ -125,7 +140,7 @@ impl ChannelStore for LiveStore {
     }
 
     fn latest(&self, channel: ChannelId) -> Option<(i64, Sample)> {
-        match &self.slot(channel).data {
+        match &self.try_slot(channel)?.data {
             ChannelData::Float(r) => r.latest().map(|(t, v)| (t, Sample::Float(v))),
             ChannelData::Int(r) => r.latest().map(|(t, v)| (t, Sample::Int(v))),
             ChannelData::Bool(r) => r.latest().map(|(t, v)| (t, Sample::Bool(v != 0))),
@@ -186,6 +201,24 @@ max_lines = 10
 "#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn reads_tolerate_id_ahead_of_slot() {
+        // Registry hands out an id, but the matching store slot hasn't been
+        // appended yet (the dynamic-registration race: registry grows before
+        // the store). Reads must return "no data", not panic.
+        let reg = registry();
+        let store = LiveStore::from_registry(&reg);
+        let ahead = ChannelId(reg.len() as u32); // one past the last real slot
+        match store.snapshot(ahead, ALL) {
+            ChannelSnapshot::Float { ts, vals } => {
+                assert!(ts.is_empty() && vals.is_empty());
+            }
+            other => panic!("expected empty snapshot, got {other:?}"),
+        }
+        assert_eq!(store.latest(ahead), None);
+        assert_eq!(store.latest_at(ahead, i64::MAX), None);
     }
 
     #[test]
