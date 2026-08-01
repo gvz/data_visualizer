@@ -109,12 +109,99 @@ fn warm_up(py: Python<'_>, compute: &Bound<'_, PyAny>, n: usize) -> PyResult<()>
     Ok(())
 }
 
-// Placeholder impl so the crate compiles; Task 6 replaces `run`.
 impl CompiledScript for PyScript {
-    fn run(&mut self, _inputs: &[InputWindow]) -> Result<Vec<OutputBatch>, String> {
-        let _ = self.n_outputs;
-        Err("PyScript::run not yet implemented".to_string())
+    fn run(&mut self, inputs: &[InputWindow]) -> Result<Vec<OutputBatch>, String> {
+        use numpy::PyArray1;
+        use pyo3::types::PyTuple;
+
+        Python::with_gil(|py| {
+            // Build ts and vals tuples of numpy arrays, in INPUTS order.
+            let ts_arrays: Vec<_> =
+                inputs.iter().map(|w| PyArray1::from_slice_bound(py, &w.ts)).collect();
+            let val_arrays: Vec<_> =
+                inputs.iter().map(|w| PyArray1::from_slice_bound(py, &w.vals)).collect();
+            let ts_tuple = PyTuple::new_bound(py, &ts_arrays);
+            let vals_tuple = PyTuple::new_bound(py, &val_arrays);
+
+            let result = self
+                .compute
+                .bind(py)
+                .call1((ts_tuple, vals_tuple))
+                .map_err(|e| e.to_string())?;
+
+            // Normalise the return into a list of (ts, vals) pairs. A single
+            // output may be returned as a bare 2-tuple; several as a tuple of
+            // pairs. Distinguish by inspecting the first element.
+            let pairs: Vec<Bound<'_, PyAny>> = if self.n_outputs == 1 {
+                // Could be (ts, vals) directly, or ((ts, vals),) — handle both.
+                let tup = result.downcast::<PyTuple>().map_err(|_| {
+                    "compute must return a (ts, vals) tuple".to_string()
+                })?;
+                if tup.len() == 2 && tup.get_item(0).map_or(false, |x| is_array(&x)) {
+                    vec![result.clone()]
+                } else {
+                    tup.iter().collect()
+                }
+            } else {
+                let tup = result.downcast::<PyTuple>().map_err(|_| {
+                    "compute must return a tuple of (ts, vals) pairs".to_string()
+                })?;
+                tup.iter().collect()
+            };
+
+            if pairs.len() != self.n_outputs {
+                return Err(format!(
+                    "compute returned {} outputs, expected {}",
+                    pairs.len(),
+                    self.n_outputs
+                ));
+            }
+
+            let mut batches = Vec::with_capacity(pairs.len());
+            for pair in pairs {
+                let pair = pair
+                    .downcast::<PyTuple>()
+                    .map_err(|_| "each output must be a (ts, vals) tuple".to_string())?;
+                if pair.len() != 2 {
+                    return Err("each output must be a (ts, vals) pair".to_string());
+                }
+                let ts = extract_i64(&pair.get_item(0).map_err(|e| e.to_string())?)?;
+                let vals = extract_f64(&pair.get_item(1).map_err(|e| e.to_string())?)?;
+                batches.push(OutputBatch { ts, vals });
+            }
+            Ok(batches)
+        })
     }
+}
+
+/// True if the object is a numpy ndarray (used to disambiguate the single-output
+/// bare-pair return from a tuple-of-pairs return).
+fn is_array(obj: &Bound<'_, PyAny>) -> bool {
+    obj.hasattr("dtype").unwrap_or(false) && obj.hasattr("shape").unwrap_or(false)
+}
+
+/// Extract an int64 array, coercing a float array via truncation.
+fn extract_i64(obj: &Bound<'_, PyAny>) -> Result<Vec<i64>, String> {
+    use numpy::{PyArray1, PyArrayMethods};
+    if let Ok(a) = obj.downcast::<PyArray1<i64>>() {
+        return Ok(a.to_vec().map_err(|e| e.to_string())?);
+    }
+    if let Ok(a) = obj.downcast::<PyArray1<f64>>() {
+        return Ok(a.to_vec().map_err(|e| e.to_string())?.into_iter().map(|v| v as i64).collect());
+    }
+    Err("output ts must be an int64 or float64 array".to_string())
+}
+
+/// Extract a float64 array, widening an int64 array.
+fn extract_f64(obj: &Bound<'_, PyAny>) -> Result<Vec<f64>, String> {
+    use numpy::{PyArray1, PyArrayMethods};
+    if let Ok(a) = obj.downcast::<PyArray1<f64>>() {
+        return Ok(a.to_vec().map_err(|e| e.to_string())?);
+    }
+    if let Ok(a) = obj.downcast::<PyArray1<i64>>() {
+        return Ok(a.to_vec().map_err(|e| e.to_string())?.into_iter().map(|v| v as f64).collect());
+    }
+    Err("output vals must be a float64 or int64 array".to_string())
 }
 
 #[cfg(test)]
@@ -177,5 +264,48 @@ def compute(ts, vals):
             Ok(_) => panic!("expected an error but load succeeded"),
         };
         assert!(err.contains("numba.njit"), "got: {err}");
+    }
+
+    #[test]
+    fn runs_elementwise_and_returns_pairs() {
+        if skip_without_numba() {
+            return;
+        }
+        let mut loaded = PyScriptLoader.load(ELEMENTWISE, "elementwise").unwrap();
+        let inputs = vec![
+            InputWindow { ts: vec![1, 2], vals: vec![10.0, 20.0] },
+            InputWindow { ts: vec![1, 2], vals: vec![1.0, 2.0] },
+        ];
+        let out = loaded.compiled.run(&inputs).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].ts, vec![1, 2]);
+        assert_eq!(out[0].vals, vec![11.0, 22.0]);
+    }
+
+    const REDUCTION: &str = r#"
+import numpy as np
+import numba
+
+INPUTS  = ["a"]
+OUTPUTS = [{"name": "rms", "type": "float"}]
+
+@numba.njit
+def compute(ts, vals):
+    v = vals[0]
+    return (ts[0][-1:], np.array([np.sqrt(np.mean(v**2))]))
+"#;
+
+    #[test]
+    fn runs_reduction_single_sample() {
+        if skip_without_numba() {
+            return;
+        }
+        let mut loaded = PyScriptLoader.load(REDUCTION, "reduction").unwrap();
+        let inputs = vec![InputWindow { ts: vec![1, 2], vals: vec![3.0, 4.0] }];
+        let out = loaded.compiled.run(&inputs).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].ts, vec![2]);
+        assert_eq!(out[0].vals.len(), 1);
+        assert!((out[0].vals[0] - (12.5f64).sqrt()).abs() < 1e-9);
     }
 }
