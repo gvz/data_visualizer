@@ -206,14 +206,17 @@ pub fn draw_script_panel(
             .unwrap_or(row.inputs.len());
         row.inputs.resize(slot_count, String::new());
 
-        // Collect slot-level info before splitting borrows.
+        // Collect slot-level info before splitting borrows. Label each slot
+        // generically ("input channel", numbered when the script takes more
+        // than one) rather than with the script's declared default channel
+        // name, which read like a value.
         let slot_labels: Vec<String> = (0..slot_count)
             .map(|s| {
-                metas
-                    .get(&row.script)
-                    .and_then(|m| m.inputs.get(s))
-                    .cloned()
-                    .unwrap_or_else(|| format!("input[{s}]"))
+                if slot_count == 1 {
+                    "input channel".to_string()
+                } else {
+                    format!("input channel {s}")
+                }
             })
             .collect();
         let slot_keys: Vec<String> = (0..slot_count).map(|s| format!("{id}#{s}")).collect();
