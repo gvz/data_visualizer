@@ -98,6 +98,7 @@ pub mod demo;
 pub mod dynamic_channel;
 pub mod ingest;
 pub mod record;
+pub mod script;
 pub mod store;
 pub mod types;
 pub mod viz;
