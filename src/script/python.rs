@@ -25,15 +25,8 @@ pub struct PyScript {
 /// Loads Python source through numba. The gate probe must have already passed.
 pub struct PyScriptLoader;
 
-/// Map a declared output `type` string to a numeric `SampleType`. Text is
-/// rejected — script outputs are numeric only.
 fn output_sample_type(ty: &str) -> Result<SampleType, String> {
-    match ty {
-        "float" => Ok(SampleType::Float),
-        "int" => Ok(SampleType::Int),
-        "bool" => Ok(SampleType::Bool),
-        other => Err(format!("output type '{other}' is not one of float/int/bool")),
-    }
+    crate::script::types::parse_sample_type(ty)
 }
 
 impl ScriptLoader for PyScriptLoader {
