@@ -29,6 +29,10 @@ tungstenite = "0.21"
 pyo3 = { version = "0.22", features = ["auto-initialize"], optional = true }
 numpy = { version = "0.22", optional = true }
 
+# `scripting` is on by default. It pulls in PyO3/numpy, which require a Python
+# interpreter (python3 + python3-config) on PATH at build time — build inside
+# the `nix develop` shell (it provides python3 + numba) or install python3-dev.
+# Build the base app without a Python toolchain via `--no-default-features`.
 [features]
 default = ["scripting"]
 scripting = ["dep:pyo3", "dep:numpy"]
