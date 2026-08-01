@@ -8,3 +8,18 @@ type = "waveform"
 channels = []
 cursors = false
 dots = false
+
+[scripts]
+dir = "scripts"
+window_s = 10.0
+
+[[scripts.instances]]
+id = "ch0_squared"
+script = "sine_squared"
+enabled = true
+
+[[scripts.instances]]
+id = "ch0_rms"
+script = "sine_rms"
+inputs = ["load/ch1"]
+enabled = true
