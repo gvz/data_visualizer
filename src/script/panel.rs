@@ -114,6 +114,22 @@ fn staged_from_instance(inst: &ScriptInstance) -> StagedInstance {
     }
 }
 
+/// Ids to render, in order: committed instances first (config order), then any
+/// staged-only rows — instances the user "Add"ed but hasn't applied yet. Those
+/// have no committed counterpart, so without this they would never be drawn and
+/// their Apply button (the only way to commit them) would be unreachable.
+fn render_order(
+    instance_ids: &[String],
+    staged: &HashMap<String, StagedInstance>,
+) -> Vec<String> {
+    let mut ids = instance_ids.to_vec();
+    let mut extra: Vec<String> =
+        staged.keys().filter(|k| !instance_ids.contains(k)).cloned().collect();
+    extra.sort();
+    ids.extend(extra);
+    ids
+}
+
 pub fn draw_script_panel(
     ui: &mut egui::Ui,
     state: &mut ScriptPanelState,
@@ -138,9 +154,11 @@ pub fn draw_script_panel(
         state.staged.entry(inst.id.clone()).or_insert_with(|| staged_from_instance(inst));
     }
 
-    // Render each staged row that corresponds to a live instance.
+    // Render committed instances (config order) followed by any staged-only
+    // rows the user just added but hasn't applied yet.
     let instance_ids: Vec<String> = instances.iter().map(|i| i.id.clone()).collect();
-    for id in &instance_ids {
+    let render_ids = render_order(&instance_ids, &state.staged);
+    for id in &render_ids {
         let Some(row) = state.staged.get_mut(id) else { continue };
 
         ui.separator();
@@ -408,5 +426,43 @@ mod tests {
         assert!(input_is_valid("load/ch0", &names));
         assert!(!input_is_valid("load/ch9", &names));
         assert!(!input_is_valid("", &names));
+    }
+
+    fn staged(id: &str) -> StagedInstance {
+        StagedInstance {
+            id: id.into(),
+            script: "s".into(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn render_order_includes_staged_only_added_instance() {
+        // "existing" is a committed instance; "fresh" was just Add-ed and has no
+        // committed counterpart. Both must render, committed first, or the new
+        // row (and its Apply button) would be invisible.
+        let committed = vec!["existing".to_string()];
+        let mut st = HashMap::new();
+        st.insert("existing".to_string(), staged("existing"));
+        st.insert("fresh".to_string(), staged("fresh"));
+
+        let order = render_order(&committed, &st);
+        assert_eq!(order, vec!["existing".to_string(), "fresh".to_string()]);
+    }
+
+    #[test]
+    fn render_order_no_duplicates_and_committed_first() {
+        let committed = vec!["b".to_string(), "a".to_string()];
+        let mut st = HashMap::new();
+        for id in ["a", "b", "z", "m"] {
+            st.insert(id.to_string(), staged(id));
+        }
+        // Committed keep config order (b, a); staged-only are appended sorted (m, z).
+        assert_eq!(
+            render_order(&committed, &st),
+            vec!["b".to_string(), "a".to_string(), "m".to_string(), "z".to_string()]
+        );
     }
 }
