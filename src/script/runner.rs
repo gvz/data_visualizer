@@ -67,8 +67,11 @@ impl ScriptRunner {
     ) -> Self {
         let mut output_ids = Vec::with_capacity(meta.outputs.len());
         for out in &meta.outputs {
+            let is_new = registry.id(&out.name).is_none();
             let id = registry.add_dynamic(&out.name, &out.name, out.sample_type);
-            store.add_channel(registry.meta(id).clone());
+            if is_new {
+                store.add_channel(registry.meta(id).clone());
+            }
             output_ids.push(id);
         }
         let input_ids = vec![None; meta.inputs.len()];
@@ -316,5 +319,62 @@ mod tests {
         let mut runner = ScriptRunner::new("f".into(), meta, compiled, &store, &reg);
         runner.tick(&store, &reg, ALL);
         assert_eq!(runner.state(), &ScriptState::Failed("boom".to_string()));
+    }
+
+    /// Re-enabling a script (disable → enable) calls `ScriptRunner::new` twice
+    /// for the same output name against the same registry+store. Before the fix,
+    /// the second `new` called `store.add_channel` again even though `o1` was
+    /// already registered, creating an orphan slot. Any subsequent `add_dynamic`
+    /// call then got a registry id that indexed the orphan slot instead of the
+    /// real one, corrupting reads for every channel registered after re-enable.
+    ///
+    /// This test proves the invariant holds: after a re-enable cycle, a freshly
+    /// registered `o2` channel's registry id correctly indexes its own store slot.
+    #[test]
+    fn reenable_does_not_desync_registry_and_store() {
+        let reg = registry_with_input();
+        let store = LiveStore::from_registry(&reg);
+        let in_id = reg.id("in.a").unwrap();
+        store.write_numeric(in_id, 10, NumericVal::Float(1.0));
+
+        // First enable: creates runner, ticks, confirms o1 works.
+        let make_meta = || ScriptMeta {
+            inputs: vec!["in.a".into()],
+            outputs: vec![out("o1")],
+        };
+        let make_script = || {
+            Box::new(FakeScript(|inp: &[InputWindow]| {
+                let w = &inp[0];
+                Ok(vec![OutputBatch { ts: w.ts.clone(), vals: w.vals.clone() }])
+            }))
+        };
+
+        let mut runner1 = ScriptRunner::new("s".into(), make_meta(), make_script(), &store, &reg);
+        runner1.tick(&store, &reg, ALL);
+        assert_eq!(runner1.state(), &ScriptState::Healthy);
+        let o1_id = reg.id("o1").unwrap();
+        assert!(store.latest(o1_id).is_some(), "o1 slot must be populated after first tick");
+
+        // Simulate re-enable: second ScriptRunner::new for the same output name
+        // against the same store+registry. Before the fix, this pushed an orphan
+        // slot at index o1_id.0 + 1, shifting every subsequent id by one.
+        let _runner2 = ScriptRunner::new("s".into(), make_meta(), make_script(), &store, &reg);
+
+        // Now register a NEW channel (as MQTT ingest / another script would do).
+        let o2_is_new = reg.id("o2").is_none();
+        assert!(o2_is_new, "o2 must not exist yet");
+        let o2_id = reg.add_dynamic("o2", "o2", SampleType::Float);
+        store.add_channel(reg.meta(o2_id).clone());
+
+        // Write a distinctive value to o2's slot and read it back via o2_id.
+        store.write_numeric(o2_id, 99, NumericVal::Float(42.0));
+
+        // Before the fix: o2_id pointed at the orphan slot (empty / wrong type).
+        // After the fix: o2_id correctly points at o2's slot, returning 42.0.
+        assert_eq!(
+            store.latest(o2_id),
+            Some((99, crate::types::Sample::Float(42.0))),
+            "o2 registry id must index o2's store slot — registry/store are desynced"
+        );
     }
 }
