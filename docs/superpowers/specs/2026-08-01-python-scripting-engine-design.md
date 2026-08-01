@@ -18,9 +18,12 @@ existing panel (waveform, spectrum, gauge, status, …) works on them unchanged.
   compiled to native code at load** (the engine forces numba compilation with a
   known signature), so the first tick is already warm — no lazy first-call JIT
   stall, no per-tick parse. Because numba compiles the function, `compute` must
-  be pure array-in/array-out (numba nopython mode handles numpy arrays, scalars,
-  and tuples — not dicts of Python objects). The engine does all channel
-  plumbing around it.
+  be pure array-in/array-out (numba nopython mode handles numpy arrays and tuples
+  of arrays — not dicts of Python objects). The engine does all channel plumbing
+  around it.
+- **Resampling is a user problem:** each input is handed its own timestamps, and
+  scripts return explicit output timestamps. The engine never aligns or resamples
+  channels; combining different-rate inputs is done inside the script.
 - **Channel binding:** each `.py` self-declares `INPUTS` and `OUTPUTS`.
 - **Selection:** a GUI panel lists available scripts with checkboxes; the
   enabled set persists in `config.toml`.
@@ -58,9 +61,9 @@ Python interpreter (via PyO3). The thread runs a fixed-cadence loop:
 ```
 loop every ~16 ms (~60 Hz):
     for each enabled, healthy script:
-        gather ts + one float64 array per input channel (window snapshot)
-        outputs = compiled_compute(ts, in0, in1, ...)   # native, pre-compiled
-        for each declared output, append new samples to the store
+        gather per-input (ts, vals) window snapshots into two tuples
+        outputs = compiled_compute(ts_tuple, vals_tuple)   # native, pre-compiled
+        for each returned (ts, vals) pair, append new samples to its output
 ```
 
 Outputs are written to the shared `ChannelStore`. The store's `write_seq()`
@@ -83,11 +86,11 @@ thread, which nothing else contends for.
 
 A script is a `.py` file that self-declares its bindings as module globals and
 implements a numba-compiled `compute` function. Because the engine compiles
-`compute` with numba, it must be **pure**: numpy arrays and scalars in,
-numpy arrays and scalars out. No dicts of objects, no `.push()`, no channel
-handles cross the `@njit` boundary — the engine handles all of that.
+`compute` with numba, it must be **pure**: tuples of numpy arrays in, `(ts,
+vals)` array pairs out. No dicts of objects, no `.push()`, no channel handles
+cross the `@njit` boundary — the engine handles all of that.
 
-**Element-wise transform** (magnitude of a 3-axis vector):
+**Element-wise transform** (magnitude of a co-sampled 3-axis vector):
 
 ```python
 import numpy as np
@@ -97,11 +100,31 @@ INPUTS  = ["accel.x", "accel.y", "accel.z"]
 OUTPUTS = [{"name": "accel.magnitude", "type": "float", "unit": "m/s2"}]
 
 @numba.njit
-def compute(ts, x, y, z):
-    return np.sqrt(x**2 + y**2 + z**2)   # array, len == len(ts)
+def compute(ts, vals):
+    t = ts[0]                            # accel.x timestamps
+    x, y, z = vals[0], vals[1], vals[2]
+    mag = np.sqrt(x**2 + y**2 + z**2)
+    return (t, mag)                      # one (ts, vals) pair for the one output
 ```
 
-**Window reduction** (RMS of a window → one value):
+**Multi-rate combine** (user resamples — the engine never does):
+
+```python
+import numpy as np
+import numba
+
+INPUTS  = ["accel.x", "gps.speed"]
+OUTPUTS = [{"name": "norm.speed", "type": "float", "unit": "m/s"}]
+
+@numba.njit
+def compute(ts, vals):
+    tx, x = ts[0], vals[0]
+    tg, g = ts[1], vals[1]
+    g_on_x = np.interp(tx.astype(np.float64), tg.astype(np.float64), g)
+    return (tx, g_on_x * x)
+```
+
+**Window reduction** (RMS of a window → one sample):
 
 ```python
 import numpy as np
@@ -111,37 +134,46 @@ INPUTS  = ["motor.current"]
 OUTPUTS = [{"name": "motor.current.rms", "type": "float", "unit": "A"}]
 
 @numba.njit
-def compute(ts, v):
-    return np.sqrt(np.mean(v**2))        # scalar
+def compute(ts, vals):
+    t, v = ts[0], vals[0]
+    rms = np.sqrt(np.mean(v**2))
+    return (t[-1:], np.array([rms]))     # length-1 ts + vals -> one sample
 ```
 
 ### Signature
 
-`compute`'s parameters are fixed by position:
+`compute` takes exactly two arguments, both numba tuples indexed in `INPUTS`
+order (nanosecond timestamps and values are handed over separately so a script
+can align channels itself):
 
-- **`ts`** — first parameter, always. `int64[:]`, nanoseconds since the Unix
-  epoch, for the current window.
-- **one array per `INPUTS` entry, in order** — each `float64[:]`, the window
-  snapshot of that channel's values (int/bool channels are widened to
-  `float64`, matching what panels get).
+- **`ts`** — `UniTuple(int64[:], N)`. `ts[i]` is input `i`'s timestamps
+  (nanoseconds since the Unix epoch) for the current window.
+- **`vals`** — `UniTuple(float64[:], N)`. `vals[i]` is input `i`'s values.
+  Int/bool channels are widened to `float64`, matching what panels get.
 
-All inputs share the leading `ts` time base: element-wise scripts require their
-inputs to be sample-aligned (equal length). Mismatched lengths raise at runtime
-and flag the script. Cross-channel resampling is out of scope for v1.
+Each input carries its **own** timestamps — there is no shared time base and the
+engine performs no alignment. Combining channels at different rates is the
+script's job (`np.interp`, decimation, etc.). This is deliberate: resampling is
+a user problem.
 
 ### Return values
 
-`compute` returns one value per `OUTPUTS` entry — a single value, or a tuple in
-`OUTPUTS` order. Each value is interpreted by shape:
+`compute` returns one **`(ts, vals)` pair per `OUTPUTS` entry** — the explicit
+timestamps and values to publish. For a single output, return the bare pair
+`(ts, vals)`; for several, return a tuple of pairs in `OUTPUTS` order. (Prefer
+tuples over Python lists — numba compiles homogeneous tuples cleanly.)
 
-- **array of length `len(ts)`** → element-wise. Each element is a sample at the
-  matching `ts`. The engine appends only samples newer than the last it wrote
-  for that channel (windows overlap tick to tick; this dedups by timestamp).
-- **scalar (or length-1 array)** → one reduction sample per tick, written at
-  `ts[-1]` (the latest input timestamp).
+- Both `ts` (`int64[:]`) and `vals` (`float64[:]`) must be **equal-length**
+  arrays; each element `(ts[k], vals[k])` is one sample.
+- The engine appends only samples with a timestamp newer than the last it wrote
+  for that channel. Windows overlap tick to tick, so this dedups by timestamp —
+  a full window on the first tick, then just the newly-arrived samples after.
+- A reduction returns length-1 arrays (one sample), typically stamped
+  `ts[i][-1:]` (the latest input time).
 
-An input channel with no data yet yields empty arrays; the engine skips the call
-(the script stays healthy, "waiting for data").
+If any input's window is empty (no data yet), the engine skips the call — the
+script stays healthy, "waiting for data" — so scripts need not guard against
+empty arrays.
 
 ### Type mapping
 
@@ -165,8 +197,8 @@ When a script is enabled (at startup or via the GUI toggle):
 2. Read `INPUTS` and `OUTPUTS` globals; validate shapes. Grab `compute` and
    verify it is a numba dispatcher (a `@numba.njit` function). If it is a plain
    function, flag the script failed: "`compute` must be decorated `@numba.njit`."
-3. **Eagerly compile.** Build the numba signature from arity —
-   `(int64[:], float64[:], … × len(INPUTS))` — and call
+3. **Eagerly compile.** Build the numba signature from the input count `N` —
+   `(UniTuple(int64[:], N), UniTuple(float64[:], N))` — and call
    `compute.compile(signature)`. This compiles to native code now, at load, so
    the first tick runs warm. A numba compilation error flags the script failed
    with the numba message (visible immediately, per the graceful-warning rule).
@@ -294,10 +326,13 @@ watch.
 **Script-contract tests (with the interpreter):**
 
 - An element-wise fixture (`@njit`) eagerly compiles at load, runs on a known
-  input snapshot, and its output channel receives the expected per-sample values.
-- A reduction fixture returning a scalar writes one sample at `ts[-1]`.
-- The dedup rule: across two overlapping-window ticks, an element-wise output
-  gains only the newly-arrived samples, no duplicates.
+  input snapshot, and its output channel receives the expected `(ts, vals)`.
+- A reduction fixture returning length-1 arrays writes exactly one sample at the
+  returned timestamp.
+- A multi-rate fixture with two different-length inputs resamples in-script and
+  publishes without the engine touching alignment.
+- The dedup rule: across two overlapping-window ticks, an output gains only the
+  samples whose timestamps are newer than the last written, no duplicates.
 - A `compute` that is not `@numba.njit`, or that raises a numba compilation
   error at load, is flagged failed with the message; sibling scripts still load.
 - A `compute()` that raises at runtime is caught; the script is paused, the
@@ -313,9 +348,9 @@ watch.
 ## Out of Scope (v1)
 
 - Text-typed inputs and outputs (numeric only).
-- Cross-channel resampling: element-wise scripts assume their inputs share a
-  time base (equal-length windows). Mismatched inputs are a runtime error, not
-  auto-aligned.
+- Engine-side resampling/alignment. Each input carries its own timestamps and the
+  script aligns channels itself; the engine only reads windows and writes what the
+  script returns.
 - Sub-interpreters / parallel per-script threads (numpy does not support
   sub-interpreters yet). One engine thread runs all scripts sequentially.
 - Live editing inside the app; scripts are edited in an external editor and
