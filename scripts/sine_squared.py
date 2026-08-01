@@ -8,7 +8,7 @@
 import numba
 
 INPUTS = ["load/ch0"]
-OUTPUTS = [{"name": "scripts.ch0_squared", "type": "float", "unit": ""}]
+OUTPUTS = [{"name": "scripts.{in0.stem}_squared", "type": "float", "unit": ""}]
 
 
 @numba.njit

@@ -9,7 +9,7 @@ import numpy as np
 import numba
 
 INPUTS = ["load/ch0"]
-OUTPUTS = [{"name": "scripts.ch0_rms", "type": "float", "unit": ""}]
+OUTPUTS = [{"name": "scripts.{in0.stem}_rms", "type": "float", "unit": ""}]
 
 
 @numba.njit
