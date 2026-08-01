@@ -45,8 +45,6 @@ pub struct ScriptPanelState {
     pub staged: HashMap<String, StagedInstance>,
     pub new_id: String,
     pub new_script: String,
-    /// Per-input free-text filter buffers, keyed by "<id>#<slot>".
-    pub input_query: HashMap<String, String>,
 }
 
 /// Case-insensitive subsequence match; ranks tighter match spans first. Empty
@@ -222,33 +220,40 @@ pub fn draw_script_panel(
         let slot_keys: Vec<String> = (0..slot_count).map(|s| format!("{id}#{s}")).collect();
 
         for (slot, (k, label)) in slot_keys.iter().zip(slot_labels.iter()).enumerate() {
-            ui.horizontal(|ui| {
-                ui.label(format!("{label}:"));
-
-                // Re-borrow staged row for this slot.
-                let row = state.staged.get_mut(id).unwrap();
-                let query = state.input_query.entry(k.clone()).or_default();
-
-                egui::ComboBox::from_id_source(k)
-                    .selected_text(if row.inputs[slot].is_empty() {
-                        "<pick channel>".to_string()
-                    } else {
-                        row.inputs[slot].clone()
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.text_edit_singleline(query);
-                        for name in fuzzy_rank(query, channel_names) {
-                            if ui.selectable_label(&row.inputs[slot] == name, name).clicked() {
-                                row.inputs[slot] = name.clone();
-                            }
+            ui.push_id(k, |ui| {
+                // Type directly into the input field. A ComboBox popup can't hold
+                // a text field — the field takes focus and egui dismisses the
+                // popup as you type — so we render fuzzy suggestions inline
+                // instead, only while the field is focused and its text is not
+                // yet an exact channel name.
+                let resp = ui
+                    .horizontal(|ui| {
+                        ui.label(format!("{label}:"));
+                        let row = state.staged.get_mut(id).unwrap();
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut row.inputs[slot])
+                                .hint_text("type to search channels")
+                                .desired_width(180.0),
+                        );
+                        if !input_is_valid(&row.inputs[slot], channel_names) {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(0xB0, 0x60, 0x00),
+                                "unknown channel",
+                            );
                         }
-                    });
+                        r
+                    })
+                    .inner;
 
-                if !input_is_valid(&row.inputs[slot], channel_names) {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(0xB0, 0x60, 0x00),
-                        "unknown channel",
-                    );
+                let row = state.staged.get_mut(id).unwrap();
+                if resp.has_focus() && !input_is_valid(&row.inputs[slot], channel_names) {
+                    for name in
+                        fuzzy_rank(&row.inputs[slot], channel_names).into_iter().take(8)
+                    {
+                        if ui.selectable_label(false, name).clicked() {
+                            row.inputs[slot] = name.clone();
+                        }
+                    }
                 }
             });
         }
