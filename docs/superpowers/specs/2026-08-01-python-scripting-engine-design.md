@@ -151,6 +151,15 @@ can align channels itself):
 - **`vals`** — `UniTuple(float64[:], N)`. `vals[i]` is input `i`'s values.
   Int/bool channels are widened to `float64`, matching what panels get.
 
+`vals` is a **tuple of `N` separate 1D arrays, not a 2D array** — `vals[i]` is a
+full array, indexed by input position. Each input has its own rate and window
+fill, so `vals[0]` and `vals[1]` may differ in length (and `ts[i]` matches
+`vals[i]`). That raggedness is why it is a tuple: a 2D array cannot hold rows of
+different lengths. When inputs *are* co-sampled (equal length, e.g. `x`/`y`/`z`
+from one message) a script can stack them itself — `np.stack((vals[0], vals[1],
+vals[2]))` — to get a true 2D array for matrix math; the engine just never
+assumes it.
+
 Each input carries its **own** timestamps — there is no shared time base and the
 engine performs no alignment. Combining channels at different rates is the
 script's job (`np.interp`, decimation, etc.). This is deliberate: resampling is
