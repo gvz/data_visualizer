@@ -378,35 +378,32 @@ fn draw_editor(
 
         for (slot, (k, label)) in slot_keys.iter().zip(slot_labels.iter()).enumerate() {
             ui.push_id(k, |ui| {
-                // Type directly into the input field. A ComboBox popup can't hold
-                // a text field — the field takes focus and egui dismisses the
-                // popup as you type — so we render fuzzy suggestions inline
-                // instead, only while the field is focused and its text is not
-                // yet an exact channel name.
-                let resp = ui
-                    .horizontal(|ui| {
-                        ui.label(format!("{label}:"));
-                        let row = state.staged.get_mut(id).unwrap();
-                        let r = ui.add(
-                            egui::TextEdit::singleline(&mut row.inputs[slot])
-                                .hint_text("type to search channels")
-                                .desired_width(180.0),
+                // Type directly into the input field (a ComboBox popup can't hold
+                // a text field — it dismisses itself as you type).
+                ui.horizontal(|ui| {
+                    ui.label(format!("{label}:"));
+                    let row = state.staged.get_mut(id).unwrap();
+                    ui.add(
+                        egui::TextEdit::singleline(&mut row.inputs[slot])
+                            .hint_text("type to search channels")
+                            .desired_width(180.0),
+                    );
+                    if !input_is_valid(&row.inputs[slot], channel_names) {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0xB0, 0x60, 0x00),
+                            "unknown channel",
                         );
-                        if !input_is_valid(&row.inputs[slot], channel_names) {
-                            ui.colored_label(
-                                egui::Color32::from_rgb(0xB0, 0x60, 0x00),
-                                "unknown channel",
-                            );
-                        }
-                        r
-                    })
-                    .inner;
+                    }
+                });
 
+                // Fuzzy suggestions whenever the field holds a partial/unknown
+                // entry. NOT gated on focus: egui surrenders the text field's
+                // focus on the same frame a suggestion is clicked, so a focus
+                // gate would hide the list before the click could register.
                 let row = state.staged.get_mut(id).unwrap();
-                if resp.has_focus() && !input_is_valid(&row.inputs[slot], channel_names) {
-                    for name in
-                        fuzzy_rank(&row.inputs[slot], channel_names).into_iter().take(8)
-                    {
+                if !row.inputs[slot].is_empty() && !input_is_valid(&row.inputs[slot], channel_names)
+                {
+                    for name in fuzzy_rank(&row.inputs[slot], channel_names).into_iter().take(8) {
                         if ui.selectable_label(false, name).clicked() {
                             row.inputs[slot] = name.clone();
                         }
