@@ -169,8 +169,8 @@ pub fn draw_script_panel(
 ) {
     ui.horizontal(|ui| {
         ui.heading("Scripts");
-        // Opens the window on all instances + the add-instance form.
-        if ui.small_button("settings…").clicked() {
+        // Opens the window on the add-instance form.
+        if ui.small_button("＋ add").clicked() {
             state.editing = None;
             state.settings_open = true;
         }
@@ -182,7 +182,7 @@ pub fn draw_script_panel(
     }
 
     if instances.is_empty() {
-        ui.small("no instances — open settings to add one");
+        ui.small("no instances — click ＋ add to create one");
         return;
     }
 
@@ -304,11 +304,11 @@ fn draw_editor(
         }
     }
 
+    // Render only the focused instance; the add view (focus = None) shows just
+    // the add-instance form below, not the instance list.
     for id in &render_ids {
-        if let Some(f) = focus {
-            if id != f {
-                continue;
-            }
+        if focus != Some(id.as_str()) {
+            continue;
         }
         let Some(row) = state.staged.get_mut(id) else { continue };
 
@@ -513,7 +513,11 @@ fn draw_editor(
                 outputs,
                 enabled: true,
             };
-            state.staged.insert(state.new_id.clone(), staged);
+            let new_id = state.new_id.clone();
+            state.staged.insert(new_id.clone(), staged);
+            // Focus the window on the instance we just created so its inputs and
+            // outputs can be edited straight away.
+            state.editing = Some(new_id);
             state.new_id.clear();
             state.new_script.clear();
         }
