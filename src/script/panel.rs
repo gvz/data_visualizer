@@ -101,13 +101,37 @@ fn type_str(st: SampleType) -> &'static str {
     }
 }
 
-/// Seed a `StagedInstance` from a committed `ScriptInstance`.
-fn staged_from_instance(inst: &ScriptInstance) -> StagedInstance {
+/// The script's default outputs as editable `OutputBinding`s (names kept as
+/// their raw templates).
+fn default_outputs(meta: &ScriptMeta) -> Vec<OutputBinding> {
+    meta.outputs
+        .iter()
+        .map(|o| OutputBinding {
+            name: o.name.clone(),
+            ty: type_str(o.sample_type).to_string(),
+            unit: o.unit.clone(),
+        })
+        .collect()
+}
+
+/// Seed a `StagedInstance` from a committed `ScriptInstance`. Instances that
+/// omit `inputs`/`outputs` in config rely on the script's declared defaults —
+/// materialize those from the peeked `meta` (when known) so they are visible
+/// and editable rather than showing as empty.
+fn staged_from_instance(inst: &ScriptInstance, meta: Option<&ScriptMeta>) -> StagedInstance {
+    let inputs = inst
+        .inputs
+        .clone()
+        .unwrap_or_else(|| meta.map(|m| m.inputs.clone()).unwrap_or_default());
+    let outputs = inst
+        .outputs
+        .clone()
+        .unwrap_or_else(|| meta.map(default_outputs).unwrap_or_default());
     StagedInstance {
         id: inst.id.clone(),
         script: inst.script.clone(),
-        inputs: inst.inputs.clone().unwrap_or_default(),
-        outputs: inst.outputs.clone().unwrap_or_default(),
+        inputs,
+        outputs,
         enabled: inst.enabled,
     }
 }
@@ -147,9 +171,24 @@ pub fn draw_script_panel(
 
     let states = status.lock().unwrap().clone();
 
-    // Ensure every committed instance has a staged row.
+    // Ensure every committed instance has a staged row, materializing default
+    // inputs/outputs from the script meta so they are visible/editable.
     for inst in instances {
-        state.staged.entry(inst.id.clone()).or_insert_with(|| staged_from_instance(inst));
+        let meta = metas.get(&inst.script);
+        let row = state
+            .staged
+            .entry(inst.id.clone())
+            .or_insert_with(|| staged_from_instance(inst, meta));
+        // The engine peeks metas asynchronously; if it arrived after this row
+        // was first seeded, backfill the defaults the instance relies on.
+        if let Some(meta) = meta {
+            if inst.outputs.is_none() && row.outputs.is_empty() {
+                row.outputs = default_outputs(meta);
+            }
+            if inst.inputs.is_none() && row.inputs.iter().all(|s| s.is_empty()) {
+                row.inputs = meta.inputs.clone();
+            }
+        }
     }
 
     // Render committed instances (config order) followed by any staged-only
@@ -444,6 +483,52 @@ mod tests {
             outputs: Vec::new(),
             enabled: true,
         }
+    }
+
+    #[test]
+    fn staged_from_instance_materializes_script_defaults() {
+        use crate::script::types::OutputSpec;
+        // Committed instance omits inputs and outputs -> relies on script defaults.
+        let inst = ScriptInstance {
+            id: "rms".into(),
+            script: "sine_rms".into(),
+            inputs: None,
+            outputs: None,
+            enabled: true,
+        };
+        let meta = ScriptMeta {
+            inputs: vec!["load/ch0".into()],
+            outputs: vec![OutputSpec {
+                name: "scripts.{in0.stem}_rms".into(),
+                sample_type: SampleType::Float,
+                unit: "g".into(),
+            }],
+        };
+        let staged = staged_from_instance(&inst, Some(&meta));
+        assert_eq!(staged.inputs, vec!["load/ch0".to_string()]);
+        assert_eq!(staged.outputs.len(), 1);
+        assert_eq!(staged.outputs[0].name, "scripts.{in0.stem}_rms"); // template kept
+        assert_eq!(staged.outputs[0].ty, "float");
+        assert_eq!(staged.outputs[0].unit, "g");
+    }
+
+    #[test]
+    fn staged_from_instance_keeps_explicit_bindings_over_defaults() {
+        let inst = ScriptInstance {
+            id: "x".into(),
+            script: "s".into(),
+            inputs: Some(vec!["a/b".into()]),
+            outputs: Some(vec![OutputBinding {
+                name: "explicit".into(),
+                ty: "int".into(),
+                unit: String::new(),
+            }]),
+            enabled: true,
+        };
+        let meta = ScriptMeta { inputs: vec!["default".into()], outputs: vec![] };
+        let staged = staged_from_instance(&inst, Some(&meta));
+        assert_eq!(staged.inputs, vec!["a/b".to_string()]);
+        assert_eq!(staged.outputs[0].name, "explicit");
     }
 
     #[test]
