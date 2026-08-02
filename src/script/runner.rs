@@ -17,8 +17,9 @@ pub struct ScriptRunner {
     name: String,
     meta: ScriptMeta,
     compiled: Box<dyn CompiledScript>,
-    /// Output channel ids, aligned to `meta.outputs`.
-    output_ids: Vec<ChannelId>,
+    /// Output channel ids, aligned to `meta.outputs`; `None` until the output
+    /// is registered, which happens lazily on its first written sample.
+    output_ids: Vec<Option<ChannelId>>,
     /// Input channel ids, aligned to `meta.inputs`; `None` until resolved.
     input_ids: Vec<Option<ChannelId>>,
     /// Last timestamp written per output, aligned to `meta.outputs`.
@@ -55,25 +56,20 @@ fn cast_to(sample_type: SampleType, v: f64) -> NumericVal {
 }
 
 impl ScriptRunner {
-    /// Register each declared output as a runtime channel (same lockstep append
-    /// the MQTT drop path uses) and build the runner. Callers must have already
-    /// run `validate_meta` so output names are unique and collision-free.
+    /// Build the runner. Output channels are NOT registered here — each is
+    /// registered lazily on its first written sample (see [`Self::tick`]) so a
+    /// script's output channel only appears once it has produced a value. The
+    /// engine still reserves the output names in `owned_outputs` at build time,
+    /// so collisions are caught before any tick. `store`/`registry` are unused
+    /// now but kept in the signature for call-site stability.
     pub fn new(
         name: String,
         meta: ScriptMeta,
         compiled: Box<dyn CompiledScript>,
-        store: &dyn ChannelStore,
-        registry: &ChannelRegistry,
+        _store: &dyn ChannelStore,
+        _registry: &ChannelRegistry,
     ) -> Self {
-        let mut output_ids = Vec::with_capacity(meta.outputs.len());
-        for out in &meta.outputs {
-            let is_new = registry.id(&out.name).is_none();
-            let id = registry.add_dynamic(&out.name, &out.name, out.sample_type);
-            if is_new {
-                store.add_channel(registry.meta(id).clone());
-            }
-            output_ids.push(id);
-        }
+        let output_ids = vec![None; meta.outputs.len()];
         let input_ids = vec![None; meta.inputs.len()];
         let last_written = vec![i64::MIN; meta.outputs.len()];
         Self { name, meta, compiled, output_ids, input_ids, last_written, state: ScriptState::Healthy }
@@ -143,7 +139,25 @@ impl ScriptRunner {
                         ));
                         return;
                     }
-                    let id = self.output_ids[i];
+                    if batch.ts.is_empty() {
+                        continue; // nothing to publish; don't register the channel yet
+                    }
+                    // Register the output channel lazily, on its first sample, so
+                    // it only appears in the tree once it has a value (same
+                    // lockstep append the MQTT drop path uses).
+                    let id = match self.output_ids[i] {
+                        Some(id) => id,
+                        None => {
+                            let out = &self.meta.outputs[i];
+                            let is_new = registry.id(&out.name).is_none();
+                            let cid = registry.add_dynamic(&out.name, &out.name, out.sample_type);
+                            if is_new {
+                                store.add_channel(registry.meta(cid).clone());
+                            }
+                            self.output_ids[i] = Some(cid);
+                            cid
+                        }
+                    };
                     let sty = self.meta.outputs[i].sample_type;
                     for (&t, &v) in batch.ts.iter().zip(&batch.vals) {
                         if t > self.last_written[i] {
@@ -233,13 +247,13 @@ mod tests {
             Ok(vec![OutputBatch { ts: w.ts.clone(), vals: w.vals.clone() }])
         }));
         let mut runner = ScriptRunner::new("id".into(), meta, compiled, &store, &reg);
-        let out_id = reg.id("o").unwrap();
 
         store.write_numeric(in_id, 1, NumericVal::Float(1.0));
-        runner.tick(&store, &reg, ALL); // writes ts=1
+        runner.tick(&store, &reg, ALL); // writes ts=1 (registers "o" lazily here)
         store.write_numeric(in_id, 2, NumericVal::Float(2.0));
         runner.tick(&store, &reg, ALL); // window is {1,2}; only ts=2 is new
 
+        let out_id = reg.id("o").unwrap(); // registered by the first tick's write
         match store.snapshot(out_id, ALL) {
             ChannelSnapshot::Float { ts, .. } => assert_eq!(ts, vec![1, 2]),
             other => panic!("wrong variant: {other:?}"),

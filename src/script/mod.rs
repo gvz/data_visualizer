@@ -174,17 +174,26 @@ impl ScriptEngine {
 
         let meta = ScriptMeta { inputs, outputs };
 
-        // Collision check: a name that exists in the registry is a real clash
-        // ONLY if it is not one of this same id's already-registered outputs.
-        // A rebuild (enable→disable→enable, or edit-then-apply) must be able to
-        // reuse the channels it already registered. Names owned by *other*
-        // instances are still registry entries, so they correctly collide.
+        // Collision check. Output channels are now registered lazily (on their
+        // first written sample), so the registry alone can't detect a clash with
+        // another instance whose output hasn't been written yet. Reserve names
+        // in `owned_outputs` at build time and treat a name as taken if either
+        // another instance owns it, or it is an existing registry channel that
+        // is not one of this same id's own outputs (a rebuild reuses those).
         let mut owned = self.owned_outputs.lock().unwrap();
         let owned_by_self: std::collections::HashSet<&str> = owned
             .get(&inst.id)
             .map(|v| v.iter().map(String::as_str).collect())
             .unwrap_or_default();
-        let exists = |n: &str| self.registry.id(n).is_some() && !owned_by_self.contains(n);
+        let owned_by_others: std::collections::HashSet<&str> = owned
+            .iter()
+            .filter(|(k, _)| k.as_str() != inst.id)
+            .flat_map(|(_, v)| v.iter().map(String::as_str))
+            .collect();
+        let exists = |n: &str| {
+            owned_by_others.contains(n)
+                || (self.registry.id(n).is_some() && !owned_by_self.contains(n))
+        };
         validate_meta(&meta, exists).map_err(&fail)?;
         owned.insert(inst.id.clone(), meta.outputs.iter().map(|o| o.name.clone()).collect());
         drop(owned);
@@ -501,9 +510,17 @@ mod tests {
             reg.clone(),
             Box::new(|| Ok(())),
         );
-        let runner = engine.build_runner(&instance("first", "dbl", Some(vec!["in.b"])), store.as_ref()).unwrap();
-        assert_eq!(runner.name(), "first");                 // keyed by id, not stem
-        assert!(reg.id("in.b.double").is_some());           // {in0}.double expanded from in.b
+        let mut runner = engine
+            .build_runner(&instance("first", "dbl", Some(vec!["in.b"])), store.as_ref())
+            .unwrap();
+        assert_eq!(runner.name(), "first"); // keyed by id, not stem
+        // {in0}.double expands from in.b and is reserved in ownership at build
+        // time, but the channel is registered lazily — only after a tick writes.
+        assert!(engine.owned_outputs.lock().unwrap()["first"].iter().any(|n| n == "in.b.double"));
+        assert!(reg.id("in.b.double").is_none()); // not registered until first value
+        store.write_numeric(reg.id("in.b").unwrap(), store.now_ns(), NumericVal::Float(2.0));
+        runner.tick(store.as_ref(), &reg, TimeWindow::last(10_000_000_000, store.now_ns()));
+        assert!(reg.id("in.b.double").is_some()); // appears after the first written value
     }
 
     #[test]
@@ -556,9 +573,9 @@ mod tests {
             Box::new(|| Ok(())),
         );
         let inst = instance("first", "dbl", Some(vec!["in.a"]));
-        // First build registers in.a.double and records ownership under "first".
+        // First build reserves in.a.double under "first" (registration is lazy).
         assert!(engine.build_runner(&inst, store.as_ref()).is_ok());
-        assert!(reg.id("in.a.double").is_some());
+        assert!(engine.owned_outputs.lock().unwrap()["first"].iter().any(|n| n == "in.a.double"));
         // Rebuilding the same id + inputs must NOT report a spurious collision.
         assert!(engine.build_runner(&inst, store.as_ref()).is_ok());
     }
@@ -585,8 +602,10 @@ mod tests {
         );
         engine.build_runner(&instance("a", "dbl", Some(vec!["in.a"])), store.as_ref()).unwrap();
         engine.build_runner(&instance("b", "dbl", Some(vec!["in.b"])), store.as_ref()).unwrap();
-        assert!(reg.id("in.a.double").is_some());
-        assert!(reg.id("in.b.double").is_some());
+        // Distinct output names, reserved per instance (registered lazily on tick).
+        let owned = engine.owned_outputs.lock().unwrap();
+        assert!(owned["a"].iter().any(|n| n == "in.a.double"));
+        assert!(owned["b"].iter().any(|n| n == "in.b.double"));
     }
 
     fn loop_until<T>(mut f: impl FnMut() -> Option<T>, ms: u64) -> T {
