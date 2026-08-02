@@ -201,7 +201,12 @@ pub fn draw_script_panel(
         ui.separator();
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(&row.id).strong());
-            ui.checkbox(&mut row.enabled, "enabled");
+            // Enable/disable takes effect immediately, no Apply needed: a
+            // disable stops the runner (its output channel stops updating); an
+            // enable rebuilds it.
+            if ui.checkbox(&mut row.enabled, "enabled").changed() {
+                cmds.push(PanelCommand::Upsert(row.to_instance()));
+            }
         });
 
         // Script selector
