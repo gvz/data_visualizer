@@ -733,9 +733,19 @@ impl DataVisApp {
 
                 ui.separator();
                 {
-                    // Mirror the channel tree's set: registry channels plus any
-                    // discovered-but-unregistered MQTT topics (same merge the
-                    // tree does), so the picker searches everything the tree shows.
+                    let disabled = self.script_disabled.lock().unwrap().clone();
+                    // Compact sidebar list (names + status); editing is in a window.
+                    crate::script::panel::draw_script_panel(
+                        ui,
+                        &mut self.script_panel_state,
+                        &self.script_instances,
+                        &self.script_status,
+                        &disabled,
+                    );
+
+                    // Full editor lives in a floating settings window. Mirror the
+                    // channel tree's set: registry channels plus discovered-but-
+                    // unregistered MQTT topics, so the picker searches all of it.
                     let mut channel_names: Vec<String> =
                         self.channels.iter_ids().map(|id| self.channels.meta(id).name.clone()).collect();
                     for topic in self.mqtt_snapshot.keys() {
@@ -744,9 +754,9 @@ impl DataVisApp {
                         }
                     }
                     let metas = self.script_metas.lock().unwrap().clone();
-                    let disabled = self.script_disabled.lock().unwrap().clone();
-                    let cmds = crate::script::panel::draw_script_panel(
-                        ui,
+                    let ctx = ui.ctx().clone();
+                    let cmds = crate::script::panel::draw_script_settings(
+                        &ctx,
                         &mut self.script_panel_state,
                         &self.script_instances,
                         &metas,

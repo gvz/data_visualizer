@@ -45,6 +45,8 @@ pub struct ScriptPanelState {
     pub staged: HashMap<String, StagedInstance>,
     pub new_id: String,
     pub new_script: String,
+    /// Whether the floating settings/editor window is open.
+    pub settings_open: bool,
 }
 
 /// Case-insensitive subsequence match; ranks tighter match spans first. Empty
@@ -152,8 +154,54 @@ fn render_order(
     ids
 }
 
+/// Compact sidebar list: instance names + status plus a button that opens the
+/// settings window. All editing lives in that window (see
+/// [`draw_script_settings`]) so the sidebar stays small.
 pub fn draw_script_panel(
     ui: &mut egui::Ui,
+    state: &mut ScriptPanelState,
+    instances: &[ScriptInstance],
+    status: &SharedStatus,
+    disabled: &Option<String>,
+) {
+    ui.horizontal(|ui| {
+        ui.heading("Scripts");
+        if ui.small_button("settings…").clicked() {
+            state.settings_open = true;
+        }
+    });
+
+    if let Some(reason) = disabled {
+        ui.colored_label(egui::Color32::from_rgb(0xB0, 0x60, 0x00), reason);
+        return;
+    }
+
+    if instances.is_empty() {
+        ui.small("no instances — open settings to add one");
+        return;
+    }
+
+    let states = status.lock().unwrap().clone();
+    for inst in instances {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(&inst.id).strong());
+            match states.iter().find(|s| s.name == inst.id) {
+                Some(s) => {
+                    ui.small(status_line(s));
+                }
+                None => {
+                    ui.small(if inst.enabled { "  ○ …" } else { "  ⏻ off" });
+                }
+            }
+        });
+    }
+}
+
+/// Floating settings window holding the full instance editor (script, inputs,
+/// outputs, enable, add, save). Returns any committed commands. Shown only
+/// while `state.settings_open`.
+pub fn draw_script_settings(
+    ctx: &egui::Context,
     state: &mut ScriptPanelState,
     instances: &[ScriptInstance],
     metas: &HashMap<String, ScriptMeta>,
@@ -162,13 +210,37 @@ pub fn draw_script_panel(
     disabled: &Option<String>,
 ) -> Vec<PanelCommand> {
     let mut cmds = Vec::new();
-    ui.heading("Scripts");
-
-    if let Some(reason) = disabled {
-        ui.colored_label(egui::Color32::from_rgb(0xB0, 0x60, 0x00), reason);
+    if !state.settings_open {
         return cmds;
     }
+    let mut open = state.settings_open;
+    egui::Window::new("Script settings")
+        .open(&mut open)
+        .resizable(true)
+        .default_width(460.0)
+        .show(ctx, |ui| {
+            if let Some(reason) = disabled {
+                ui.colored_label(egui::Color32::from_rgb(0xB0, 0x60, 0x00), reason);
+                return;
+            }
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                draw_editor(ui, state, instances, metas, channel_names, status, &mut cmds);
+            });
+        });
+    state.settings_open = open;
+    cmds
+}
 
+/// The instance editor body, rendered inside the settings window.
+fn draw_editor(
+    ui: &mut egui::Ui,
+    state: &mut ScriptPanelState,
+    instances: &[ScriptInstance],
+    metas: &HashMap<String, ScriptMeta>,
+    channel_names: &[String],
+    status: &SharedStatus,
+    cmds: &mut Vec<PanelCommand>,
+) {
     let states = status.lock().unwrap().clone();
 
     // Ensure every committed instance has a staged row, materializing default
@@ -408,8 +480,6 @@ pub fn draw_script_panel(
     if ui.button("Save to config").clicked() {
         cmds.push(PanelCommand::SaveConfig);
     }
-
-    cmds
 }
 
 fn status_line(s: &ScriptStatus) -> String {
