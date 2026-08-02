@@ -13,7 +13,6 @@ use crate::types::SampleType;
 pub enum PanelCommand {
     Upsert(ScriptInstance),
     Remove(String),
-    SaveConfig,
 }
 
 /// A row being edited in the panel before Apply commits it.
@@ -521,11 +520,6 @@ fn draw_editor(
             state.new_id.clear();
             state.new_script.clear();
         }
-    }
-
-    ui.separator();
-    if ui.button("Save to config").clicked() {
-        cmds.push(PanelCommand::SaveConfig);
     }
 }
 

@@ -287,7 +287,11 @@ impl DataVisApp {
     }
 
     fn save_layout(&mut self) {
-        self.status = match self.current_layout().save(&self.layout_path) {
+        // Saving the layout also persists the script instances into the same
+        // file — they share config.toml and there is no separate save action.
+        let result =
+            self.current_layout().save(&self.layout_path).and_then(|()| self.save_scripts());
+        self.status = match result {
             Ok(()) => format!("layout saved to {}", self.layout_path.display()),
             Err(e) => format!("layout save failed: {e}"),
         };
@@ -786,21 +790,18 @@ impl DataVisApp {
                 self.script_instances.retain(|i| i.id != id);
                 let _ = self.script_commands.send(ScriptCommand::Remove(id));
             }
-            PanelCommand::SaveConfig => self.persist_scripts(),
         }
     }
 
-    /// Write the current script instances back to config.toml, preserving the
-    /// dir and window_s already on disk.
-    fn persist_scripts(&mut self) {
+    /// Write the current script instances into config.toml, preserving every
+    /// other section. Called as part of [`Self::save_layout`] — there is no
+    /// separate scripts-save action.
+    fn save_scripts(&self) -> anyhow::Result<()> {
         let existing = std::fs::read_to_string(&self.layout_path).unwrap_or_default();
-        let mut cfg = crate::script::config::ScriptsConfig::from_toml_str(&existing).unwrap_or_default();
+        let mut cfg =
+            crate::script::config::ScriptsConfig::from_toml_str(&existing).unwrap_or_default();
         cfg.instances = self.script_instances.clone();
-        self.status = match cfg.save(&self.layout_path) {
-            Ok(()) => "scripts saved".to_string(),
-            Err(e) => format!("scripts save failed: {e}"),
-        };
-        self.status_clear_at = Some(Instant::now() + Duration::from_secs(2));
+        cfg.save(&self.layout_path)
     }
 
     fn add_panel_window(&mut self, ctx: &egui::Context) {
@@ -1020,7 +1021,7 @@ impl eframe::App for DataVisApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        let _ = self.current_layout().save(&self.layout_path);
+        let _ = self.current_layout().save(&self.layout_path).and_then(|()| self.save_scripts());
     }
 }
 
