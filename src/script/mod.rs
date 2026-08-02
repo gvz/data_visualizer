@@ -159,7 +159,24 @@ impl ScriptEngine {
                 }
                 v
             }
-            None => loaded.meta.outputs.clone(),
+            None => {
+                // Default output names to the instance id (`id_N` when the
+                // script declares more than one output); types/units come from
+                // the script's declaration. Names remain overridable per
+                // instance via `inst.outputs`.
+                let n = loaded.meta.outputs.len();
+                loaded
+                    .meta
+                    .outputs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, o)| OutputSpec {
+                        name: if n == 1 { inst.id.clone() } else { format!("{}_{}", inst.id, i) },
+                        sample_type: o.sample_type,
+                        unit: o.unit.clone(),
+                    })
+                    .collect()
+            }
         };
 
         // Expand output-name templates against the resolved inputs.
@@ -445,8 +462,9 @@ mod tests {
         let handle = Box::new(engine).spawn(store.clone());
         assert_eq!(handle.name, "scripts");
 
-        // Give the loop a few ticks to load and run.
-        let out_id = loop_until(|| reg.id("in.a.double"), 2000);
+        // Give the loop a few ticks to load and run. The instance omits
+        // `outputs`, so its channel is named after the id ("dbl").
+        let out_id = loop_until(|| reg.id("dbl"), 2000);
         let deadline = std::time::Instant::now() + Duration::from_millis(2000);
         loop {
             if let ChannelSnapshot::Float { vals, .. } = store.snapshot(out_id, super::TimeWindow { start_ns: i64::MIN, end_ns: i64::MAX }) {
@@ -510,17 +528,48 @@ mod tests {
             reg.clone(),
             Box::new(|| Ok(())),
         );
-        let mut runner = engine
-            .build_runner(&instance("first", "dbl", Some(vec!["in.b"])), store.as_ref())
-            .unwrap();
+        // Explicit output with a template, bound to in.b via the input override.
+        let mut inst = instance("first", "dbl", Some(vec!["in.b"]));
+        inst.outputs = Some(vec![crate::script::config::OutputBinding {
+            name: "{in0.stem}.double".into(),
+            ty: "float".into(),
+            unit: String::new(),
+        }]);
+        let mut runner = engine.build_runner(&inst, store.as_ref()).unwrap();
         assert_eq!(runner.name(), "first"); // keyed by id, not stem
-        // {in0}.double expands from in.b and is reserved in ownership at build
-        // time, but the channel is registered lazily — only after a tick writes.
+        // {in0.stem} expands from the bound input (in.b) and is reserved in
+        // ownership at build time, but the channel is registered lazily — only
+        // after a tick writes.
         assert!(engine.owned_outputs.lock().unwrap()["first"].iter().any(|n| n == "in.b.double"));
         assert!(reg.id("in.b.double").is_none()); // not registered until first value
         store.write_numeric(reg.id("in.b").unwrap(), store.now_ns(), NumericVal::Float(2.0));
         runner.tick(store.as_ref(), &reg, TimeWindow::last(10_000_000_000, store.now_ns()));
         assert!(reg.id("in.b.double").is_some()); // appears after the first written value
+    }
+
+    #[test]
+    fn build_runner_defaults_output_name_to_instance_id() {
+        // An instance that omits `outputs` gets an output channel named after
+        // its id (registration still lazy).
+        let reg = Arc::new(
+            ChannelRegistry::from_toml_str(
+                "[channels.\"in.a\"]\ntype=\"float\"\nmax_rate=100\nhistory_s=1.0\n",
+            )
+            .unwrap(),
+        );
+        let store: Arc<dyn ChannelStore> = Arc::new(LiveStore::from_registry(&reg));
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("dbl.py"), "# fake").unwrap();
+        let engine = ScriptEngine::new(
+            dir.path().to_path_buf(),
+            vec![],
+            10.0,
+            Box::new(TemplateDoublerLoader),
+            reg,
+            Box::new(|| Ok(())),
+        );
+        engine.build_runner(&instance("myout", "dbl", Some(vec!["in.a"])), store.as_ref()).unwrap();
+        assert!(engine.owned_outputs.lock().unwrap()["myout"].iter().any(|n| n == "myout"));
     }
 
     #[test]
@@ -573,9 +622,9 @@ mod tests {
             Box::new(|| Ok(())),
         );
         let inst = instance("first", "dbl", Some(vec!["in.a"]));
-        // First build reserves in.a.double under "first" (registration is lazy).
+        // First build reserves the id-named output under "first" (lazy register).
         assert!(engine.build_runner(&inst, store.as_ref()).is_ok());
-        assert!(engine.owned_outputs.lock().unwrap()["first"].iter().any(|n| n == "in.a.double"));
+        assert!(engine.owned_outputs.lock().unwrap()["first"].iter().any(|n| n == "first"));
         // Rebuilding the same id + inputs must NOT report a spurious collision.
         assert!(engine.build_runner(&inst, store.as_ref()).is_ok());
     }
@@ -602,10 +651,10 @@ mod tests {
         );
         engine.build_runner(&instance("a", "dbl", Some(vec!["in.a"])), store.as_ref()).unwrap();
         engine.build_runner(&instance("b", "dbl", Some(vec!["in.b"])), store.as_ref()).unwrap();
-        // Distinct output names, reserved per instance (registered lazily on tick).
+        // Distinct id-named outputs, reserved per instance (registered lazily).
         let owned = engine.owned_outputs.lock().unwrap();
-        assert!(owned["a"].iter().any(|n| n == "in.a.double"));
-        assert!(owned["b"].iter().any(|n| n == "in.b.double"));
+        assert!(owned["a"].iter().any(|n| n == "a"));
+        assert!(owned["b"].iter().any(|n| n == "b"));
     }
 
     fn loop_until<T>(mut f: impl FnMut() -> Option<T>, ms: u64) -> T {

@@ -105,13 +105,16 @@ fn type_str(st: SampleType) -> &'static str {
     }
 }
 
-/// The script's default outputs as editable `OutputBinding`s (names kept as
-/// their raw templates).
-fn default_outputs(meta: &ScriptMeta) -> Vec<OutputBinding> {
+/// The default output bindings for an instance: the channel name defaults to
+/// the instance `id` (`id_N` when the script declares more than one output),
+/// with types/units taken from the script. Editable afterwards.
+fn default_outputs(id: &str, meta: &ScriptMeta) -> Vec<OutputBinding> {
+    let n = meta.outputs.len();
     meta.outputs
         .iter()
-        .map(|o| OutputBinding {
-            name: o.name.clone(),
+        .enumerate()
+        .map(|(i, o)| OutputBinding {
+            name: if n == 1 { id.to_string() } else { format!("{id}_{i}") },
             ty: type_str(o.sample_type).to_string(),
             unit: o.unit.clone(),
         })
@@ -130,7 +133,7 @@ fn staged_from_instance(inst: &ScriptInstance, meta: Option<&ScriptMeta>) -> Sta
     let outputs = inst
         .outputs
         .clone()
-        .unwrap_or_else(|| meta.map(default_outputs).unwrap_or_default());
+        .unwrap_or_else(|| meta.map(|m| default_outputs(&inst.id, m)).unwrap_or_default());
     StagedInstance {
         id: inst.id.clone(),
         script: inst.script.clone(),
@@ -283,7 +286,7 @@ fn draw_editor(
         // was first seeded, backfill the defaults the instance relies on.
         if let Some(meta) = meta {
             if inst.outputs.is_none() && row.outputs.is_empty() {
-                row.outputs = default_outputs(meta);
+                row.outputs = default_outputs(&inst.id, meta);
             }
             if inst.inputs.is_none() && row.inputs.iter().all(|s| s.is_empty()) {
                 row.inputs = meta.inputs.clone();
@@ -334,20 +337,11 @@ fn draw_editor(
                     for key in &script_keys {
                         if ui.selectable_label(&row.script == key, key).clicked() {
                             row.script = key.clone();
-                            // Prefill outputs when script changes.
+                            // Prefill outputs (named after the id) when the
+                            // script changes, and resize inputs to its arity.
                             if let Some(meta) = metas.get(key) {
-                                row.outputs = meta
-                                    .outputs
-                                    .iter()
-                                    .map(|o| OutputBinding {
-                                        name: o.name.clone(),
-                                        ty: type_str(o.sample_type).to_string(),
-                                        unit: o.unit.clone(),
-                                    })
-                                    .collect();
-                                // Resize inputs to match new slot count.
-                                let n = meta.inputs.len();
-                                row.inputs.resize(n, String::new());
+                                row.outputs = default_outputs(id, meta);
+                                row.inputs.resize(meta.inputs.len(), String::new());
                             }
                         }
                     }
@@ -489,16 +483,7 @@ fn draw_editor(
         if ui.add_enabled(can_add, egui::Button::new("Add")).clicked() {
             let outputs = metas
                 .get(&state.new_script)
-                .map(|m| {
-                    m.outputs
-                        .iter()
-                        .map(|o| OutputBinding {
-                            name: o.name.clone(),
-                            ty: type_str(o.sample_type).to_string(),
-                            unit: o.unit.clone(),
-                        })
-                        .collect::<Vec<_>>()
-                })
+                .map(|m| default_outputs(&state.new_id, m))
                 .unwrap_or_default();
             let input_count =
                 metas.get(&state.new_script).map(|m| m.inputs.len()).unwrap_or(0);
@@ -620,7 +605,9 @@ mod tests {
         let staged = staged_from_instance(&inst, Some(&meta));
         assert_eq!(staged.inputs, vec!["load/ch0".to_string()]);
         assert_eq!(staged.outputs.len(), 1);
-        assert_eq!(staged.outputs[0].name, "scripts.{in0.stem}_rms"); // template kept
+        // Single-output default is named after the instance id, not the script
+        // template; type/unit still come from the script.
+        assert_eq!(staged.outputs[0].name, "rms");
         assert_eq!(staged.outputs[0].ty, "float");
         assert_eq!(staged.outputs[0].unit, "g");
     }
