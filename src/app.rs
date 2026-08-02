@@ -733,8 +733,16 @@ impl DataVisApp {
 
                 ui.separator();
                 {
-                    let channel_names: Vec<String> =
+                    // Mirror the channel tree's set: registry channels plus any
+                    // discovered-but-unregistered MQTT topics (same merge the
+                    // tree does), so the picker searches everything the tree shows.
+                    let mut channel_names: Vec<String> =
                         self.channels.iter_ids().map(|id| self.channels.meta(id).name.clone()).collect();
+                    for topic in self.mqtt_snapshot.keys() {
+                        if !channel_names.iter().any(|n| n == topic) {
+                            channel_names.push(topic.clone());
+                        }
+                    }
                     let metas = self.script_metas.lock().unwrap().clone();
                     let disabled = self.script_disabled.lock().unwrap().clone();
                     let cmds = crate::script::panel::draw_script_panel(
