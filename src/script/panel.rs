@@ -47,6 +47,9 @@ pub struct ScriptPanelState {
     pub new_script: String,
     /// Whether the floating settings/editor window is open.
     pub settings_open: bool,
+    /// When `Some(id)`, the settings window edits only that instance; when
+    /// `None`, it shows every instance plus the add-instance form.
+    pub editing: Option<String>,
 }
 
 /// Case-insensitive subsequence match; ranks tighter match spans first. Empty
@@ -166,7 +169,9 @@ pub fn draw_script_panel(
 ) {
     ui.horizontal(|ui| {
         ui.heading("Scripts");
+        // Opens the window on all instances + the add-instance form.
         if ui.small_button("settings…").clicked() {
+            state.editing = None;
             state.settings_open = true;
         }
     });
@@ -184,6 +189,11 @@ pub fn draw_script_panel(
     let states = status.lock().unwrap().clone();
     for inst in instances {
         ui.horizontal(|ui| {
+            // Per-instance gear: opens the window focused on just this instance.
+            if ui.small_button("⚙").on_hover_text("settings").clicked() {
+                state.editing = Some(inst.id.clone());
+                state.settings_open = true;
+            }
             ui.label(egui::RichText::new(&inst.id).strong());
             match states.iter().find(|s| s.name == inst.id) {
                 Some(s) => {
@@ -214,7 +224,15 @@ pub fn draw_script_settings(
         return cmds;
     }
     let mut open = state.settings_open;
-    egui::Window::new("Script settings")
+    let focus = state.editing.clone();
+    let title = match &focus {
+        Some(id) => format!("Script settings — {id}"),
+        None => "Script settings".to_string(),
+    };
+    egui::Window::new(title)
+        // Stable id so the window keeps its position when the title changes
+        // between the all-instances and single-instance views.
+        .id(egui::Id::new("script_settings_window"))
         .open(&mut open)
         .resizable(true)
         .default_width(460.0)
@@ -224,14 +242,24 @@ pub fn draw_script_settings(
                 return;
             }
             egui::ScrollArea::vertical().show(ui, |ui| {
-                draw_editor(ui, state, instances, metas, channel_names, status, &mut cmds);
+                draw_editor(
+                    ui,
+                    state,
+                    instances,
+                    metas,
+                    channel_names,
+                    status,
+                    focus.as_deref(),
+                    &mut cmds,
+                );
             });
         });
     state.settings_open = open;
     cmds
 }
 
-/// The instance editor body, rendered inside the settings window.
+/// The instance editor body, rendered inside the settings window. When
+/// `focus` is `Some(id)`, only that instance is shown (no add-instance form).
 fn draw_editor(
     ui: &mut egui::Ui,
     state: &mut ScriptPanelState,
@@ -239,6 +267,7 @@ fn draw_editor(
     metas: &HashMap<String, ScriptMeta>,
     channel_names: &[String],
     status: &SharedStatus,
+    focus: Option<&str>,
     cmds: &mut Vec<PanelCommand>,
 ) {
     let states = status.lock().unwrap().clone();
@@ -267,7 +296,20 @@ fn draw_editor(
     // rows the user just added but hasn't applied yet.
     let instance_ids: Vec<String> = instances.iter().map(|i| i.id.clone()).collect();
     let render_ids = render_order(&instance_ids, &state.staged);
+
+    // When focused on one instance, show only it (and note if it's gone).
+    if let Some(f) = focus {
+        if !render_ids.iter().any(|id| id == f) {
+            ui.label("this instance no longer exists");
+        }
+    }
+
     for id in &render_ids {
+        if let Some(f) = focus {
+            if id != f {
+                continue;
+            }
+        }
         let Some(row) = state.staged.get_mut(id) else { continue };
 
         ui.separator();
@@ -419,61 +461,62 @@ fn draw_editor(
         }
     }
 
-    ui.separator();
-
-    // Add-instance form
-    ui.label("Add instance:");
-    ui.horizontal(|ui| {
-        ui.label("id:");
-        ui.text_edit_singleline(&mut state.new_id);
-        ui.label("script:");
-        let mut script_keys: Vec<String> = metas.keys().cloned().collect();
-        script_keys.sort();
-        egui::ComboBox::from_id_source("new_instance#script")
-            .selected_text(if state.new_script.is_empty() {
-                "<select>".to_string()
-            } else {
-                state.new_script.clone()
-            })
-            .show_ui(ui, |ui| {
-                for key in &script_keys {
-                    if ui.selectable_label(&state.new_script == key, key).clicked() {
-                        state.new_script = key.clone();
+    // The add-instance form only appears in the all-instances view.
+    if focus.is_none() {
+        ui.separator();
+        ui.label("Add instance:");
+        ui.horizontal(|ui| {
+            ui.label("id:");
+            ui.text_edit_singleline(&mut state.new_id);
+            ui.label("script:");
+            let mut script_keys: Vec<String> = metas.keys().cloned().collect();
+            script_keys.sort();
+            egui::ComboBox::from_id_source("new_instance#script")
+                .selected_text(if state.new_script.is_empty() {
+                    "<select>".to_string()
+                } else {
+                    state.new_script.clone()
+                })
+                .show_ui(ui, |ui| {
+                    for key in &script_keys {
+                        if ui.selectable_label(&state.new_script == key, key).clicked() {
+                            state.new_script = key.clone();
+                        }
                     }
-                }
-            });
-    });
+                });
+        });
 
-    let can_add = !state.new_id.is_empty()
-        && !state.new_script.is_empty()
-        && !instance_ids.contains(&state.new_id);
+        let can_add = !state.new_id.is_empty()
+            && !state.new_script.is_empty()
+            && !instance_ids.contains(&state.new_id);
 
-    if ui.add_enabled(can_add, egui::Button::new("Add")).clicked() {
-        let outputs = metas
-            .get(&state.new_script)
-            .map(|m| {
-                m.outputs
-                    .iter()
-                    .map(|o| OutputBinding {
-                        name: o.name.clone(),
-                        ty: type_str(o.sample_type).to_string(),
-                        unit: o.unit.clone(),
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let input_count =
-            metas.get(&state.new_script).map(|m| m.inputs.len()).unwrap_or(0);
-        let staged = StagedInstance {
-            id: state.new_id.clone(),
-            script: state.new_script.clone(),
-            inputs: vec![String::new(); input_count],
-            outputs,
-            enabled: true,
-        };
-        state.staged.insert(state.new_id.clone(), staged);
-        state.new_id.clear();
-        state.new_script.clear();
+        if ui.add_enabled(can_add, egui::Button::new("Add")).clicked() {
+            let outputs = metas
+                .get(&state.new_script)
+                .map(|m| {
+                    m.outputs
+                        .iter()
+                        .map(|o| OutputBinding {
+                            name: o.name.clone(),
+                            ty: type_str(o.sample_type).to_string(),
+                            unit: o.unit.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let input_count =
+                metas.get(&state.new_script).map(|m| m.inputs.len()).unwrap_or(0);
+            let staged = StagedInstance {
+                id: state.new_id.clone(),
+                script: state.new_script.clone(),
+                inputs: vec![String::new(); input_count],
+                outputs,
+                enabled: true,
+            };
+            state.staged.insert(state.new_id.clone(), staged);
+            state.new_id.clear();
+            state.new_script.clear();
+        }
     }
 
     ui.separator();
