@@ -2,6 +2,7 @@
 //! a fixed columnar Protobuf `Batch` off its stdout. See
 //! `docs/superpowers/specs/2026-08-03-proprietary-source-bridge-design.md`.
 
+pub mod config;
 pub mod frame;
 pub mod router;
 pub mod schema;
