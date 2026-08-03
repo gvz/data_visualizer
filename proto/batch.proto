@@ -1,0 +1,20 @@
+syntax = "proto3";
+package datavis.bridge;
+
+message Batch {
+  repeated Column cols = 1;
+}
+
+message Column {
+  string topic = 1;
+  repeated sfixed64 t_ns = 2;
+  oneof values {
+    DoubleCol doubles = 3;
+    Sint64Col ints = 4;
+    StringCol strings = 5;
+  }
+}
+
+message DoubleCol { repeated double   v = 1; }
+message Sint64Col { repeated sfixed64 v = 1; }
+message StringCol { repeated string   v = 1; }

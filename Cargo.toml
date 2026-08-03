@@ -28,6 +28,7 @@ egui-phosphor = "0.6"
 tungstenite = "0.21"
 pyo3 = { version = "0.22", features = ["auto-initialize"], optional = true }
 numpy = { version = "0.22", optional = true }
+prost = "0.13"
 
 # `scripting` is on by default. It pulls in PyO3/numpy, which require a Python
 # interpreter (python3 + python3-config) on PATH at build time — build inside
@@ -39,6 +40,11 @@ scripting = ["dep:pyo3", "dep:numpy"]
 
 [dev-dependencies]
 tempfile = "3"
+
+[build-dependencies]
+protox = "0.7"
+prost = "0.13"
+prost-build = "0.13"
 
 # Cargo subcommand binaries used for dependency hygiene. These are installed
 # tools, not library dependencies — install with:

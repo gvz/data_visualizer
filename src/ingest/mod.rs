@@ -6,6 +6,7 @@ use crate::config::ChannelRegistry;
 use crate::record::RecordMsg;
 use crate::store::ChannelStore;
 
+pub mod bridge;
 pub mod decode;
 pub mod lineproto;
 pub mod loader;
