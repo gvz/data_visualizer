@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::AtomicU8;
+use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crossbeam_channel::Sender;
@@ -74,6 +74,31 @@ pub struct SourceHandle {
     /// `None` for MQTT/WebSocket, which embed per-message schemas in
     /// [`RecordMsg::DynamicProto`](crate::record::RecordMsg).
     pub schema_bytes: Option<Vec<u8>>,
+    /// Present only for `SubprocessSource`: kills the child on shutdown. All
+    /// other sources set this to `None`.
+    pub child_guard: Option<ChildGuard>,
+}
+
+/// Kills a spawned child process when dropped. `SubprocessSource` puts one in
+/// its `SourceHandle`; because the app owns every handle for its lifetime, the
+/// child is killed when the app shuts down — a bridge never outlives datavis.
+pub struct ChildGuard {
+    /// Signals the reader/restart thread to stop respawning.
+    pub(crate) stop: Arc<AtomicBool>,
+    /// The currently-running child, if any, shared with the reader thread.
+    pub(crate) current: Arc<Mutex<Option<std::process::Child>>>,
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut guard) = self.current.lock() {
+            if let Some(mut child) = guard.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
 }
 
 /// Runtime topic discovery capability, present on MQTT-shaped sources.
@@ -128,6 +153,7 @@ mod tests {
             record_sender: Arc::new(Mutex::new(None)),
             discovery: Some(discovery),
             schema_bytes: None,
+            child_guard: None,
         };
         assert_eq!(h.name, "mqtt");
         assert!(h.discovery.is_some());

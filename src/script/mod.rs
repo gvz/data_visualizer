@@ -341,6 +341,7 @@ impl DataSource for ScriptEngine {
             record_sender,
             discovery: None,
             schema_bytes: None,
+            child_guard: None,
         }
     }
 }

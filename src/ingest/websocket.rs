@@ -70,6 +70,7 @@ impl DataSource for WsSource {
             record_sender,
             discovery: Some(Discovery { discovered, topic_map: self.topic_map }),
             schema_bytes: None,
+            child_guard: None,
         }
     }
 }

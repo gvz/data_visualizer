@@ -1085,6 +1085,7 @@ mod tests {
             record_sender: Arc::new(Mutex::new(None)),
             discovery: None,
             schema_bytes: None,
+            child_guard: None,
         };
         let h1 = make_handle("a");
         let h2 = make_handle("b");
@@ -1117,6 +1118,7 @@ mod tests {
                 topic_map: Arc::new(RwLock::new(std::collections::HashMap::new())),
             }),
             schema_bytes: None,
+            child_guard: None,
         };
         let zmq = SourceHandle {
             name: "zmq".into(),
@@ -1124,6 +1126,7 @@ mod tests {
             record_sender: Arc::new(Mutex::new(None)),
             discovery: None,
             schema_bytes: Some(vec![1, 2, 3]),
+            child_guard: None,
         };
         let d = DerivedIngest::from_handles(vec![mqtt, zmq]);
         assert_eq!(d.record_sender_slots.len(), 2);

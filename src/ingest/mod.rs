@@ -90,6 +90,7 @@ impl source::DataSource for ZmqSource {
             record_sender,
             discovery: None,
             schema_bytes: Some(self.schema_bytes),
+            child_guard: None,
         }
     }
 }

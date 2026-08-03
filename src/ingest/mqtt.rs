@@ -76,6 +76,7 @@ impl DataSource for MqttSource {
             record_sender,
             discovery: Some(Discovery { discovered, topic_map: self.topic_map }),
             schema_bytes: None,
+            child_guard: None,
         }
     }
 }

@@ -6,3 +6,7 @@ pub mod config;
 pub mod frame;
 pub mod router;
 pub mod schema;
+pub mod source;
+
+pub use config::BridgeConfig;
+pub use source::SubprocessSource;
