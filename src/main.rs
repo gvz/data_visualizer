@@ -78,6 +78,19 @@ fn main() -> anyhow::Result<()> {
         sources.push(Box::new(src).spawn(store.clone()));
     }
 
+    // External bridges: spawn each org-provided adapter declared in
+    // [[sources.bridge]]. datavis owns the child process lifecycle.
+    let config_text = std::fs::read_to_string(&layout_path).unwrap_or_default();
+    match datavis::ingest::bridge::BridgeConfig::list_from_toml_str(&config_text) {
+        Ok(bridges) => {
+            for bridge in bridges {
+                let src = datavis::ingest::bridge::SubprocessSource::new(bridge, channels.as_ref());
+                sources.push(Box::new(src).spawn(store.clone()));
+            }
+        }
+        Err(e) => eprintln!("config: ignoring malformed [[sources.bridge]]: {e}"),
+    }
+
     // Scripting engine: load the [scripts] section, discover *.py in its dir,
     // and spawn the numba-backed engine (disabled gracefully if numba is absent).
     let scripts_cfg = datavis::script::config::ScriptsConfig::from_toml_str(
