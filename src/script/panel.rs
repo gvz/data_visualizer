@@ -106,15 +106,15 @@ fn type_str(st: SampleType) -> &'static str {
 }
 
 /// The default output bindings for an instance: the channel name defaults to
-/// the instance `id` (`id_N` when the script declares more than one output),
-/// with types/units taken from the script. Editable afterwards.
+/// `scripts/<id>` (`scripts/<id>_N` when the script declares more than one
+/// output), with types/units taken from the script. Editable afterwards.
 fn default_outputs(id: &str, meta: &ScriptMeta) -> Vec<OutputBinding> {
     let n = meta.outputs.len();
     meta.outputs
         .iter()
         .enumerate()
         .map(|(i, o)| OutputBinding {
-            name: if n == 1 { id.to_string() } else { format!("{id}_{i}") },
+            name: if n == 1 { format!("scripts/{id}") } else { format!("scripts/{id}_{i}") },
             ty: type_str(o.sample_type).to_string(),
             unit: o.unit.clone(),
         })
@@ -605,9 +605,9 @@ mod tests {
         let staged = staged_from_instance(&inst, Some(&meta));
         assert_eq!(staged.inputs, vec!["load/ch0".to_string()]);
         assert_eq!(staged.outputs.len(), 1);
-        // Single-output default is named after the instance id, not the script
-        // template; type/unit still come from the script.
-        assert_eq!(staged.outputs[0].name, "rms");
+        // Single-output default is named scripts/<id>, not the script template;
+        // type/unit still come from the script.
+        assert_eq!(staged.outputs[0].name, "scripts/rms");
         assert_eq!(staged.outputs[0].ty, "float");
         assert_eq!(staged.outputs[0].unit, "g");
     }

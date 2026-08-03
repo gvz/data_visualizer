@@ -160,9 +160,9 @@ impl ScriptEngine {
                 v
             }
             None => {
-                // Default output names to the instance id (`id_N` when the
-                // script declares more than one output); types/units come from
-                // the script's declaration. Names remain overridable per
+                // Default output names to `scripts/<id>` (`scripts/<id>_N` when
+                // the script declares more than one output); types/units come
+                // from the script's declaration. Names remain overridable per
                 // instance via `inst.outputs`.
                 let n = loaded.meta.outputs.len();
                 loaded
@@ -171,7 +171,11 @@ impl ScriptEngine {
                     .iter()
                     .enumerate()
                     .map(|(i, o)| OutputSpec {
-                        name: if n == 1 { inst.id.clone() } else { format!("{}_{}", inst.id, i) },
+                        name: if n == 1 {
+                            format!("scripts/{}", inst.id)
+                        } else {
+                            format!("scripts/{}_{}", inst.id, i)
+                        },
                         sample_type: o.sample_type,
                         unit: o.unit.clone(),
                     })
@@ -463,8 +467,8 @@ mod tests {
         assert_eq!(handle.name, "scripts");
 
         // Give the loop a few ticks to load and run. The instance omits
-        // `outputs`, so its channel is named after the id ("dbl").
-        let out_id = loop_until(|| reg.id("dbl"), 2000);
+        // `outputs`, so its channel is named scripts/<id> ("scripts/dbl").
+        let out_id = loop_until(|| reg.id("scripts/dbl"), 2000);
         let deadline = std::time::Instant::now() + Duration::from_millis(2000);
         loop {
             if let ChannelSnapshot::Float { vals, .. } = store.snapshot(out_id, super::TimeWindow { start_ns: i64::MIN, end_ns: i64::MAX }) {
@@ -569,7 +573,7 @@ mod tests {
             Box::new(|| Ok(())),
         );
         engine.build_runner(&instance("myout", "dbl", Some(vec!["in.a"])), store.as_ref()).unwrap();
-        assert!(engine.owned_outputs.lock().unwrap()["myout"].iter().any(|n| n == "myout"));
+        assert!(engine.owned_outputs.lock().unwrap()["myout"].iter().any(|n| n == "scripts/myout"));
     }
 
     #[test]
@@ -624,7 +628,7 @@ mod tests {
         let inst = instance("first", "dbl", Some(vec!["in.a"]));
         // First build reserves the id-named output under "first" (lazy register).
         assert!(engine.build_runner(&inst, store.as_ref()).is_ok());
-        assert!(engine.owned_outputs.lock().unwrap()["first"].iter().any(|n| n == "first"));
+        assert!(engine.owned_outputs.lock().unwrap()["first"].iter().any(|n| n == "scripts/first"));
         // Rebuilding the same id + inputs must NOT report a spurious collision.
         assert!(engine.build_runner(&inst, store.as_ref()).is_ok());
     }
@@ -653,8 +657,8 @@ mod tests {
         engine.build_runner(&instance("b", "dbl", Some(vec!["in.b"])), store.as_ref()).unwrap();
         // Distinct id-named outputs, reserved per instance (registered lazily).
         let owned = engine.owned_outputs.lock().unwrap();
-        assert!(owned["a"].iter().any(|n| n == "a"));
-        assert!(owned["b"].iter().any(|n| n == "b"));
+        assert!(owned["a"].iter().any(|n| n == "scripts/a"));
+        assert!(owned["b"].iter().any(|n| n == "scripts/b"));
     }
 
     fn loop_until<T>(mut f: impl FnMut() -> Option<T>, ms: u64) -> T {
