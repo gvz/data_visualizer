@@ -135,6 +135,14 @@ fn run_loop(
             std::thread::spawn(move || log_stderr(name, stderr));
         }
         *current.lock().unwrap() = Some(child);
+        // Close the orphan window: if `ChildGuard::drop` fired between spawn and
+        // the store above, it set `stop` and found `current` empty (killing
+        // nothing). Re-check `stop` now that the child is stored — if drop
+        // already ran, reap the child ourselves so it never outlives datavis.
+        if stop.load(Ordering::Relaxed) {
+            reap(&current);
+            return;
+        }
 
         match read_stream(stdout, &router, store.as_ref(), &conn, &record_sender, &last_frame_ns, &topic) {
             StreamEnd::PermanentProtocol => {
