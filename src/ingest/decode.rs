@@ -104,7 +104,7 @@ fn write_value(binding: &ChannelBinding, ts: i64, val: &Value, store: &dyn Chann
 /// A sample's timestamp, falling back to UTC-now when the message carries none.
 /// Proto3 reports an unset scalar as `0`, so a non-positive value is treated as
 /// "no timestamp" and stamped with the current time rather than 1970.
-fn resolve_ts(ts: Option<i64>) -> i64 {
+pub(crate) fn resolve_ts(ts: Option<i64>) -> i64 {
     ts.filter(|&t| t > 0).unwrap_or_else(now_ns)
 }
 

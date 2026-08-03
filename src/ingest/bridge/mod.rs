@@ -3,4 +3,5 @@
 //! `docs/superpowers/specs/2026-08-03-proprietary-source-bridge-design.md`.
 
 pub mod frame;
+pub mod router;
 pub mod schema;
