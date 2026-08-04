@@ -13,7 +13,7 @@ use crate::viz::VizPanel;
 
 pub const TYPE_NAME: &str = "state_graph";
 
-const ACCEPTED: &[SampleType] = &[SampleType::Bool, SampleType::Int];
+const ACCEPTED: &[SampleType] = &[SampleType::Bool, SampleType::Int, SampleType::Text];
 
 const PALETTE: &[Color32] = &[
     Color32::from_rgb(0x4c, 0xaf, 0x50), // green
@@ -33,7 +33,14 @@ fn color_for(value: i64) -> Color32 {
 pub struct StateGraphPanel {
     bound: Binding,
     label: Option<String>,
+    /// Explicit code→label map from config, used for numeric (Int/Bool)
+    /// channels. Empty for Text channels — their labels are the strings.
     states: BTreeMap<i64, String>,
+    /// Runtime interning for Text channels: each distinct string is assigned a
+    /// stable code in first-seen order so it maps onto the integer coloring and
+    /// segment machinery. In-memory only; never serialized.
+    text_codes: BTreeMap<String, i64>,
+    text_labels: BTreeMap<i64, String>,
     /// Visible span in seconds; `None` follows the global default.
     time_window_s: Option<f64>,
     /// Active absolute-ns time window `[start, end]`. Set by the linked-zoom
@@ -61,6 +68,8 @@ pub fn ctor(
         bound: bind(&name, reg, ACCEPTED),
         label: opt_label(cfg),
         states,
+        text_codes: BTreeMap::new(),
+        text_labels: BTreeMap::new(),
         time_window_s: opt_f64_opt(cfg, "time_window_s"),
         zoom: None,
     }))
@@ -86,11 +95,17 @@ pub(crate) fn segments(ts: &[i64], vals: &[i64]) -> Vec<(i64, i64, i64)> {
 }
 
 impl StateGraphPanel {
-    fn label_for(&self, value: i64) -> String {
-        self.states
-            .get(&value)
-            .cloned()
-            .unwrap_or_else(|| value.to_string())
+    /// Map a Text value to a stable integer code, assigning the next code in
+    /// first-seen order on first sight. Codes persist for the panel's lifetime,
+    /// so a given string keeps its color and legend slot across renders.
+    fn intern(&mut self, s: &str) -> i64 {
+        if let Some(&code) = self.text_codes.get(s) {
+            return code;
+        }
+        let code = self.text_codes.len() as i64;
+        self.text_codes.insert(s.to_string(), code);
+        self.text_labels.insert(code, s.to_string());
+        code
     }
 }
 
@@ -141,13 +156,24 @@ impl VizPanel for StateGraphPanel {
         };
         let span = (end_ns - t0).max(1);
         let snap = store.snapshot(id, TimeWindow { start_ns: t0, end_ns: end_ns + 1 });
+        let mut text_mode = false;
         let (ts, vals): (Vec<i64>, Vec<i64>) = match &snap {
             ChannelSnapshot::Int { ts, vals } => (ts.clone(), vals.clone()),
             ChannelSnapshot::Bool { ts, vals } => {
                 (ts.clone(), vals.iter().map(|&v| v as i64).collect())
             }
+            ChannelSnapshot::Text { lines } => {
+                text_mode = true;
+                let ts = lines.iter().map(|(t, _)| *t).collect();
+                let vals = lines.iter().map(|(_, s)| self.intern(s)).collect();
+                (ts, vals)
+            }
             _ => return,
         };
+        // Text channels label segments with the interned strings; numeric
+        // channels use the explicit config `states` map.
+        let labels = if text_mode { &self.text_labels } else { &self.states };
+        let label_for = |v: i64| labels.get(&v).cloned().unwrap_or_else(|| v.to_string());
         let desired = egui::vec2(ui.available_width().max(80.0), 40.0);
         let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
         let painter = ui.painter();
@@ -167,7 +193,7 @@ impl VizPanel for StateGraphPanel {
                 painter.text(
                     seg.center(),
                     Align2::CENTER_CENTER,
-                    self.label_for(v),
+                    label_for(v),
                     FontId::proportional(12.0),
                     Color32::BLACK,
                 );
@@ -175,7 +201,7 @@ impl VizPanel for StateGraphPanel {
         }
         // Legend of known states.
         ui.horizontal_wrapped(|ui| {
-            for (v, label) in &self.states {
+            for (v, label) in labels {
                 let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
                 ui.painter().rect_filled(dot, 2.0, color_for(*v));
                 ui.label(label);
@@ -240,6 +266,12 @@ topic = "t"
 proto_path = "p"
 ts_path = "q"
 type = "bool"
+
+[channels."motor.log"]
+topic = "t"
+proto_path = "p"
+ts_path = "q"
+type = "text"
 "#,
         )
         .unwrap()
@@ -310,6 +342,65 @@ channel = "demo.enabled""#,
                 });
             });
         }
+    }
+
+    /// Bare panel bound to a channel, no config `states` map — for unit-testing
+    /// the interner directly (the trait object hides the concrete type).
+    fn panel_for(channel: &str, reg: &ChannelRegistry) -> StateGraphPanel {
+        StateGraphPanel {
+            bound: bind(channel, reg, ACCEPTED),
+            label: None,
+            states: BTreeMap::new(),
+            text_codes: BTreeMap::new(),
+            text_labels: BTreeMap::new(),
+            time_window_s: None,
+            zoom: None,
+        }
+    }
+
+    #[test]
+    fn text_channel_binds() {
+        let channels = registry();
+        let reg = PanelRegistry::with_builtins();
+        // ACCEPTED includes Text, so a text channel resolves rather than erroring.
+        let e: PanelEntry =
+            toml::from_str("type = \"state_graph\"\nchannel = \"motor.log\"").unwrap();
+        let p = reg.build(&e, &channels).unwrap();
+        assert_eq!(p.title(), "motor.log");
+    }
+
+    #[test]
+    fn intern_assigns_stable_first_seen_codes() {
+        let channels = registry();
+        let mut p = panel_for("motor.log", &channels);
+        assert_eq!(p.intern("idle"), 0);
+        assert_eq!(p.intern("running"), 1);
+        assert_eq!(p.intern("error"), 2);
+        // Repeats return the same code; codes and labels stay consistent.
+        assert_eq!(p.intern("idle"), 0);
+        assert_eq!(p.intern("running"), 1);
+        assert_eq!(p.text_labels.get(&0).map(String::as_str), Some("idle"));
+        assert_eq!(p.text_labels.get(&2).map(String::as_str), Some("error"));
+    }
+
+    #[test]
+    fn renders_text_channel_without_panic() {
+        let channels = registry();
+        let store = LiveStore::from_registry(&channels);
+        let log = channels.id("motor.log").unwrap();
+        for (i, s) in ["idle", "idle", "running", "error", "idle"].iter().enumerate() {
+            store.write_text(log, i as i64 * 1_000_000, s.to_string());
+        }
+        let reg = PanelRegistry::with_builtins();
+        let e: PanelEntry =
+            toml::from_str("type = \"state_graph\"\nchannel = \"motor.log\"").unwrap();
+        let mut p = reg.build(&e, &channels).unwrap();
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                p.render(ui, &store);
+            });
+        });
     }
 
     #[test]
