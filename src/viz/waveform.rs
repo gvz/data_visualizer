@@ -291,6 +291,12 @@ impl VizPanel for WaveformPanel {
             .allow_zoom(false)
             .allow_boxed_zoom(false)
             .allow_double_click_reset(false)
+            // Pin the x/y margin (egui_plot's default) so the state graph can
+            // mirror the exact horizontal padding and scroll in lockstep.
+            .set_margin_fraction(egui::vec2(
+                crate::viz::common::PLOT_MARGIN_FRAC,
+                crate::viz::common::PLOT_MARGIN_FRAC,
+            ))
             .include_x(x_of(t0))
             .include_x(x_of(end_ns))
             // X is plotted relative to the fixed anchor; label the ticks with the

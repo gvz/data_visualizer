@@ -6,8 +6,9 @@ use crate::config::ChannelRegistry;
 use crate::store::ChannelStore;
 use crate::types::{ChannelSnapshot, SampleType, TimeWindow};
 use crate::viz::common::{
-    bind, binding_error, effective_window_s, label_config_row, opt_f64_opt, opt_label, opt_str,
-    refresh_binding, serialize_label, window_config_row, Binding, RebindCtx,
+    bind, binding_error, effective_window_s, format_time_of_day, frame_clock, label_config_row,
+    opt_f64_opt, opt_label, opt_str, refresh_binding, serialize_label, window_config_row, Binding,
+    RebindCtx, PLOT_MARGIN_FRAC,
 };
 use crate::viz::VizPanel;
 
@@ -119,6 +120,25 @@ pub(crate) fn painted_spans(
     segs
 }
 
+/// A "nice" axis tick step (ns) for `span_ns`, aiming for ~`target` ticks,
+/// snapped to a 1/2/5 × 10ⁿ value so ticks land on round times — the same
+/// mantissa progression egui_plot uses for the waveform x-axis.
+pub(crate) fn nice_time_step_ns(span_ns: i64, target: i64) -> i64 {
+    let rough = (span_ns / target.max(1)).max(1) as f64;
+    let mag = 10f64.powf(rough.log10().floor());
+    let norm = rough / mag; // 1.0..10.0
+    let mult = if norm <= 1.5 {
+        1.0
+    } else if norm <= 3.0 {
+        2.0
+    } else if norm <= 7.0 {
+        5.0
+    } else {
+        10.0
+    };
+    ((mag * mult) as i64).max(1)
+}
+
 impl StateGraphPanel {
     /// Map a Text value to a stable integer code, assigning the next code in
     /// first-seen order on first sight. Codes persist for the panel's lifetime,
@@ -178,12 +198,20 @@ impl VizPanel for StateGraphPanel {
         let (t0, end_ns) = match linked.or(self.zoom) {
             Some((a, b)) => (a, b),
             None => {
-                let end = store.now_ns();
+                // Same right edge as the waveforms: the app's shared frame clock.
+                let end = frame_clock(ui.ctx()).unwrap_or_else(|| store.now_ns());
                 let span = (effective_window_s(ui.ctx(), self.time_window_s) * 1e9) as i64;
                 (end - span, end)
             }
         };
+        // Visible x-range = the data window plus egui_plot's margin on each side,
+        // so bands and ticks line up with — and scroll at the same rate as — the
+        // waveforms. `vt0..vend` drives x mapping; the data window `t0..end_ns`
+        // still bounds the snapshot and the painted bands.
         let span = (end_ns - t0).max(1);
+        let margin = (span as f64 * PLOT_MARGIN_FRAC as f64) as i64;
+        let (vt0, vend) = (t0 - margin, end_ns + margin);
+        let vspan = (vend - vt0).max(1);
         let snap = store.snapshot(id, TimeWindow { start_ns: t0, end_ns: end_ns + 1 });
         let mut text_mode = false;
         let (ts, vals): (Vec<i64>, Vec<i64>) = match &snap {
@@ -221,7 +249,7 @@ impl VizPanel for StateGraphPanel {
         let painter = ui.painter();
         painter.rect_filled(rect, 2.0, Color32::from_gray(30));
         let x_of = |t: i64| {
-            rect.left() + rect.width() * ((t - t0) as f32 / span.max(1) as f32)
+            rect.left() + rect.width() * ((t - vt0) as f32 / vspan as f32)
         };
         for (s, e, v) in painted_spans(&ts, &vals, t0, end_ns) {
             let seg = egui::Rect::from_min_max(
@@ -238,6 +266,40 @@ impl VizPanel for StateGraphPanel {
                     Color32::BLACK,
                 );
             }
+        }
+        // Time axis: ticks at round UTC times (like the waveform x-axis), so
+        // they stay put and slide left as the live window advances instead of
+        // jittering at fixed fractions of the span.
+        let (axis_rect, _) =
+            ui.allocate_exact_size(egui::vec2(rect.width(), 15.0), egui::Sense::hover());
+        let axis_painter = ui.painter();
+        let step = nice_time_step_ns(vspan, 5);
+        let mut t = vt0.div_euclid(step) * step;
+        if t < vt0 {
+            t += step;
+        }
+        while t <= vend {
+            let x = x_of(t);
+            axis_painter.line_segment(
+                [egui::pos2(x, axis_rect.top()), egui::pos2(x, axis_rect.top() + 3.0)],
+                egui::Stroke::new(1.0_f32, Color32::from_gray(110)),
+            );
+            // Edge-anchor the labels nearest each border so they don't clip.
+            let anchor = if x - rect.left() < 24.0 {
+                Align2::LEFT_TOP
+            } else if rect.right() - x < 24.0 {
+                Align2::RIGHT_TOP
+            } else {
+                Align2::CENTER_TOP
+            };
+            axis_painter.text(
+                egui::pos2(x, axis_rect.top() + 3.0),
+                anchor,
+                format_time_of_day(t),
+                FontId::proportional(9.0),
+                Color32::from_gray(160),
+            );
+            t += step;
         }
         // Legend of known states.
         ui.horizontal_wrapped(|ui| {
@@ -349,6 +411,18 @@ type = "text"
     #[test]
     fn painted_spans_empty_without_data() {
         assert!(painted_spans(&[], &[], 0, 10).is_empty());
+    }
+
+    #[test]
+    fn nice_time_step_snaps_to_1_2_5() {
+        // 10s window, ~5 ticks → 2s step.
+        assert_eq!(nice_time_step_ns(10_000_000_000, 5), 2_000_000_000);
+        // 1s window → 200ms.
+        assert_eq!(nice_time_step_ns(1_000_000_000, 5), 200_000_000);
+        // 60s window → 10s.
+        assert_eq!(nice_time_step_ns(60_000_000_000, 5), 10_000_000_000);
+        // Never zero on a tiny span.
+        assert!(nice_time_step_ns(1, 5) >= 1);
     }
 
     #[test]

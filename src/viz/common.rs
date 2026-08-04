@@ -419,6 +419,12 @@ pub fn opt_f64_opt(cfg: &toml::Table, key: &str) -> Option<f64> {
 /// Fallback visible span (seconds) when neither the panel nor the app set one.
 pub const DEFAULT_WINDOW_S: f64 = 10.0;
 
+/// Horizontal margin egui_plot adds each side of the data window (its default
+/// `margin_fraction`). Pinned here and set explicitly on the waveform plot so
+/// the manually-drawn state graph can pad its time axis by the same fraction
+/// and scroll in lockstep with the waveforms.
+pub const PLOT_MARGIN_FRAC: f32 = 0.05;
+
 fn global_window_id() -> egui::Id {
     egui::Id::new("datavis_global_window_s")
 }
