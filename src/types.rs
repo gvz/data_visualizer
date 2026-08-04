@@ -89,6 +89,13 @@ pub struct ChannelMeta {
     pub max_rate: u32,
     pub history_s: f64,
     pub max_lines: usize,
+    /// For `Text` channels only: store values as interned integer codes in a
+    /// rate×history ring (the waveform buffer) rather than a fixed-line
+    /// `TextBuf`. Set for discovered channels (state/status fields), so a
+    /// state graph keeps full transition history at high sample rates. Left
+    /// false for config-declared text channels, which are logs and must keep
+    /// every line verbatim.
+    pub text_coded: bool,
 }
 
 /// Owned copy of a channel's samples within a window, SoA layout.

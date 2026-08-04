@@ -149,11 +149,16 @@ impl ScriptRunner {
                         Some(id) => id,
                         None => {
                             let out = &self.meta.outputs[i];
-                            let is_new = registry.id(&out.name).is_none();
-                            let cid = registry.add_dynamic(&out.name, &out.name, out.sample_type);
-                            if is_new {
-                                store.add_channel(registry.meta(cid).clone());
-                            }
+                            // Atomic id + store-slot append under the registry
+                            // lock: the store slot lands only for a genuinely
+                            // new channel, and never interleaves with the UI
+                            // drop path registering concurrently.
+                            let cid = registry.register_dynamic(
+                                &out.name,
+                                &out.name,
+                                out.sample_type,
+                                |meta| store.add_channel(meta.clone()),
+                            );
                             self.output_ids[i] = Some(cid);
                             cid
                         }

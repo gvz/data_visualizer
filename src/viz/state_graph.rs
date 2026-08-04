@@ -94,6 +94,31 @@ pub(crate) fn segments(ts: &[i64], vals: &[i64]) -> Vec<(i64, i64, i64)> {
     out
 }
 
+/// Runs from [`segments`], stretched to cover the whole `[t0, end_ns]` window:
+/// the first run fills back to the left edge and the last run forward to
+/// `end_ns`. A state is piecewise-constant, so the earliest known value holds
+/// for the unpainted region before it, and the latest value holds up to "now".
+///
+/// Without the left-fill, a channel whose samples cover only part of the window
+/// — e.g. a high-rate `Text` channel whose fixed-line ring holds just the last
+/// few milliseconds — paints a thin sliver at the right edge and leaves the
+/// rest black.
+pub(crate) fn painted_spans(
+    ts: &[i64],
+    vals: &[i64],
+    t0: i64,
+    end_ns: i64,
+) -> Vec<(i64, i64, i64)> {
+    let mut segs = segments(ts, vals);
+    if let Some(first) = segs.first_mut() {
+        first.0 = first.0.min(t0);
+    }
+    if let Some(last) = segs.last_mut() {
+        last.1 = last.1.max(end_ns);
+    }
+    segs
+}
+
 impl StateGraphPanel {
     /// Map a Text value to a stable integer code, assigning the next code in
     /// first-seen order on first sight. Codes persist for the panel's lifetime,
@@ -138,6 +163,10 @@ impl VizPanel for StateGraphPanel {
             ui.label("no data");
             return;
         }
+        // Discovered text arrives as interned codes on the ring path (an `Int`
+        // snapshot) with this code→label table; `None` for numeric channels and
+        // for verbatim `TextBuf` channels (which come through as `Text`).
+        let coded = store.state_labels(id);
         // When the toolbar link is armed, a shared time window overrides this
         // panel's trailing view; before any shared zoom (`linked == None`) it
         // keeps its own frozen zoom, else the live trailing window.
@@ -170,10 +199,23 @@ impl VizPanel for StateGraphPanel {
             }
             _ => return,
         };
-        // Text channels label segments with the interned strings; numeric
-        // channels use the explicit config `states` map.
-        let labels = if text_mode { &self.text_labels } else { &self.states };
-        let label_for = |v: i64| labels.get(&v).cloned().unwrap_or_else(|| v.to_string());
+        // Legend / label source, in priority: the discovered coded-text table
+        // (indexed by code), then interned strings for a verbatim `Text`
+        // channel, then the config `states` map for a numeric channel.
+        let legend: Vec<(i64, String)> = if let Some(lbls) = &coded {
+            lbls.iter().enumerate().map(|(i, s)| (i as i64, s.clone())).collect()
+        } else if text_mode {
+            self.text_labels.iter().map(|(k, v)| (*k, v.clone())).collect()
+        } else {
+            self.states.iter().map(|(k, v)| (*k, v.clone())).collect()
+        };
+        let label_for = |v: i64| -> String {
+            legend
+                .iter()
+                .find(|(code, _)| *code == v)
+                .map(|(_, s)| s.clone())
+                .unwrap_or_else(|| v.to_string())
+        };
         let desired = egui::vec2(ui.available_width().max(80.0), 40.0);
         let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
         let painter = ui.painter();
@@ -181,9 +223,7 @@ impl VizPanel for StateGraphPanel {
         let x_of = |t: i64| {
             rect.left() + rect.width() * ((t - t0) as f32 / span.max(1) as f32)
         };
-        for (s, e, v) in segments(&ts, &vals) {
-            // Extend the last segment to "now" (the right edge).
-            let e = if e == *ts.last().unwrap() { end_ns } else { e };
+        for (s, e, v) in painted_spans(&ts, &vals, t0, end_ns) {
             let seg = egui::Rect::from_min_max(
                 egui::pos2(x_of(s), rect.top()),
                 egui::pos2(x_of(e), rect.bottom()),
@@ -201,7 +241,7 @@ impl VizPanel for StateGraphPanel {
         }
         // Legend of known states.
         ui.horizontal_wrapped(|ui| {
-            for (v, label) in labels {
+            for (v, label) in &legend {
                 let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
                 ui.painter().rect_filled(dot, 2.0, color_for(*v));
                 ui.label(label);
@@ -284,6 +324,31 @@ type = "text"
         assert_eq!(segments(&ts, &vals), vec![(0, 2, 0), (2, 4, 1), (4, 4, 0)]);
         assert!(segments(&[], &[]).is_empty());
         assert_eq!(segments(&[7], &[3]), vec![(7, 7, 3)]);
+    }
+
+    #[test]
+    fn painted_spans_fill_whole_window_from_late_sliver() {
+        // Samples only in the tail of a wide window (a high-rate ring holds
+        // just the last few ms). The painted spans must still tile [t0, end]
+        // with no gap — otherwise the panel is black except a right-edge sliver.
+        let (t0, end) = (0i64, 10_000i64);
+        let ts = [9_990i64, 9_995, 10_000];
+        let vals = [1i64, 2, 2];
+        let spans = painted_spans(&ts, &vals, t0, end);
+        assert_eq!(spans.first().unwrap().0, t0, "first span must reach left edge");
+        assert_eq!(spans.last().unwrap().1, end, "last span must reach right edge");
+        // Contiguous coverage, no gaps.
+        let mut cursor = t0;
+        for (s, e, _) in &spans {
+            assert_eq!(*s, cursor, "gap in coverage");
+            cursor = *e;
+        }
+        assert_eq!(cursor, end);
+    }
+
+    #[test]
+    fn painted_spans_empty_without_data() {
+        assert!(painted_spans(&[], &[], 0, 10).is_empty());
     }
 
     #[test]
@@ -401,6 +466,72 @@ channel = "demo.enabled""#,
                 p.render(ui, &store);
             });
         });
+    }
+
+    #[test]
+    fn text_channel_in_trailing_window_draws_bands() {
+        let channels = registry();
+        let store = LiveStore::from_registry(&channels);
+        let log = channels.id("motor.log").unwrap();
+        // Timestamps within the last second so they land inside the trailing
+        // window the panel derives from `store.now_ns()`.
+        let now = store.now_ns();
+        for (i, s) in ["idle", "idle", "running", "error", "idle"].iter().enumerate() {
+            store.write_text(log, now - (5 - i as i64) * 100_000_000, s.to_string());
+        }
+        let mut p = panel_for("motor.log", &channels);
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                p.render(ui, &store);
+            });
+        });
+        // If the Text snapshot reached the panel, the strings were interned.
+        assert!(!p.text_codes.is_empty(), "no text interned — panel drew nothing");
+        assert_eq!(p.text_codes.len(), 3, "idle/running/error");
+    }
+
+    #[test]
+    fn discovered_text_topic_binds_and_draws() {
+        use crate::dynamic_channel::MqttTopicMap;
+        use std::collections::HashMap;
+        use std::sync::RwLock;
+
+        // Mirrors the config panel `channel = "load/state0"`: the channel does
+        // not exist until the ws/influx stream discovers it live.
+        let channels = registry();
+        let store = LiveStore::from_registry(&channels);
+        let mut p = panel_for("load/state0", &channels);
+        assert!(p.bound.id.is_none(), "topic must start unresolved");
+
+        // First string arrives on the wire → discovery snapshot carries it.
+        let topic_map: MqttTopicMap = RwLock::new(HashMap::new());
+        let mut snap = BTreeMap::new();
+        snap.insert("load/state0".to_string(), "idle".to_string());
+        p.refresh_bindings(&RebindCtx {
+            channels: &channels,
+            store: &store,
+            mqtt: Some((&topic_map, &snap)),
+        });
+        assert!(p.bound.id.is_some(), "discovered text topic did not bind");
+        assert!(p.bound.type_ok, "state graph rejected the text channel");
+
+        // A couple more in-window transitions on top of the seeded value.
+        let id = p.bound.id.unwrap();
+        let now = store.now_ns();
+        store.write_text(id, now - 300_000_000, "running".to_string());
+        store.write_text(id, now - 100_000_000, "error".to_string());
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                p.render(ui, &store);
+            });
+        });
+        // Discovered text is stored as interned codes on the ring, so the labels
+        // live on the store (not the panel's `text_codes`, which only backs the
+        // verbatim `TextBuf` path).
+        let labels = store.state_labels(id).expect("discovered text must be coded");
+        assert_eq!(labels, vec!["idle", "running", "error"]);
     }
 
     #[test]

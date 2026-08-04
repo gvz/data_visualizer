@@ -140,6 +140,9 @@ fn dynamic_channel(
         max_rate,
         history_s,
         max_lines: cfg.max_lines,
+        // Discovered text is state/status data: store it as codes in a
+        // rate×history ring so a state graph retains transitions at any rate.
+        text_coded: sample_type == SampleType::Text,
     };
     (cfg, meta)
 }
@@ -161,6 +164,8 @@ impl ChannelRegistry {
                 max_rate: resolve_static_rate(cfg.max_rate, defaults.max_rate),
                 history_s: resolve_static_history(cfg.history_s, defaults.history_s),
                 max_lines: cfg.max_lines,
+                // Config-declared text channels are logs — keep every line.
+                text_coded: false,
             });
             configs.push(cfg);
         }
@@ -191,6 +196,27 @@ impl ChannelRegistry {
         mqtt_topic: &str,
         sample_type: SampleType,
     ) -> ChannelId {
+        self.register_dynamic(name, mqtt_topic, sample_type, |_| {})
+    }
+
+    /// Like [`add_dynamic`](Self::add_dynamic), but runs `on_new` with the fresh
+    /// channel's meta **under the same write lock** that assigns the id — only
+    /// when the channel is genuinely new. Production registrants pass a closure
+    /// that appends the matching store slot, so the registry id and the store
+    /// slot index advance as one atomic step.
+    ///
+    /// This is what keeps ids and slots in lockstep when several threads
+    /// register at once — the UI drop path and the script engine both grow the
+    /// registry and the store. Without the shared lock their two-step
+    /// (grow registry, then grow store) sequences interleave and a later id
+    /// overshoots the store, panicking with `channel id out of range`.
+    pub fn register_dynamic(
+        &self,
+        name: &str,
+        mqtt_topic: &str,
+        sample_type: SampleType,
+        on_new: impl FnOnce(&ChannelMeta),
+    ) -> ChannelId {
         if let Some(id) = self.id(name) {
             return id;
         }
@@ -206,6 +232,10 @@ impl ChannelRegistry {
         self.dyn_configs.push(cfg);
         let idx = self.dyn_metas.push(meta);
         let id = ChannelId((self.n_static() + idx) as u32);
+        // Append the store slot before publishing the id, still holding the
+        // write lock: no other registrant can push between the registry and
+        // store grows, so slot index == id.
+        on_new(self.dyn_metas.get(idx).expect("just pushed"));
         dyn_ids.insert(name.to_string(), id);
         id
     }
@@ -293,6 +323,47 @@ ts_path    = "LogBatch.samples.t_ns"
 type       = "text"
 max_lines  = 500
 "##;
+
+    #[test]
+    fn concurrent_dynamic_registration_keeps_ids_and_slots_aligned() {
+        use crate::store::{ChannelStore, LiveStore};
+        use std::sync::Arc;
+        use std::thread;
+
+        // Reproduces the UI-drop / script-engine race: two-step registration
+        // (grow registry, then grow store) run from several threads at once.
+        // Before `register_dynamic` held the store append under the id lock,
+        // the grows interleaved and a later id overshot the store slot.
+        for _ in 0..40 {
+            let reg = Arc::new(ChannelRegistry::from_toml_str(EXAMPLE).unwrap());
+            let store: Arc<LiveStore> = Arc::new(LiveStore::from_registry(&reg));
+            let mut handles = Vec::new();
+            for t in 0..4 {
+                let reg = reg.clone();
+                let store = store.clone();
+                handles.push(thread::spawn(move || {
+                    let mut ids = Vec::new();
+                    for k in 0..25 {
+                        let name = format!("t{t}/c{k}");
+                        let id = reg.register_dynamic(&name, &name, SampleType::Float, |m| {
+                            store.add_channel(m.clone())
+                        });
+                        ids.push((name, id));
+                    }
+                    ids
+                }));
+            }
+            let mut all = Vec::new();
+            for h in handles {
+                all.extend(h.join().unwrap());
+            }
+            // Each id must resolve to the store slot holding exactly its channel
+            // — misalignment either panics here or returns the wrong name.
+            for (name, id) in all {
+                assert_eq!(store.channel_meta(id).name, name, "id/slot misaligned");
+            }
+        }
+    }
 
     #[test]
     fn parses_example_and_assigns_sorted_ids() {

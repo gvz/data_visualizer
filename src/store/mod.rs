@@ -17,6 +17,13 @@ pub trait ChannelStore: Send + Sync {
     fn snapshot(&self, channel: ChannelId, window: TimeWindow) -> ChannelSnapshot;
     fn latest(&self, channel: ChannelId) -> Option<(i64, Sample)>;
     fn channel_meta(&self, channel: ChannelId) -> &ChannelMeta;
+    /// For a discovered (interned-code) text channel, its code→label table
+    /// indexed by code — so a state graph can turn the `Int` codes from
+    /// [`snapshot`](Self::snapshot) back into state names. `None` for every
+    /// other channel (numeric, or a verbatim `TextBuf` log channel).
+    fn state_labels(&self, _channel: ChannelId) -> Option<Vec<String>> {
+        None
+    }
     /// Append a runtime-registered channel slot. The new slot's index must
     /// equal the ChannelId the registry assigned it. Live-only; the default
     /// is a no-op (replay has a fixed channel set).

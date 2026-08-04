@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::config::ChannelRegistry;
 use crate::store::{ChannelStore, SoaRing, TextBuf};
@@ -12,6 +12,36 @@ enum ChannelData {
     Int(SoaRing<i64>),
     Bool(SoaRing<u8>),
     Text(TextBuf),
+    /// Discovered text stored the waveform way: a rate×history ring of interned
+    /// integer codes plus the code→label table. A state graph reads the codes
+    /// (full retention, cheap `Copy` samples) and resolves labels via
+    /// [`ChannelStore::state_labels`].
+    CodedText { ring: SoaRing<i64>, codec: Mutex<TextCodec> },
+}
+
+/// Bidirectional map between state strings and small integer codes, assigned in
+/// first-seen order. A state channel has few distinct values, so the table
+/// stays tiny even as millions of samples flow through the ring.
+#[derive(Default)]
+struct TextCodec {
+    to_code: std::collections::HashMap<String, i64>,
+    labels: Vec<String>,
+}
+
+impl TextCodec {
+    fn intern(&mut self, s: &str) -> i64 {
+        if let Some(&c) = self.to_code.get(s) {
+            return c;
+        }
+        let c = self.labels.len() as i64;
+        self.to_code.insert(s.to_string(), c);
+        self.labels.push(s.to_string());
+        c
+    }
+
+    fn label(&self, code: i64) -> Option<&str> {
+        usize::try_from(code).ok().and_then(|i| self.labels.get(i)).map(String::as_str)
+    }
 }
 
 struct ChannelSlot {
@@ -42,6 +72,9 @@ fn slot_from_meta(meta: ChannelMeta) -> ChannelSlot {
         SampleType::Float => ChannelData::Float(SoaRing::new(cap)),
         SampleType::Int => ChannelData::Int(SoaRing::new(cap)),
         SampleType::Bool => ChannelData::Bool(SoaRing::new(cap)),
+        SampleType::Text if meta.text_coded => {
+            ChannelData::CodedText { ring: SoaRing::new(cap), codec: Mutex::new(TextCodec::default()) }
+        }
         SampleType::Text => ChannelData::Text(TextBuf::new(meta.max_lines)),
     };
     ChannelSlot { meta, data }
@@ -106,6 +139,10 @@ impl ChannelStore for LiveStore {
         self.writes.fetch_add(1, Ordering::Relaxed);
         match &self.slot(channel).data {
             ChannelData::Text(t) => t.push(ts, line),
+            ChannelData::CodedText { ring, codec } => {
+                let code = codec.lock().unwrap().intern(&line);
+                ring.push(ts, code);
+            }
             _ => self.count_type_error(),
         }
     }
@@ -136,6 +173,13 @@ impl ChannelStore for LiveStore {
                 ChannelSnapshot::Bool { ts, vals }
             }
             ChannelData::Text(t) => ChannelSnapshot::Text { lines: t.window(window) },
+            // Codes ride the same ring path as Int; the state graph pairs them
+            // with `state_labels` to recover the strings.
+            ChannelData::CodedText { ring, .. } => {
+                let (mut ts, mut vals) = (Vec::new(), Vec::new());
+                ring.read_window(window, &mut ts, &mut vals);
+                ChannelSnapshot::Int { ts, vals }
+            }
         }
     }
 
@@ -145,6 +189,10 @@ impl ChannelStore for LiveStore {
             ChannelData::Int(r) => r.latest().map(|(t, v)| (t, Sample::Int(v))),
             ChannelData::Bool(r) => r.latest().map(|(t, v)| (t, Sample::Bool(v != 0))),
             ChannelData::Text(t) => t.latest().map(|(ts, l)| (ts, Sample::Text(l))),
+            ChannelData::CodedText { ring, codec } => ring.latest().map(|(ts, code)| {
+                let label = codec.lock().unwrap().label(code).unwrap_or("").to_string();
+                (ts, Sample::Text(label))
+            }),
         }
     }
 
@@ -154,6 +202,13 @@ impl ChannelStore for LiveStore {
 
     fn add_channel(&self, meta: ChannelMeta) {
         self.channels.push(slot_from_meta(meta));
+    }
+
+    fn state_labels(&self, channel: ChannelId) -> Option<Vec<String>> {
+        match &self.try_slot(channel)?.data {
+            ChannelData::CodedText { codec, .. } => Some(codec.lock().unwrap().labels.clone()),
+            _ => None,
+        }
     }
 }
 
@@ -201,6 +256,46 @@ max_lines = 10
 "#,
         )
         .unwrap()
+    }
+
+    /// A discovered (coded) text channel keeps far more than a `TextBuf`'s line
+    /// cap — its ring is sized by rate×history like a waveform — and exposes the
+    /// codes as an `Int` snapshot plus the code→label table.
+    #[test]
+    fn coded_text_channel_uses_ring_retention_and_labels() {
+        let reg = registry();
+        let store = LiveStore::from_registry(&reg);
+        let id = crate::types::ChannelId(reg.len() as u32);
+        // max_lines is tiny (5), but text_coded routes storage to a ring sized
+        // by max_rate(1000) × history_s(10) — thousands of samples.
+        store.add_channel(ChannelMeta {
+            name: "vx/state".into(),
+            sample_type: SampleType::Text,
+            unit: String::new(),
+            color: "#cccccc".into(),
+            max_rate: 1000,
+            history_s: 10.0,
+            max_lines: 5,
+            text_coded: true,
+        });
+        // 2000 samples cycling through 3 states — well past max_lines.
+        let states = ["idle", "running", "error"];
+        for i in 0..2000i64 {
+            store.write_text(id, i, states[(i as usize / 100) % 3].to_string());
+        }
+        // Retention: the ring holds all 2000 (a TextBuf would keep only 5).
+        let snap = store.snapshot(id, ALL);
+        let ChannelSnapshot::Int { ts, vals } = snap else {
+            panic!("coded text must snapshot as Int codes");
+        };
+        assert_eq!(ts.len(), 2000, "ring retained every sample");
+        // Codes resolve to the three interned labels, first-seen order.
+        assert_eq!(store.state_labels(id).unwrap(), vec!["idle", "running", "error"]);
+        assert_eq!(vals[0], 0); // idle
+        assert_eq!(vals[100], 1); // running
+        assert_eq!(vals[200], 2); // error
+        // latest reconstructs the string.
+        assert_eq!(store.latest(id), Some((1999, Sample::Text("running".into()))));
     }
 
     #[test]
@@ -271,6 +366,7 @@ max_lines = 10
             max_rate: 100,
             history_s: 30.0,
             max_lines: 500,
+            text_coded: false,
         });
         store.write_numeric(new_id, 5, NumericVal::Float(21.5));
         assert_eq!(store.latest(new_id), Some((5, Sample::Float(21.5))));

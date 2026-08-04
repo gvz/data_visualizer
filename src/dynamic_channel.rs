@@ -83,10 +83,10 @@ pub fn resolve_or_register_drop(
     let (topic_map, snapshot) = mqtt?;
     let value = snapshot.get(raw)?;
     let ty = infer_sample_type(value);
-    let id = channels.add_dynamic(raw, raw, ty);
-    // Registry id and store index advance in lockstep: this is the only path
-    // that calls both, and the early return above guarantees a fresh id here.
-    store.add_channel(channels.meta(id).clone());
+    // Registry id and store slot advance atomically under the registry lock, so
+    // this UI path and the script engine can register concurrently without the
+    // two-step grows interleaving into a mismatched id/slot.
+    let id = channels.register_dynamic(raw, raw, ty, |meta| store.add_channel(meta.clone()));
     seed_value(store, id, ty, value);
     topic_map.write().unwrap().insert(raw.to_string(), (id, ty));
     Some(raw.to_string())
