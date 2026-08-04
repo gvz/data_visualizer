@@ -93,6 +93,9 @@ pub(crate) struct DerivedIngest {
     pub ingest_schema_bytes: Vec<u8>,
     pub mqtt_topics: Option<Arc<Mutex<BTreeMap<String, String>>>>,
     pub mqtt_topic_map: Option<Arc<crate::dynamic_channel::MqttTopicMap>>,
+    /// RAII guards that kill bridge child processes on drop. Held here so they
+    /// survive `from_handles` and can be moved into the owning app struct.
+    pub child_guards: Vec<crate::ingest::source::ChildGuard>,
 }
 
 impl DerivedIngest {
@@ -102,6 +105,7 @@ impl DerivedIngest {
         let mut ingest_schema_bytes = Vec::new();
         let mut mqtt_topics = None;
         let mut mqtt_topic_map = None;
+        let mut child_guards = Vec::new();
         for h in handles {
             record_sender_slots.push(h.record_sender);
             conn_states.push(h.conn_state);
@@ -116,8 +120,18 @@ impl DerivedIngest {
                     mqtt_topic_map = Some(d.topic_map);
                 }
             }
+            if let Some(g) = h.child_guard {
+                child_guards.push(g);
+            }
         }
-        Self { conn_states, record_sender_slots, ingest_schema_bytes, mqtt_topics, mqtt_topic_map }
+        Self {
+            conn_states,
+            record_sender_slots,
+            ingest_schema_bytes,
+            mqtt_topics,
+            mqtt_topic_map,
+            child_guards,
+        }
     }
 }
 
@@ -204,6 +218,10 @@ pub struct DataVisApp {
     script_commands: crossbeam_channel::Sender<ScriptCommand>,
     script_disabled: Arc<Mutex<Option<String>>>,
     script_panel_state: crate::script::panel::ScriptPanelState,
+    /// Holds bridge `ChildGuard`s for the app's lifetime so child processes are
+    /// only killed when the app exits, not during `DataVisApp::new`.
+    #[allow(dead_code)]
+    _bridge_guards: Vec<crate::ingest::source::ChildGuard>,
 }
 
 impl DataVisApp {
@@ -230,6 +248,7 @@ impl DataVisApp {
             ingest_schema_bytes,
             mqtt_topics,
             mqtt_topic_map,
+            child_guards,
         } = DerivedIngest::from_handles(sources);
         let panel_type = registry
             .pickable_type_names()
@@ -276,6 +295,7 @@ impl DataVisApp {
             script_commands,
             script_disabled,
             script_panel_state: Default::default(),
+            _bridge_guards: child_guards,
         }
     }
 
@@ -1135,6 +1155,38 @@ mod tests {
         assert!(d.mqtt_topic_map.is_some());
         // Every source's conn_state is kept (mqtt CONNECTING=0, zmq LIVE=1).
         assert_eq!(d.conn_states.len(), 2);
+    }
+
+    #[test]
+    fn from_handles_retains_child_guards() {
+        // Regression test: ChildGuard must NOT be dropped during from_handles.
+        // Before the fix, h.child_guard was silently dropped at the end of each
+        // loop iteration because DerivedIngest had no field for it, triggering
+        // ChildGuard::drop which sets stop=true and kills the child.
+        use crate::ingest::SourceHandle;
+        use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let guard = crate::ingest::source::ChildGuard {
+            stop: stop.clone(),
+            current: Arc::new(Mutex::new(None)),
+        };
+        let handle = SourceHandle {
+            name: "bridge".into(),
+            conn_state: Arc::new(AtomicU8::new(0)),
+            record_sender: Arc::new(Mutex::new(None)),
+            discovery: None,
+            schema_bytes: None,
+            child_guard: Some(guard),
+        };
+        let derived = DerivedIngest::from_handles(vec![handle]);
+        // Guard must be retained — stop should still be false.
+        assert_eq!(derived.child_guards.len(), 1);
+        assert!(!stop.load(Ordering::SeqCst), "ChildGuard was dropped prematurely by from_handles");
+        // Dropping DerivedIngest must fire the guard (sets stop=true).
+        drop(derived);
+        assert!(stop.load(Ordering::SeqCst), "ChildGuard::drop did not fire when DerivedIngest was dropped");
     }
 
     #[test]
