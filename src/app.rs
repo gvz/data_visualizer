@@ -421,6 +421,12 @@ impl DataVisApp {
                 });
                 self.saved_channel_tree = Some(self.channel_tree.clone());
                 self.channel_tree = ChannelTree::build(&self.channels);
+                // Loading reconstructed the recording's dynamic (MQTT/generated)
+                // channels into the registry. Rebind panels now so bindings that
+                // were "unknown channel" at layout-load time resolve — replay has
+                // no MQTT discovery tick to do this later.
+                self.workspace
+                    .refresh_bindings(&self.channels, self.store.as_ref(), None);
                 self.status = format!("Loaded {}", path.display());
             }
             Err(e) => {
