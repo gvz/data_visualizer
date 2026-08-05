@@ -173,6 +173,10 @@ pub struct DataVisApp {
     status_clear_at: Option<Instant>,
     conn_states: Vec<Arc<std::sync::atomic::AtomicU8>>,
     mode: AppMode,
+    /// In-flight recording load. The MCAP decode runs on a worker thread so the
+    /// UI stays responsive; the result arrives here and is applied on the frame
+    /// it lands. `PathBuf` is the file being loaded (for the status message).
+    pending_load: Option<(PathBuf, crossbeam_channel::Receiver<anyhow::Result<Arc<PlaybackStore>>>)>,
     // Recording state
     record_handle: Option<RecordHandle>,
     record_sender_slots: Vec<Arc<Mutex<Option<crossbeam_channel::Sender<crate::record::RecordMsg>>>>>,
@@ -272,6 +276,7 @@ impl DataVisApp {
             status_clear_at: None,
             conn_states,
             mode: AppMode::Live,
+            pending_load: None,
             record_handle: None,
             record_sender_slots,
             ingest_schema_bytes,
@@ -406,6 +411,10 @@ impl DataVisApp {
             self.status = "Stop recording before opening a file".to_string();
             return;
         }
+        if self.pending_load.is_some() {
+            self.status = "Already loading a recording…".to_string();
+            return;
+        }
         let Some(path) = rfd::FileDialog::new()
             .add_filter("MCAP recording", &["mcap"])
             .pick_file()
@@ -413,7 +422,35 @@ impl DataVisApp {
             return;
         };
 
-        match PlaybackStore::load(&path, &self.channels) {
+        // Decode on a worker thread — large MCAPs take seconds and would
+        // otherwise freeze the UI. The result is polled in `poll_pending_load`.
+        // `ChannelRegistry` uses interior mutability (load calls `add_dynamic`),
+        // so the shared Arc is safe to hand to the worker.
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let channels = self.channels.clone();
+        let load_path = path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(PlaybackStore::load(&load_path, &channels));
+        });
+        self.pending_load = Some((path.clone(), rx));
+        self.status = format!("Loading {}…", path.display());
+    }
+
+    /// Apply a finished background load, if one has arrived. Called once per
+    /// frame; a no-op until the worker sends its result.
+    fn poll_pending_load(&mut self) {
+        let Some((_, rx)) = &self.pending_load else { return };
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(crossbeam_channel::TryRecvError::Empty) => return,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.pending_load = None;
+                self.status = "Recording load failed (worker gone)".to_string();
+                return;
+            }
+        };
+        let (path, _) = self.pending_load.take().unwrap();
+        match result {
             Ok(playback) => {
                 self.store = playback.clone();
                 self.mode = AppMode::Replay(ReplayState {
@@ -814,6 +851,10 @@ impl DataVisApp {
                 } else if !matches!(self.mode, AppMode::Replay(_)) {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(&self.status);
+                        // Animated spinner while a recording decodes on the worker.
+                        if self.pending_load.is_some() {
+                            ui.spinner();
+                        }
                     });
                 }
             });
@@ -983,15 +1024,20 @@ impl eframe::App for DataVisApp {
         // samples are arriving; otherwise fall back to a slow heartbeat that
         // still polls for new data and connection state. Any input event
         // repaints immediately regardless of this hint.
-        let animating = match self.mode {
-            AppMode::Replay(ref rs) => rs.playing,
-            AppMode::Live => {
-                let seq = self.store.write_seq();
-                let changed = seq != self.last_write_seq;
-                self.last_write_seq = seq;
-                changed && !self.live_paused
-            }
-        };
+        // Apply a finished background recording load before deciding on repaint
+        // cadence — this may flip us into Replay mode this frame.
+        self.poll_pending_load();
+
+        let animating = self.pending_load.is_some()
+            || match self.mode {
+                AppMode::Replay(ref rs) => rs.playing,
+                AppMode::Live => {
+                    let seq = self.store.write_seq();
+                    let changed = seq != self.last_write_seq;
+                    self.last_write_seq = seq;
+                    changed && !self.live_paused
+                }
+            };
         ctx.request_repaint_after(Duration::from_millis(if animating { 16 } else { 200 }));
 
         // Expire transient status messages (e.g. "layout saved"). The heartbeat

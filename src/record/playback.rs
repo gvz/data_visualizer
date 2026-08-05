@@ -151,16 +151,34 @@ impl PlaybackStore {
         let bytes = std::fs::read(path)
             .with_context(|| format!("reading MCAP file {}", path.display()))?;
 
-        // Pass 1: collect one embedded schema per topic.
+        // Collect one embedded schema per topic. Prefer the MCAP summary
+        // section: channel/schema records are indexed in the footer, so we
+        // learn every schema without decompressing a single message chunk.
+        // Files that weren't finalised (e.g. a crash mid-recording) carry no
+        // summary — fall back to a full message scan for those.
         let mut topic_schemas: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-        for message in mcap::MessageStream::new(&bytes)
-            .context("opening MCAP message stream")?
-        {
-            let msg = message.context("reading MCAP message")?;
-            if let Some(schema) = &msg.channel.schema {
-                topic_schemas
-                    .entry(msg.channel.topic.clone())
-                    .or_insert_with(|| schema.data.to_vec());
+        let summary = mcap::Summary::read(&bytes).context("reading MCAP summary")?;
+        match summary.filter(|s| !s.channels.is_empty()) {
+            Some(summary) => {
+                for channel in summary.channels.values() {
+                    if let Some(schema) = &channel.schema {
+                        topic_schemas
+                            .entry(channel.topic.clone())
+                            .or_insert_with(|| schema.data.to_vec());
+                    }
+                }
+            }
+            None => {
+                for message in mcap::MessageStream::new(&bytes)
+                    .context("opening MCAP message stream")?
+                {
+                    let msg = message.context("reading MCAP message")?;
+                    if let Some(schema) = &msg.channel.schema {
+                        topic_schemas
+                            .entry(msg.channel.topic.clone())
+                            .or_insert_with(|| schema.data.to_vec());
+                    }
+                }
             }
         }
 
@@ -208,7 +226,7 @@ impl PlaybackStore {
         // Build the store AFTER add_dynamic so reconstructed channels are included.
         let mut store = Self::new(registry);
 
-        // Pass 2: decode every message into the store.
+        // Decode every message into the store (the one unavoidable full scan).
         for message in mcap::MessageStream::new(&bytes)
             .context("opening MCAP message stream")?
         {
