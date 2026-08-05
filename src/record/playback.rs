@@ -165,9 +165,11 @@ impl PlaybackStore {
     pub fn load_many(paths: &[&Path], registry: &ChannelRegistry) -> anyhow::Result<Arc<Self>> {
         anyhow::ensure!(!paths.is_empty(), "no recording files to load");
 
-        // Per-file decode plan, retained through the decode phase.
-        struct FilePlan<'a> {
-            path: &'a Path,
+        // Per-file decode plan, retained through the decode phase. The file's
+        // bytes are held so the parallel phase can stream chunks without a
+        // second read from disk.
+        struct FilePlan {
+            bytes: Vec<u8>,
             router: TopicRouter,
             reconstructed: HashMap<String, Vec<ChannelBinding>>,
             /// (min, max) sample time in the file, if it has any data.
@@ -184,28 +186,74 @@ impl PlaybackStore {
             let (router, reconstructed) = Self::plan_file(&bytes, registry)?;
             let bounds = Self::time_bounds(&bytes)
                 .with_context(|| format!("reading time bounds of {}", path.display()))?;
-            plans.push(FilePlan { path, router, reconstructed, bounds });
+            plans.push(FilePlan { bytes, router, reconstructed, bounds });
         }
 
         // Build the store AFTER all add_dynamic calls so every channel exists.
         let mut store = Self::new(registry);
 
-        // Phase 2: decode each file into the store with its original timestamps.
+        // Phase 2: decode each file into the store, preserving original
+        // timestamps. MCAP chunks are independently compressed, so we split a
+        // file's chunks across worker threads — each decodes into its own local
+        // buffer (no lock contention), then we merge. Decompression and the
+        // reflective protobuf decode are the load's dominant cost and both
+        // parallelise cleanly this way.
+        let nthreads = std::thread::available_parallelism().map_or(1, |n| n.get());
         for plan in &plans {
-            let bytes = std::fs::read(plan.path)
-                .with_context(|| format!("reading MCAP file {}", plan.path.display()))?;
-            for message in mcap::MessageStream::new(&bytes)
-                .context("opening MCAP message stream")?
-            {
-                let msg = message.context("reading MCAP message")?;
-                let topic = msg.channel.topic.as_str();
-                let zmq = plan.router.bindings_for(topic);
-                let bindings: &[ChannelBinding] = if zmq.is_empty() {
-                    plan.reconstructed.get(topic).map(Vec::as_slice).unwrap_or(&[])
-                } else {
-                    zmq
-                };
-                decode_batch(&msg.data, bindings, &store);
+            // Chunk count from the summary index. Unchunked or unfinalised files
+            // (no summary) fall back to a single-threaded linear scan.
+            let nchunks = mcap::Summary::read(&plan.bytes)
+                .context("reading MCAP summary")?
+                .map_or(0, |s| s.chunk_indexes.len());
+
+            if nchunks == 0 {
+                for message in mcap::MessageStream::new(&plan.bytes)
+                    .context("opening MCAP message stream")?
+                {
+                    let msg = message.context("reading MCAP message")?;
+                    Self::decode_message(&msg, &plan.router, &plan.reconstructed, &store);
+                }
+                continue;
+            }
+
+            let workers = nthreads.min(nchunks);
+            let bytes = &plan.bytes;
+            let router = &plan.router;
+            let reconstructed = &plan.reconstructed;
+            let buffers: Vec<anyhow::Result<PlaybackStore>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..workers)
+                    .map(|w| {
+                        // Contiguous chunk range [lo, hi) for this worker.
+                        let lo = w * nchunks / workers;
+                        let hi = (w + 1) * nchunks / workers;
+                        scope.spawn(move || -> anyhow::Result<PlaybackStore> {
+                            // Re-read the (cheap) summary per thread: it borrows
+                            // `bytes`, so it can't be shared across the scope.
+                            let summary = mcap::Summary::read(bytes)
+                                .context("reading MCAP summary")?
+                                .context("MCAP summary missing")?;
+                            let buf = PlaybackStore::new(registry);
+                            for ci in lo..hi {
+                                let index = &summary.chunk_indexes[ci];
+                                for message in summary
+                                    .stream_chunk(bytes, index)
+                                    .context("streaming MCAP chunk")?
+                                {
+                                    let msg = message.context("reading MCAP message")?;
+                                    Self::decode_message(&msg, router, reconstructed, &buf);
+                                }
+                            }
+                            Ok(buf)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("decode worker panicked"))
+                    .collect()
+            });
+            for buf in buffers {
+                store.merge_from(buf?);
             }
         }
 
@@ -219,6 +267,59 @@ impl PlaybackStore {
 
         store.sort_and_finalize();
         Ok(Arc::new(store))
+    }
+
+    /// Decode one MCAP message into `store` using the file's routing. ZMQ topics
+    /// resolve through the registry router; the rest fall back to reconstructed
+    /// (MQTT/generated) bindings.
+    fn decode_message(
+        msg: &mcap::Message,
+        router: &TopicRouter,
+        reconstructed: &HashMap<String, Vec<ChannelBinding>>,
+        store: &dyn ChannelStore,
+    ) {
+        let topic = msg.channel.topic.as_str();
+        let zmq = router.bindings_for(topic);
+        let bindings: &[ChannelBinding] = if zmq.is_empty() {
+            reconstructed.get(topic).map(Vec::as_slice).unwrap_or(&[])
+        } else {
+            zmq
+        };
+        decode_batch(&msg.data, bindings, store);
+    }
+
+    /// Append every channel's samples from `other` onto this store. Both stores
+    /// are built from the same registry, so their channel slots line up by index.
+    /// Order is not preserved — [`sort_and_finalize`](Self::sort_and_finalize)
+    /// re-sorts afterwards.
+    fn merge_from(&mut self, other: PlaybackStore) {
+        for (dst, src) in self.channels.iter().zip(other.channels) {
+            let mut dst = dst.lock().unwrap();
+            match (&mut *dst, src.into_inner().unwrap()) {
+                (
+                    PlaybackChannel::Float { ts, vals },
+                    PlaybackChannel::Float { ts: t2, vals: v2 },
+                ) => {
+                    ts.extend(t2);
+                    vals.extend(v2);
+                }
+                (PlaybackChannel::Int { ts, vals }, PlaybackChannel::Int { ts: t2, vals: v2 }) => {
+                    ts.extend(t2);
+                    vals.extend(v2);
+                }
+                (
+                    PlaybackChannel::Bool { ts, vals },
+                    PlaybackChannel::Bool { ts: t2, vals: v2 },
+                ) => {
+                    ts.extend(t2);
+                    vals.extend(v2);
+                }
+                (PlaybackChannel::Text { lines }, PlaybackChannel::Text { lines: l2 }) => {
+                    lines.extend(l2);
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Learn one embedded schema per topic and build the routing bindings for a
