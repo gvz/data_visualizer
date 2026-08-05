@@ -1,7 +1,42 @@
+use std::sync::Arc;
+
+use crossbeam_channel::Sender;
+
 use crate::config::ChannelRegistry;
+use crate::record::mqtt_schema::DynamicProtoRegistry;
+use crate::record::RecordMsg;
 use crate::script::types::{CompiledScript, InputWindow, ScriptMeta};
 use crate::store::ChannelStore;
 use crate::types::{ChannelId, ChannelSnapshot, NumericVal, SampleType, TimeWindow};
+
+/// Records script-output samples into the active recording, the way the MQTT
+/// scalar path records discovered topics: each new sample becomes a
+/// [`RecordMsg::DynamicProto`] frame carrying its own generated schema, so a
+/// replayed file reconstructs the script channel by name. Lives for one engine
+/// tick, borrowing the engine's persistent proto registry (topic schemas lock
+/// once) and the installed record sender.
+pub struct ScriptRecorder<'a> {
+    proto: &'a mut DynamicProtoRegistry,
+    sender: &'a Sender<RecordMsg>,
+}
+
+impl<'a> ScriptRecorder<'a> {
+    pub fn new(proto: &'a mut DynamicProtoRegistry, sender: &'a Sender<RecordMsg>) -> Self {
+        Self { proto, sender }
+    }
+
+    /// Queue one output sample. A full queue or a type mismatch drops it.
+    fn emit(&mut self, name: &str, ts: i64, sample_type: SampleType, val: NumericVal) {
+        if let Some((schema, data)) = self.proto.record_numeric(name, ts, sample_type, val) {
+            let _ = self.sender.try_send(RecordMsg::DynamicProto {
+                topic: Arc::from(name),
+                schema,
+                data,
+                ts,
+            });
+        }
+    }
+}
 
 /// Per-script health, surfaced in the GUI.
 #[derive(Debug, Clone, PartialEq)]
@@ -83,13 +118,25 @@ impl ScriptRunner {
         &self.state
     }
 
-    /// Run one tick: resolve inputs, gather windows, call the compiled script,
-    /// and append new output samples (dedup by timestamp).
+    /// Run one tick with no recording. See [`Self::tick_rec`].
     pub fn tick(
         &mut self,
         store: &dyn ChannelStore,
         registry: &ChannelRegistry,
         window: TimeWindow,
+    ) {
+        self.tick_rec(store, registry, window, None);
+    }
+
+    /// Run one tick: resolve inputs, gather windows, call the compiled script,
+    /// and append new output samples (dedup by timestamp). When `rec` is set,
+    /// each newly-written sample is also queued to the recorder.
+    pub fn tick_rec(
+        &mut self,
+        store: &dyn ChannelStore,
+        registry: &ChannelRegistry,
+        window: TimeWindow,
+        mut rec: Option<&mut ScriptRecorder>,
     ) {
         if let ScriptState::Failed(_) = self.state {
             return; // A failed script stays parked until reloaded.
@@ -166,7 +213,11 @@ impl ScriptRunner {
                     let sty = self.meta.outputs[i].sample_type;
                     for (&t, &v) in batch.ts.iter().zip(&batch.vals) {
                         if t > self.last_written[i] {
-                            store.write_numeric(id, t, cast_to(sty, v));
+                            let nv = cast_to(sty, v);
+                            store.write_numeric(id, t, nv);
+                            if let Some(rec) = rec.as_deref_mut() {
+                                rec.emit(&self.meta.outputs[i].name, t, sty, nv);
+                            }
                             self.last_written[i] = t;
                         }
                     }
@@ -238,6 +289,45 @@ mod tests {
                 assert_eq!(vals, vec![4.0, 6.0]);
             }
             other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tick_rec_queues_output_samples_for_recording() {
+        let reg = registry_with_input();
+        let store = LiveStore::from_registry(&reg);
+        let in_id = reg.id("in.a").unwrap();
+        store.write_numeric(in_id, 10, NumericVal::Float(2.0));
+        store.write_numeric(in_id, 20, NumericVal::Float(3.0));
+
+        let meta = ScriptMeta { inputs: vec!["in.a".into()], outputs: vec![out("calc.out")] };
+        let compiled = Box::new(FakeScript(|inp: &[InputWindow]| {
+            let w = &inp[0];
+            Ok(vec![OutputBatch { ts: w.ts.clone(), vals: w.vals.clone() }])
+        }));
+        let mut runner = ScriptRunner::new("r".into(), meta, compiled, &store, &reg);
+
+        let (tx, rx) = crate::record::record_channel();
+        let mut proto = DynamicProtoRegistry::new();
+        let mut rec = ScriptRecorder::new(&mut proto, &tx);
+        runner.tick_rec(&store, &reg, ALL, Some(&mut rec));
+        assert_eq!(runner.state(), &ScriptState::Healthy);
+
+        // Both new output samples were queued as DynamicProto frames on the
+        // output channel's name, with a self-describing schema.
+        let frames: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(frames.len(), 2);
+        for (frame, (want_ts, want_val)) in frames.iter().zip([(10i64, 2.0f64), (20, 3.0)]) {
+            let RecordMsg::DynamicProto { topic, schema, data, ts } = frame else {
+                panic!("wrong variant: {frame:?}");
+            };
+            assert_eq!(topic.as_ref(), "calc.out");
+            assert_eq!(*ts, want_ts);
+            let pool = prost_reflect::DescriptorPool::decode(schema.as_ref()).unwrap();
+            let desc = pool.get_message_by_name("mqtt.CalcOut").unwrap();
+            let msg = prost_reflect::DynamicMessage::decode(desc, data.as_ref()).unwrap();
+            assert_eq!(msg.get_field_by_name("t_ns").unwrap().as_i64(), Some(want_ts));
+            assert_eq!(msg.get_field_by_name("value").unwrap().as_f64(), Some(want_val));
         }
     }
 

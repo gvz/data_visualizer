@@ -6,7 +6,7 @@ use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor, Value};
 use prost_types::field_descriptor_proto::{Label, Type};
 use prost_types::{DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet};
 
-use crate::types::SampleType;
+use crate::types::{NumericVal, SampleType};
 
 /// Bool payload tokens shared by inference and encoding.
 const BOOL_TRUE: &[&str] = &["1", "true", "True", "TRUE", "on", "ON", "yes", "YES"];
@@ -72,10 +72,35 @@ impl DynamicProtoRegistry {
         };
         let value = parse_value(payload, sample_type)?;
         let entry = self.entries.get(topic)?;
-        let mut msg = DynamicMessage::new(entry.descriptor.clone());
-        msg.set_field_by_name("t_ns", Value::I64(ts_ns));
-        msg.set_field_by_name("value", value);
-        Some((entry.schema_bytes.clone(), msg.encode_to_vec()))
+        Some(encode(entry, ts_ns, value))
+    }
+
+    /// Encode one script-output sample whose type is already known — no string
+    /// inference. The topic's schema is built (locked to `sample_type`) on first
+    /// sight. Returns `None` on a schema build failure or if the topic was
+    /// previously locked to a different type. Text outputs are unsupported
+    /// (script outputs are numeric) and return `None`.
+    pub fn record_numeric(
+        &mut self,
+        topic: &str,
+        ts_ns: i64,
+        sample_type: SampleType,
+        val: NumericVal,
+    ) -> Option<(Arc<[u8]>, Vec<u8>)> {
+        let value = match (sample_type, val) {
+            (SampleType::Float, NumericVal::Float(v)) => Value::F64(v),
+            (SampleType::Int, NumericVal::Int(v)) => Value::I64(v),
+            (SampleType::Bool, NumericVal::Bool(v)) => Value::Bool(v),
+            _ => return None,
+        };
+        if !self.entries.contains_key(topic) {
+            self.build_entry(topic, sample_type)?;
+        }
+        let entry = self.entries.get(topic)?;
+        if entry.sample_type != sample_type {
+            return None;
+        }
+        Some(encode(entry, ts_ns, value))
     }
 
     /// Build and cache the generated message + schema for a new topic.
@@ -109,6 +134,14 @@ impl DynamicProtoRegistry {
         }
         name
     }
+}
+
+/// Encode a `(t_ns, value)` message against a topic's cached descriptor.
+fn encode(entry: &TopicEntry, ts_ns: i64, value: Value) -> (Arc<[u8]>, Vec<u8>) {
+    let mut msg = DynamicMessage::new(entry.descriptor.clone());
+    msg.set_field_by_name("t_ns", Value::I64(ts_ns));
+    msg.set_field_by_name("value", value);
+    (entry.schema_bytes.clone(), msg.encode_to_vec())
 }
 
 fn is_textual_bool(payload: &str) -> bool {
@@ -238,6 +271,23 @@ mod tests {
             decode_back(&s3, &d3, "mqtt.AMsg").get_field_by_name("value").unwrap().as_str(),
             Some("hi")
         );
+    }
+
+    #[test]
+    fn record_numeric_encodes_declared_type_without_inference() {
+        let mut reg = DynamicProtoRegistry::new();
+        // A float output whose first value is a whole number must stay Float —
+        // string inference would have mis-locked it as Int.
+        let (s, d) = reg
+            .record_numeric("calc/out", 5, SampleType::Float, NumericVal::Float(5.0))
+            .unwrap();
+        let msg = decode_back(&s, &d, "mqtt.CalcOut");
+        assert_eq!(msg.get_field_by_name("t_ns").unwrap().as_i64(), Some(5));
+        assert_eq!(msg.get_field_by_name("value").unwrap().as_f64(), Some(5.0));
+        // Type is locked to Float: an Int sample on the same topic is rejected.
+        assert!(reg
+            .record_numeric("calc/out", 6, SampleType::Int, NumericVal::Int(7))
+            .is_none());
     }
 
     #[test]

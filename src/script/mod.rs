@@ -29,8 +29,10 @@ use crossbeam_channel::{Receiver, Sender};
 
 use crate::config::ChannelRegistry;
 use crate::ingest::{DataSource, SourceHandle, CONNECTING, LIVE, TIMEOUT};
+use crate::record::mqtt_schema::DynamicProtoRegistry;
+use crate::record::RecordMsg;
 use crate::script::config::ScriptInstance;
-use crate::script::runner::ScriptRunner;
+use crate::script::runner::{ScriptRecorder, ScriptRunner};
 use crate::script::types::{
     expand_output_name, parse_sample_type, validate_meta, OutputSpec, ScriptLoader, ScriptMeta,
 };
@@ -272,7 +274,12 @@ impl ScriptEngine {
         self.owned_outputs.lock().unwrap().remove(id);
     }
 
-    fn run_loop(self, store: Arc<dyn ChannelStore>, conn_state: Arc<AtomicU8>) {
+    fn run_loop(
+        self,
+        store: Arc<dyn ChannelStore>,
+        conn_state: Arc<AtomicU8>,
+        record_sender: Arc<Mutex<Option<Sender<RecordMsg>>>>,
+    ) {
         // Capability gate: without numba the whole feature is disabled.
         if let Err(e) = (self.probe)() {
             *self.disabled.lock().unwrap() = Some(format!("scripting unavailable: {e}"));
@@ -299,6 +306,10 @@ impl ScriptEngine {
         }
         conn_state.store(LIVE, Ordering::Relaxed);
 
+        // Per-topic schema cache for recording script outputs; persists across
+        // ticks so each output channel's schema is generated (and locked) once.
+        let mut proto = DynamicProtoRegistry::new();
+
         let tick = Duration::from_millis(16);
         loop {
             // Drain one command, blocking up to a tick so updates are prompt.
@@ -313,12 +324,16 @@ impl ScriptEngine {
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             }
 
-            // Tick all runners.
+            // Tick all runners. While recording, each new output sample is also
+            // queued to the recorder as a self-describing DynamicProto frame.
             let now = store.now_ns();
             let window = TimeWindow::last((self.window_s * 1e9) as i64, now);
+            let guard = record_sender.lock().unwrap();
+            let mut rec = guard.as_ref().map(|tx| ScriptRecorder::new(&mut proto, tx));
             for runner in &mut runners {
-                runner.tick(store.as_ref(), &self.registry, window);
+                runner.tick_rec(store.as_ref(), &self.registry, window, rec.as_mut());
             }
+            drop(guard);
             Self::publish_status(&self.status, &runners, &failed);
         }
     }
@@ -333,8 +348,11 @@ impl DataSource for ScriptEngine {
         let conn_state = Arc::new(AtomicU8::new(CONNECTING));
         let record_sender = Arc::new(Mutex::new(None));
         let state_for_thread = conn_state.clone();
+        let record_for_thread = record_sender.clone();
         let engine = *self;
-        std::thread::spawn(move || engine.run_loop(store, state_for_thread));
+        std::thread::spawn(move || {
+            engine.run_loop(store, state_for_thread, record_for_thread)
+        });
         SourceHandle {
             name: "scripts".to_string(),
             conn_state,
