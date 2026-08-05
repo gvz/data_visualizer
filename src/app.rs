@@ -783,6 +783,10 @@ impl DataVisApp {
                 // because it needs `&mut rs`, which the match's no-binding arms
                 // deliberately avoid so the live arm can call `&mut self` methods.
                 let mut close_replay = false;
+                // Set when the "zoom to full recording" button is pressed; the
+                // new global window span (seconds) is applied after the block,
+                // since `rs` holds a mutable borrow of `self` here.
+                let mut zoom_full: Option<f64> = None;
                 if let AppMode::Replay(ref mut rs) = self.mode {
                     ui.colored_label(egui::Color32::LIGHT_BLUE, "REPLAY");
                     ui.separator();
@@ -824,10 +828,11 @@ impl DataVisApp {
                         .size()
                         .x
                     });
-                    let close_w = ui.spacing().interact_size.y + ui.spacing().item_spacing.x;
+                    // Two trailing icon buttons: zoom-to-full and close.
+                    let btn_w = ui.spacing().interact_size.y + ui.spacing().item_spacing.x;
                     let slider_w = (ui.available_width()
                         - readout_w
-                        - close_w
+                        - btn_w * 2.0
                         - ui.spacing().item_spacing.x * 2.0)
                         .max(120.0);
                     let saved_slider_w = ui.spacing().slider_width;
@@ -842,9 +847,24 @@ impl DataVisApp {
 
                     ui.label(readout_str);
 
+                    // Zoom out to the whole recording: widen the global window to
+                    // the full duration and jump the position to the end, so the
+                    // panels' trailing `[end - dur, end]` view spans start..end.
+                    if ui
+                        .button(icon::ARROWS_OUT)
+                        .on_hover_text("Zoom to full recording")
+                        .clicked()
+                    {
+                        rs.store.position_ns.store(start + dur, Ordering::Relaxed);
+                        zoom_full = Some(dur as f64 / 1e9);
+                    }
+
                     if ui.button(icon::X).on_hover_text("Close recording").clicked() {
                         close_replay = true;
                     }
+                }
+                if let Some(secs) = zoom_full {
+                    self.default_window_s = secs;
                 }
                 if close_replay {
                     self.close_replay();
