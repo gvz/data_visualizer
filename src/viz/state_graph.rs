@@ -78,14 +78,22 @@ pub fn ctor(
 
 /// Contiguous runs of equal values: (start_ts, end_ts, value). The final
 /// segment ends at the last timestamp.
-pub(crate) fn segments(ts: &[i64], vals: &[i64]) -> Vec<(i64, i64, i64)> {
+pub(crate) fn segments(ts: &[i64], vals: &[i64], breaks: &[i64]) -> Vec<(i64, i64, i64)> {
     if ts.is_empty() {
         return Vec::new();
     }
     let mut out = Vec::new();
     let (mut start, mut cur) = (ts[0], vals[0]);
     for i in 1..ts.len() {
-        if vals[i] != cur {
+        // A stitched-recording boundary between two samples ends the current
+        // run at the earlier sample and starts a fresh one at the later sample,
+        // leaving a gap. The held state must not bridge the join between files.
+        let broken = breaks.iter().any(|&b| b > ts[i - 1] && b <= ts[i]);
+        if broken {
+            out.push((start, ts[i - 1], cur));
+            start = ts[i];
+            cur = vals[i];
+        } else if vals[i] != cur {
             out.push((start, ts[i], cur));
             start = ts[i];
             cur = vals[i];
@@ -109,8 +117,9 @@ pub(crate) fn painted_spans(
     vals: &[i64],
     t0: i64,
     end_ns: i64,
+    breaks: &[i64],
 ) -> Vec<(i64, i64, i64)> {
-    let mut segs = segments(ts, vals);
+    let mut segs = segments(ts, vals, breaks);
     if let Some(first) = segs.first_mut() {
         first.0 = first.0.min(t0);
     }
@@ -251,7 +260,10 @@ impl VizPanel for StateGraphPanel {
         let x_of = |t: i64| {
             rect.left() + rect.width() * ((t - vt0) as f32 / vspan as f32)
         };
-        for (s, e, v) in painted_spans(&ts, &vals, t0, end_ns) {
+        // Joins between stitched recordings must not carry a held state across
+        // the gap; break the spans there. Empty for a single file or live data.
+        let breaks = store.break_times();
+        for (s, e, v) in painted_spans(&ts, &vals, t0, end_ns, breaks) {
             let seg = egui::Rect::from_min_max(
                 egui::pos2(x_of(s), rect.top()),
                 egui::pos2(x_of(e), rect.bottom()),
@@ -383,9 +395,20 @@ type = "text"
     fn segments_merge_consecutive_values() {
         let ts = [0i64, 1, 2, 3, 4];
         let vals = [0i64, 0, 1, 1, 0];
-        assert_eq!(segments(&ts, &vals), vec![(0, 2, 0), (2, 4, 1), (4, 4, 0)]);
-        assert!(segments(&[], &[]).is_empty());
-        assert_eq!(segments(&[7], &[3]), vec![(7, 7, 3)]);
+        assert_eq!(segments(&ts, &vals, &[]), vec![(0, 2, 0), (2, 4, 1), (4, 4, 0)]);
+        assert!(segments(&[], &[], &[]).is_empty());
+        assert_eq!(segments(&[7], &[3], &[]), vec![(7, 7, 3)]);
+    }
+
+    #[test]
+    fn segments_break_splits_run_and_leaves_gap() {
+        // Same value on both sides of a stitched-file join: without the break it
+        // would be one merged band (0,3,5); the break at t=2 must split it into
+        // a run ending at the last pre-break sample and a fresh run after it,
+        // leaving the (1..2] region as a gap.
+        let ts = [0i64, 1, 2, 3];
+        let vals = [5i64, 5, 5, 5];
+        assert_eq!(segments(&ts, &vals, &[2]), vec![(0, 1, 5), (2, 3, 5)]);
     }
 
     #[test]
@@ -396,7 +419,7 @@ type = "text"
         let (t0, end) = (0i64, 10_000i64);
         let ts = [9_990i64, 9_995, 10_000];
         let vals = [1i64, 2, 2];
-        let spans = painted_spans(&ts, &vals, t0, end);
+        let spans = painted_spans(&ts, &vals, t0, end, &[]);
         assert_eq!(spans.first().unwrap().0, t0, "first span must reach left edge");
         assert_eq!(spans.last().unwrap().1, end, "last span must reach right edge");
         // Contiguous coverage, no gaps.
@@ -410,7 +433,7 @@ type = "text"
 
     #[test]
     fn painted_spans_empty_without_data() {
-        assert!(painted_spans(&[], &[], 0, 10).is_empty());
+        assert!(painted_spans(&[], &[], 0, 10, &[]).is_empty());
     }
 
     #[test]

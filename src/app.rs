@@ -175,8 +175,8 @@ pub struct DataVisApp {
     mode: AppMode,
     /// In-flight recording load. The MCAP decode runs on a worker thread so the
     /// UI stays responsive; the result arrives here and is applied on the frame
-    /// it lands. `PathBuf` is the file being loaded (for the status message).
-    pending_load: Option<(PathBuf, crossbeam_channel::Receiver<anyhow::Result<Arc<PlaybackStore>>>)>,
+    /// it lands. The `String` is a label for the file(s) being loaded (status).
+    pending_load: Option<(String, crossbeam_channel::Receiver<anyhow::Result<Arc<PlaybackStore>>>)>,
     // Recording state
     record_handle: Option<RecordHandle>,
     record_sender_slots: Vec<Arc<Mutex<Option<crossbeam_channel::Sender<crate::record::RecordMsg>>>>>,
@@ -415,25 +415,36 @@ impl DataVisApp {
             self.status = "Already loading a recording…".to_string();
             return;
         }
-        let Some(path) = rfd::FileDialog::new()
+        let Some(paths) = rfd::FileDialog::new()
             .add_filter("MCAP recording", &["mcap"])
-            .pick_file()
+            .pick_files()
         else {
             return;
+        };
+        if paths.is_empty() {
+            return;
+        }
+
+        // Label for the status line: single filename, or "N recordings".
+        let label = if paths.len() == 1 {
+            paths[0].display().to_string()
+        } else {
+            format!("{} recordings", paths.len())
         };
 
         // Decode on a worker thread — large MCAPs take seconds and would
         // otherwise freeze the UI. The result is polled in `poll_pending_load`.
         // `ChannelRegistry` uses interior mutability (load calls `add_dynamic`),
-        // so the shared Arc is safe to hand to the worker.
+        // so the shared Arc is safe to hand to the worker. Multiple files are
+        // stitched onto one timeline; same-named channels merge into one.
         let (tx, rx) = crossbeam_channel::bounded(1);
         let channels = self.channels.clone();
-        let load_path = path.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(PlaybackStore::load(&load_path, &channels));
+            let refs: Vec<&std::path::Path> = paths.iter().map(PathBuf::as_path).collect();
+            let _ = tx.send(PlaybackStore::load_many(&refs, &channels));
         });
-        self.pending_load = Some((path.clone(), rx));
-        self.status = format!("Loading {}…", path.display());
+        self.pending_load = Some((label.clone(), rx));
+        self.status = format!("Loading {label}…");
     }
 
     /// Apply a finished background load, if one has arrived. Called once per
@@ -449,7 +460,7 @@ impl DataVisApp {
                 return;
             }
         };
-        let (path, _) = self.pending_load.take().unwrap();
+        let (label, _) = self.pending_load.take().unwrap();
         match result {
             Ok(playback) => {
                 self.store = playback.clone();
@@ -467,7 +478,7 @@ impl DataVisApp {
                 // no MQTT discovery tick to do this later.
                 self.workspace
                     .refresh_bindings(&self.channels, self.store.as_ref(), None);
-                self.status = format!("Loaded {}", path.display());
+                self.status = format!("Loaded {label}");
             }
             Err(e) => {
                 self.status = format!("Failed to load recording: {e}");

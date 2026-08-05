@@ -28,6 +28,13 @@ pub trait ChannelStore: Send + Sync {
     /// equal the ChannelId the registry assigned it. Live-only; the default
     /// is a no-op (replay has a fixed channel set).
     fn add_channel(&self, _meta: ChannelMeta) {}
+    /// Sorted timestamps where a line plot must not connect across the gap
+    /// (e.g. the join between two stitched recordings). A panel breaks its
+    /// polyline at any of these that falls between two consecutive samples.
+    /// Empty for a continuous store (the default).
+    fn break_times(&self) -> &[i64] {
+        &[]
+    }
     /// Wall clock by default; PlaybackStore overrides to return playback position.
     fn now_ns(&self) -> i64 {
         crate::types::now_ns()

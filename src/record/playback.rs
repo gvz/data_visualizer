@@ -72,6 +72,10 @@ pub struct PlaybackStore {
     pub position_ns: Arc<AtomicI64>,
     pub duration_ns: i64,
     pub start_ns: i64,
+    /// Sorted start times of each stitched dataset after the first. A line plot
+    /// must not connect the sample before one of these to the sample at/after
+    /// it, so the join between two recordings is drawn as a gap, not a line.
+    breaks: Vec<i64>,
 }
 
 impl PlaybackStore {
@@ -87,6 +91,7 @@ impl PlaybackStore {
             position_ns: Arc::new(AtomicI64::new(0)),
             duration_ns: 0,
             start_ns: 0,
+            breaks: Vec::new(),
         }
     }
 
@@ -148,16 +153,85 @@ impl PlaybackStore {
     }
 
     pub fn load(path: &Path, registry: &ChannelRegistry) -> anyhow::Result<Arc<Self>> {
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("reading MCAP file {}", path.display()))?;
+        Self::load_many(std::slice::from_ref(&path), registry)
+    }
 
-        // Collect one embedded schema per topic. Prefer the MCAP summary
-        // section: channel/schema records are indexed in the footer, so we
-        // learn every schema without decompressing a single message chunk.
-        // Files that weren't finalised (e.g. a crash mid-recording) carry no
-        // summary — fall back to a full message scan for those.
+    /// Load one or more MCAP recordings into a single playback store. Channels
+    /// are keyed by name via the shared registry, so same-named channels across
+    /// files merge into one. Timestamps are preserved exactly as recorded; the
+    /// files sit on one shared timeline at their original times. The start time
+    /// of each file after the first is recorded as a break so a line plot does
+    /// not draw a segment bridging the gap between two recordings.
+    pub fn load_many(paths: &[&Path], registry: &ChannelRegistry) -> anyhow::Result<Arc<Self>> {
+        anyhow::ensure!(!paths.is_empty(), "no recording files to load");
+
+        // Per-file decode plan, retained through the decode phase.
+        struct FilePlan<'a> {
+            path: &'a Path,
+            router: TopicRouter,
+            reconstructed: HashMap<String, Vec<ChannelBinding>>,
+            /// (min, max) sample time in the file, if it has any data.
+            bounds: Option<(i64, i64)>,
+        }
+
+        // Phase 1: learn schemas and register channels for every file BEFORE
+        // building the store, so its per-channel slots cover every file's
+        // channels (a later file may introduce a new one).
+        let mut plans = Vec::with_capacity(paths.len());
+        for path in paths {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("reading MCAP file {}", path.display()))?;
+            let (router, reconstructed) = Self::plan_file(&bytes, registry)?;
+            let bounds = Self::time_bounds(&bytes)
+                .with_context(|| format!("reading time bounds of {}", path.display()))?;
+            plans.push(FilePlan { path, router, reconstructed, bounds });
+        }
+
+        // Build the store AFTER all add_dynamic calls so every channel exists.
+        let mut store = Self::new(registry);
+
+        // Phase 2: decode each file into the store with its original timestamps.
+        for plan in &plans {
+            let bytes = std::fs::read(plan.path)
+                .with_context(|| format!("reading MCAP file {}", plan.path.display()))?;
+            for message in mcap::MessageStream::new(&bytes)
+                .context("opening MCAP message stream")?
+            {
+                let msg = message.context("reading MCAP message")?;
+                let topic = msg.channel.topic.as_str();
+                let zmq = plan.router.bindings_for(topic);
+                let bindings: &[ChannelBinding] = if zmq.is_empty() {
+                    plan.reconstructed.get(topic).map(Vec::as_slice).unwrap_or(&[])
+                } else {
+                    zmq
+                };
+                decode_batch(&msg.data, bindings, &store);
+            }
+        }
+
+        // A line break sits at the start of every dataset except the earliest in
+        // time — order-independent, so it works no matter what order the files
+        // were picked in. The earliest file's start needs no break (nothing
+        // precedes it).
+        let mut mins: Vec<i64> = plans.iter().filter_map(|p| p.bounds.map(|(mn, _)| mn)).collect();
+        mins.sort_unstable();
+        store.breaks = mins.into_iter().skip(1).collect();
+
+        store.sort_and_finalize();
+        Ok(Arc::new(store))
+    }
+
+    /// Learn one embedded schema per topic and build the routing bindings for a
+    /// single file, registering any reconstructed (MQTT/generated) channels on
+    /// the shared registry. Prefers the MCAP summary section — channel/schema
+    /// records are indexed in the footer, so no message chunk is decompressed.
+    /// Files with no summary (e.g. a crash mid-recording) fall back to a scan.
+    fn plan_file(
+        bytes: &[u8],
+        registry: &ChannelRegistry,
+    ) -> anyhow::Result<(TopicRouter, HashMap<String, Vec<ChannelBinding>>)> {
         let mut topic_schemas: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-        let summary = mcap::Summary::read(&bytes).context("reading MCAP summary")?;
+        let summary = mcap::Summary::read(bytes).context("reading MCAP summary")?;
         match summary.filter(|s| !s.channels.is_empty()) {
             Some(summary) => {
                 for channel in summary.channels.values() {
@@ -169,7 +243,7 @@ impl PlaybackStore {
                 }
             }
             None => {
-                for message in mcap::MessageStream::new(&bytes)
+                for message in mcap::MessageStream::new(bytes)
                     .context("opening MCAP message stream")?
                 {
                     let msg = message.context("reading MCAP message")?;
@@ -223,26 +297,34 @@ impl PlaybackStore {
             );
         }
 
-        // Build the store AFTER add_dynamic so reconstructed channels are included.
-        let mut store = Self::new(registry);
+        Ok((router, reconstructed))
+    }
 
-        // Decode every message into the store (the one unavoidable full scan).
-        for message in mcap::MessageStream::new(&bytes)
+    /// The (min, max) message time in a file. Uses the summary statistics when
+    /// present (no decompression); otherwise scans message log times. `log_time`
+    /// equals the sample `t_ns` the recorder writes, so this matches the decoded
+    /// sample timeline used for stitching. Returns None for an empty file.
+    fn time_bounds(bytes: &[u8]) -> anyhow::Result<Option<(i64, i64)>> {
+        if let Some(summary) = mcap::Summary::read(bytes).context("reading MCAP summary")? {
+            if let Some(stats) = summary.stats {
+                if stats.message_count > 0 {
+                    return Ok(Some((
+                        stats.message_start_time as i64,
+                        stats.message_end_time as i64,
+                    )));
+                }
+            }
+        }
+        let mut min = i64::MAX;
+        let mut max = i64::MIN;
+        for message in mcap::MessageStream::new(bytes)
             .context("opening MCAP message stream")?
         {
-            let msg = message.context("reading MCAP message")?;
-            let topic = msg.channel.topic.as_str();
-            let zmq = router.bindings_for(topic);
-            let bindings: &[ChannelBinding] = if zmq.is_empty() {
-                reconstructed.get(topic).map(Vec::as_slice).unwrap_or(&[])
-            } else {
-                zmq
-            };
-            decode_batch(&msg.data, bindings, &store);
+            let t = message.context("reading MCAP message")?.log_time as i64;
+            min = min.min(t);
+            max = max.max(t);
         }
-
-        store.sort_and_finalize();
-        Ok(Arc::new(store))
+        Ok((min <= max).then_some((min, max)))
     }
 }
 
@@ -342,6 +424,10 @@ impl ChannelStore for PlaybackStore {
 
     fn now_ns(&self) -> i64 {
         self.position_ns.load(Ordering::Relaxed)
+    }
+
+    fn break_times(&self) -> &[i64] {
+        &self.breaks
     }
 }
 
@@ -511,6 +597,54 @@ type = "float"
         let store = PlaybackStore::load(&path, &registry).unwrap();
         assert_eq!(store.start_ns, 1_000_000_000);
         assert_eq!(store.duration_ns, 3_000_000_000);
+    }
+
+    #[test]
+    fn load_many_preserves_timestamps_merges_channels_and_records_break() {
+        use crate::store::ChannelStore;
+        let (schema, _dir, registry) = make_proto_and_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = dir.path().join("a.mcap");
+        let path_b = dir.path().join("b.mcap");
+        // Two files recording the SAME channel ("accel") at distinct times.
+        write_test_mcap(&path_a, &schema, &[(1_000_000_000, 1.0), (2_000_000_000, 2.0)]);
+        write_test_mcap(&path_b, &schema, &[(5_000_000_000, 3.0), (6_000_000_000, 4.0)]);
+
+        let store = PlaybackStore::load_many(&[&path_a, &path_b], &registry).unwrap();
+        let id = registry.id("accel.x").unwrap();
+
+        // Same-named channel across files → one merged channel, ORIGINAL times.
+        let all = TimeWindow { start_ns: i64::MIN, end_ns: i64::MAX };
+        match store.snapshot(id, all) {
+            ChannelSnapshot::Float { ts, vals } => {
+                assert_eq!(
+                    ts,
+                    vec![1_000_000_000, 2_000_000_000, 5_000_000_000, 6_000_000_000]
+                );
+                assert_eq!(vals.len(), 4);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        // Timeline spans both files at their real times.
+        assert_eq!(store.start_ns, 1_000_000_000);
+        assert_eq!(store.duration_ns, 5_000_000_000);
+        // The second file's start is a line break so the join is not connected.
+        assert_eq!(store.break_times(), &[5_000_000_000]);
+    }
+
+    #[test]
+    fn load_many_break_is_independent_of_file_order() {
+        let (schema, _dir, registry) = make_proto_and_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let early = dir.path().join("early.mcap");
+        let late = dir.path().join("late.mcap");
+        write_test_mcap(&early, &schema, &[(1_000_000_000, 1.0), (2_000_000_000, 2.0)]);
+        write_test_mcap(&late, &schema, &[(5_000_000_000, 3.0), (6_000_000_000, 4.0)]);
+
+        // Load with the LATER file first — the break must still fall at the
+        // later dataset's start, not the first-loaded file's.
+        let store = PlaybackStore::load_many(&[&late, &early], &registry).unwrap();
+        assert_eq!(store.break_times(), &[5_000_000_000]);
     }
 
     /// Write a single-message MCAP for one MQTT topic using the recorder's own

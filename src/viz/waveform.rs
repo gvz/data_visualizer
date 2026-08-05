@@ -327,15 +327,43 @@ impl VizPanel for WaveformPanel {
         if let Some((lo, hi)) = self.y_zoom {
             plot = plot.include_y(lo).include_y(hi);
         }
+        // Timestamps where the polyline must not span the gap — the joins
+        // between stitched recordings. Empty for a single file or live data.
+        let breaks = store.break_times();
         let inner = plot.show(ui, |plot_ui| {
             for (i, ts, vals) in &snaps {
                 let b = &self.bound[*i];
                 if self.hidden.contains(&b.name) {
                     continue;
                 }
-                let points = decimate_minmax(ts, vals, anchor, MAX_PLOT_BUCKETS);
                 let color = binding_color(b);
-                plot_ui.line(Line::new(PlotPoints::from(points)).color(color).name(&b.name));
+                // Split the samples at dataset breaks and draw one line per
+                // segment, so no segment bridges the gap between two recordings.
+                // Legend name goes on the first segment only.
+                let n = ts.len();
+                let mut splits: Vec<usize> = Vec::new();
+                for &brk in breaks {
+                    let idx = ts.partition_point(|&t| t < brk);
+                    if idx > 0 && idx < n && splits.last() != Some(&idx) {
+                        splits.push(idx);
+                    }
+                }
+                let mut seg_start = 0usize;
+                let mut first_seg = true;
+                for &split in splits.iter().chain(std::iter::once(&n)) {
+                    let (s, e) = (seg_start, split);
+                    seg_start = split;
+                    if e <= s {
+                        continue;
+                    }
+                    let points = decimate_minmax(&ts[s..e], &vals[s..e], anchor, MAX_PLOT_BUCKETS);
+                    let mut line = Line::new(PlotPoints::from(points)).color(color);
+                    if first_seg {
+                        line = line.name(&b.name);
+                        first_seg = false;
+                    }
+                    plot_ui.line(line);
+                }
                 if self.dots {
                     // Marker on each real sample in the window.
                     let pts: Vec<[f64; 2]> = ts
