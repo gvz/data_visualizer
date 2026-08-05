@@ -39,18 +39,27 @@ Two facts make a lazy design cheap to slot in:
 - **Text/log channels retained fully in RAM at load.** Logs are low-volume, so
   this is cheap; it is the one component that stays `O(file)` in memory.
   Documented v1 limitation; future work spills them to on-demand decode.
+- **No separate state-channel component.** Replay has no coded-text: a
+  `text_coded` channel loads as plain `Text`, and `state_graph.rs` already
+  interns `Text`/`Int`/`Bool` snapshots itself. So numeric channels
+  (`Float`/`Int`/`Bool`) all use the envelope, and text stays exact.
+  Consequence: a state graph of a *high-rate* `Int` channel at near-whole-file
+  zoom shows approximate bands; low-rate state channels touch few chunks and
+  stay in the exact detail path, so are unaffected. Documented limitation
+  alongside blocky mid-zoom.
 
 ## Architecture
 
-New module `src/record/lazy/`. `LazyPlaybackStore` implements the existing
-`ChannelStore` trait unchanged, so viz panels and `app.rs` need no edits beyond
-which store type is constructed on load.
+New module `src/record/lazy/` holds the components. The public store type keeps
+its current name `PlaybackStore` (in `src/record/playback.rs`) so `app.rs` —
+which holds `Arc<PlaybackStore>` and reads its `position_ns` / `start_ns` /
+`duration_ns` fields directly — needs no edits. Its internals are replaced;
+`load`/`load_many` signatures and the `ChannelStore` impl are preserved.
 
 ```
-LazyPlaybackStore
+PlaybackStore  (src/record/playback.rs)
 ├── sources:   Vec<RecordingSource>   // one per stitched file
 ├── envelope:  Envelope               // numeric channels, decimated min/max
-├── states:    StateSpans             // coded-text channels, run-length
 ├── text:      TextRetention          // text/log channels, retained in full
 ├── cache:     ChunkCache             // byte-budgeted LRU of decoded chunks
 ├── metas:     Vec<ChannelMeta>
@@ -96,19 +105,13 @@ struct Bucket { t_min: i64, v_min: f64, t_max: i64, v_max: f64, any: bool }
 `((ts - start_ns) * B / (duration_ns + 1))`, clamped to `0..B`. Built once at
 load; `any=false` buckets (no sample) are skipped when read.
 
-**`StateSpans`** — coded-text (state) channels. A run-length list
-`Vec<(code: i64, start_ns: i64, end_ns: i64)>` per channel, built at load by
-collapsing consecutive equal codes. Exact at every zoom, small when transitions
-≪ samples. The code→label table is retained alongside (as `state_labels`
-returns today).
-
 **`TextRetention`** — text/log channels retained fully: `Vec<(i64, String)>`
 per channel (today's `PlaybackChannel::Text`). `O(file)` memory for these
 channels only; accepted v1 limitation.
 
 ## Data flow
 
-### Load (`LazyPlaybackStore::load_many(paths, registry)`)
+### Load (`PlaybackStore::load_many(paths, registry)`)
 
 1. For each path: `mmap` the file; read `Summary`; if present, build `spans`
    from `chunk_indexes` (each `ChunkIndex` carries `message_start_time` /
@@ -123,11 +126,9 @@ channels only; accepted v1 limitation.
    decode required.
 4. **One parallel pass** over all chunks of all files (reuse today's
    `thread::scope` per-chunk split): each worker decodes its chunk range into a
-   thread-local partial `Envelope` + partial `StateSpans` + partial text,
-   **retaining no raw numeric samples**. Merge partials: envelope buckets by
-   min/max, state spans by concatenation then coalescing across worker
-   boundaries, text by time-ordered merge. Load stays `O(file)` time, drops to
-   `O(buckets + transitions + text)` memory.
+   thread-local partial `Envelope` + partial text, **retaining no raw numeric
+   samples**. Merge partials: envelope buckets by min/max, text by time-ordered
+   merge. Load stays `O(file)` time, drops to `O(buckets + text)` memory.
 
 ### Read `snapshot(channel, window)`
 
@@ -143,19 +144,19 @@ Numeric channel:
    min/max. `decimate_minmax` in the waveform then further reduces to
    `MAX_PLOT_BUCKETS` for drawing.
 
-State channel: slice `StateSpans` to the window (exact, both paths).
-Text channel: `partition_point`-slice the retained `Vec` (as today).
+Text channel: `partition_point`-slice the retained `Vec` (as today, exact at
+all zooms). `Int`/`Bool` shown as a state graph follow the numeric paths above.
 
 ### Read `latest_at(channel, end_ns)` / `latest`
 
-Numeric/text: locate the source+chunk whose span contains `end_ns` (or the last
-span ending ≤ `end_ns`), decode it via the cache, return the last sample with
-`ts ≤ end_ns`. Exact, no full retention. State: last span with `start ≤ end_ns`.
-`latest()` uses `position_ns` as `end_ns`, matching today's behaviour.
+Numeric: locate the source+chunk whose span contains `end_ns` (or the last span
+ending ≤ `end_ns`), decode it via the cache, return the last sample with
+`ts ≤ end_ns`. Exact, no full retention. Text: `partition_point` the retained
+`Vec`. `latest()` uses `position_ns` as `end_ns`, matching today's behaviour.
 
 ## Memory model
 
-Resident RAM = envelope (`B × numeric channels`) + state spans + retained text
+Resident RAM = envelope (`B × numeric channels`) + retained text
 + `ChunkCache` cap + OS-paged mmap working set. **All independent of total file
 size** except retained text (documented limitation). Tunable knobs:
 `cache_bytes` (512 MB), `envelope_buckets` (16384), `chunk_budget` (16).
@@ -200,8 +201,6 @@ Reuse the existing `write_test_mcap` / `write_mqtt_mcap` harness.
   correct last-≤ sample without decoding unrelated chunks.
 - **Cache bound:** decode `N+1` distinct chunks with a cap holding `N`; assert
   retained bytes ≤ cap and the evicted chunk re-decodes correctly.
-- **State spans:** coded-text channel → run-length spans exact and coalesced
-  across worker boundaries.
 - **Stitching/breaks preserved:** the two existing `load_many` tests
   (timestamps merged, break order-independent) pass against the lazy store.
 
