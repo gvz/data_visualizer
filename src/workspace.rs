@@ -401,6 +401,18 @@ impl Workspace {
         self.active = name.to_string();
     }
 
+    /// Remove a screen. Refuses to drop the last screen; if the active screen
+    /// is removed, activates the first remaining one.
+    pub fn remove_screen(&mut self, name: &str) {
+        if self.screens.len() <= 1 {
+            return;
+        }
+        self.screens.remove(name);
+        if self.active == name {
+            self.active = self.screens.keys().next().cloned().unwrap_or_default();
+        }
+    }
+
     pub fn add_panel(
         &mut self,
         entry: &PanelEntry,

@@ -165,6 +165,8 @@ pub struct DataVisApp {
     layout_path: PathBuf,
     add_panel: AddPanelDialog,
     new_screen_name: String,
+    /// Set the frame the add-screen menu opens so the name field grabs focus.
+    focus_screen_field: bool,
     status: String,
     /// When set, `status` is cleared once this instant passes. Used for
     /// transient confirmations (e.g. "layout saved") that should not linger.
@@ -265,6 +267,7 @@ impl DataVisApp {
             layout_path,
             add_panel: AddPanelDialog { panel_type, ..Default::default() },
             new_screen_name: String::new(),
+            focus_screen_field: false,
             status: String::new(),
             status_clear_at: None,
             conn_states,
@@ -478,31 +481,48 @@ impl DataVisApp {
     fn toolbar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                // Screen selector
-                ui.label("screen:");
+                // Screen tabs
                 let mut selected = self.workspace.active.clone();
-                egui::ComboBox::from_id_source("screen-select")
-                    .selected_text(&selected)
-                    .show_ui(ui, |ui| {
-                        for name in self.workspace.screens.keys() {
-                            ui.selectable_value(&mut selected, name.clone(), name);
-                        }
+                let mut to_delete: Option<String> = None;
+                let can_delete = self.workspace.screens.len() > 1;
+                for name in self.workspace.screens.keys() {
+                    let resp =
+                        ui.selectable_label(*name == self.workspace.active, name);
+                    resp.context_menu(|ui| {
+                        ui.add_enabled_ui(can_delete, |ui| {
+                            if ui.button(format!("{} Delete", icon::TRASH)).clicked() {
+                                to_delete = Some(name.clone());
+                                ui.close_menu();
+                            }
+                        });
                     });
-                if selected != self.workspace.active {
+                    if resp.clicked() {
+                        selected = name.clone();
+                    }
+                }
+                if let Some(name) = to_delete {
+                    self.workspace.remove_screen(&name);
+                } else if selected != self.workspace.active {
                     self.workspace.active = selected;
                 }
-                ui.menu_button(format!("{} screen", icon::MONITOR), |ui| {
-                    ui.text_edit_singleline(&mut self.new_screen_name);
-                    if ui
-                        .button(format!("{} Create", icon::CHECK))
-                        .clicked()
-                        && !self.new_screen_name.is_empty()
-                    {
+                let add = ui.menu_button(icon::PLUS, |ui| {
+                    let edit = ui.text_edit_singleline(&mut self.new_screen_name);
+                    if self.focus_screen_field {
+                        edit.request_focus();
+                        self.focus_screen_field = false;
+                    }
+                    let entered = edit.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let clicked = ui.button(format!("{} Create", icon::CHECK)).clicked();
+                    if (entered || clicked) && !self.new_screen_name.is_empty() {
                         let name = std::mem::take(&mut self.new_screen_name);
                         self.workspace.add_screen(&name);
                         ui.close_menu();
                     }
                 });
+                if add.response.on_hover_text("Add screen").clicked() {
+                    self.focus_screen_field = true;
+                }
                 if ui
                     .button(icon::PLUS_SQUARE)
                     .on_hover_text("Add panel")
