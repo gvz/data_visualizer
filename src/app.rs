@@ -718,15 +718,84 @@ impl DataVisApp {
                         )
                         .on_hover_text("scrub position / history covered by slider");
                     }
-                    AppMode::Replay(_) => {
-                        ui.colored_label(egui::Color32::LIGHT_BLUE, "REPLAY");
-                        ui.separator();
-                    }
+                    AppMode::Replay(_) => {}
                 }
 
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(&self.status);
-                });
+                // Replay transport — lives in the toolbar so play/scrub stay in
+                // the same place as the live controls. Rendered after the match
+                // because it needs `&mut rs`, which the match's no-binding arms
+                // deliberately avoid so the live arm can call `&mut self` methods.
+                let mut close_replay = false;
+                if let AppMode::Replay(ref mut rs) = self.mode {
+                    ui.colored_label(egui::Color32::LIGHT_BLUE, "REPLAY");
+                    ui.separator();
+
+                    let (play_icon, play_hint) =
+                        if rs.playing { (icon::PAUSE, "Pause") } else { (icon::PLAY, "Play") };
+                    if ui.button(play_icon).on_hover_text(play_hint).clicked() {
+                        rs.playing = !rs.playing;
+                    }
+
+                    egui::ComboBox::from_id_source("timeline_speed")
+                        .selected_text(format!("{}x", rs.speed))
+                        .show_ui(ui, |ui| {
+                            for &s in &[0.25f32, 0.5, 1.0, 2.0, 4.0] {
+                                ui.selectable_value(&mut rs.speed, s, format!("{s}x"));
+                            }
+                        });
+                    ui.separator();
+
+                    let pos = rs.store.position_ns.load(Ordering::Relaxed);
+                    let start = rs.store.start_ns;
+                    let dur = rs.store.duration_ns.max(1);
+                    let mut offset = (pos - start) as f64;
+
+                    // Reserve the readout width plus the close button so the
+                    // slider stretches across the remaining space and the label
+                    // stays flush against its right edge — mirrors the live scrub.
+                    let readout_str = format!(
+                        "{:.1}s / {:.1}s",
+                        (pos - start) as f64 / 1e9,
+                        dur as f64 / 1e9
+                    );
+                    let readout_w = ui.fonts(|f| {
+                        f.layout_no_wrap(
+                            readout_str.clone(),
+                            egui::TextStyle::Body.resolve(ui.style()),
+                            egui::Color32::PLACEHOLDER,
+                        )
+                        .size()
+                        .x
+                    });
+                    let close_w = ui.spacing().interact_size.y + ui.spacing().item_spacing.x;
+                    let slider_w = (ui.available_width()
+                        - readout_w
+                        - close_w
+                        - ui.spacing().item_spacing.x * 2.0)
+                        .max(120.0);
+                    let saved_slider_w = ui.spacing().slider_width;
+                    ui.spacing_mut().slider_width = slider_w;
+                    if ui
+                        .add(egui::Slider::new(&mut offset, 0.0..=(dur as f64)).show_value(false))
+                        .changed()
+                    {
+                        rs.store.position_ns.store(start + offset as i64, Ordering::Relaxed);
+                    }
+                    ui.spacing_mut().slider_width = saved_slider_w;
+
+                    ui.label(readout_str);
+
+                    if ui.button(icon::X).on_hover_text("Close recording").clicked() {
+                        close_replay = true;
+                    }
+                }
+                if close_replay {
+                    self.close_replay();
+                } else if !matches!(self.mode, AppMode::Replay(_)) {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(&self.status);
+                    });
+                }
             });
         });
     }
@@ -971,59 +1040,8 @@ impl eframe::App for DataVisApp {
         self.menu_bar(ctx);
         self.toolbar(ctx);
 
-        // Timeline bottom panel — close_replay flag defers the borrow-conflicting call.
-        let mut close_replay = false;
-        if let AppMode::Replay(ref mut rs) = self.mode {
-            egui::TopBottomPanel::bottom("timeline").show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    let play_label = if rs.playing { "Pause" } else { "Play" };
-                    if ui.button(play_label).clicked() {
-                        rs.playing = !rs.playing;
-                    }
-
-                    egui::ComboBox::from_id_source("timeline_speed")
-                        .selected_text(format!("{}x", rs.speed))
-                        .show_ui(ui, |ui| {
-                            for &s in &[0.25f32, 0.5, 1.0, 2.0, 4.0] {
-                                ui.selectable_value(&mut rs.speed, s, format!("{s}x"));
-                            }
-                        });
-
-                    ui.separator();
-
-                    let pos = rs.store.position_ns.load(Ordering::Relaxed);
-                    let start = rs.store.start_ns;
-                    let dur = rs.store.duration_ns.max(1);
-                    let mut offset = (pos - start) as f64;
-
-                    // Reserve space for the right-side label and close button, give the
-                    // rest to the slider so it stretches across the full window width.
-                    let right_reserved = 140.0;
-                    let slider_w = (ui.available_width() - right_reserved).max(60.0);
-                    if ui
-                        .add_sized(
-                            [slider_w, ui.spacing().interact_size.y],
-                            egui::Slider::new(&mut offset, 0.0..=(dur as f64))
-                                .show_value(false),
-                        )
-                        .changed()
-                    {
-                        rs.store.position_ns.store(start + offset as i64, Ordering::Relaxed);
-                    }
-
-                    let t_secs = (pos - start) as f64 / 1e9;
-                    let dur_secs = dur as f64 / 1e9;
-                    ui.label(format!("{:.1}s / {:.1}s", t_secs, dur_secs));
-
-                    if ui.button(icon::X).on_hover_text("Close recording").clicked() {
-                        close_replay = true;
-                    }
-                });
-            });
-        }
-        if close_replay {
-            self.close_replay();
-        }
+        // Replay transport now lives in the toolbar alongside the live
+        // controls, so there is no bottom timeline panel to render here.
 
         self.add_panel_window(ctx);
 
