@@ -382,6 +382,7 @@ impl DataVisApp {
             &self.channels,
             self.ingest_schema_bytes.clone(),
             rx,
+            None, // replaced with self.record_max_bytes in the config-wiring task
         ) {
             Ok(handle) => {
                 self.record_handle = Some(handle);

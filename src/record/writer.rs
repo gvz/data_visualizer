@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::BufWriter;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -12,6 +12,29 @@ use crossbeam_channel::Receiver;
 use crate::config::ChannelRegistry;
 use crate::record::queue::RecordMsg;
 
+/// Everything needed to open a fresh recording part without borrowing the
+/// registry into the recorder thread.
+struct RecorderCfg {
+    output_dir: PathBuf,
+    session_secs: u64,
+    schema_bytes: Vec<u8>,
+    /// Distinct ZMQ/Proto topics to pre-seed as channels in every part.
+    zmq_topics: Vec<String>,
+    /// On-disk size limit; `None` = never rotate, single un-suffixed file.
+    max_bytes: Option<u64>,
+}
+
+impl RecorderCfg {
+    fn part_path(&self, part: u32) -> PathBuf {
+        let name = if self.max_bytes.is_some() {
+            format!("recording_{}_{:03}.mcap", self.session_secs, part)
+        } else {
+            format!("recording_{}.mcap", self.session_secs)
+        };
+        self.output_dir.join(name)
+    }
+}
+
 struct McapRecorder {
     writer: mcap::Writer<'static, BufWriter<File>>,
     /// ZMQ/Proto channels: pre-seeded from the ChannelRegistry at startup.
@@ -20,36 +43,34 @@ struct McapRecorder {
     dynamic_channel_ids: HashMap<String, u16>,
     last_flush: Instant,
     sequence: u32,
+    path: PathBuf,
+    max_bytes: Option<u64>,
+    /// Set true by the flush block once the file on disk reaches `max_bytes`.
+    over_limit: bool,
 }
 
 impl McapRecorder {
-    fn new(path: &Path, registry: &ChannelRegistry, schema_bytes: &[u8]) -> anyhow::Result<Self> {
-        let file = BufWriter::new(File::create(path)?);
+    fn open(cfg: &RecorderCfg, part: u32) -> anyhow::Result<Self> {
+        let path = cfg.part_path(part);
+        let file = BufWriter::new(File::create(&path)?);
         let mut writer = mcap::Writer::new(file)?;
 
         let schema = Arc::new(mcap::Schema {
             name: "protobuf".to_string(),
             encoding: "protobuf".to_string(),
-            data: Cow::Owned(schema_bytes.to_vec()),
+            data: Cow::Owned(cfg.schema_bytes.clone()),
         });
 
         let mut channel_ids = HashMap::new();
-        let mut seen: HashSet<String> = HashSet::new();
-
-        for id in registry.iter_ids() {
-            let Some(topic) = registry.config(id).topic.clone() else {
-                continue; // MQTT-only channel; not recorded via ZMQ path
+        for topic in &cfg.zmq_topics {
+            let channel = mcap::Channel {
+                topic: topic.clone(),
+                schema: Some(schema.clone()),
+                message_encoding: "protobuf".to_string(),
+                metadata: BTreeMap::new(),
             };
-            if seen.insert(topic.clone()) {
-                let channel = mcap::Channel {
-                    topic: topic.clone(),
-                    schema: Some(schema.clone()),
-                    message_encoding: "protobuf".to_string(),
-                    metadata: BTreeMap::new(),
-                };
-                let channel_id = writer.add_channel(&channel)?;
-                channel_ids.insert(topic, channel_id);
-            }
+            let channel_id = writer.add_channel(&channel)?;
+            channel_ids.insert(topic.clone(), channel_id);
         }
 
         Ok(Self {
@@ -58,6 +79,9 @@ impl McapRecorder {
             dynamic_channel_ids: HashMap::new(),
             last_flush: Instant::now(),
             sequence: 0,
+            path,
+            max_bytes: cfg.max_bytes,
+            over_limit: false,
         })
     }
 
@@ -80,6 +104,16 @@ impl McapRecorder {
         if self.last_flush.elapsed() >= Duration::from_secs(1) {
             self.writer.flush()?;
             self.last_flush = Instant::now();
+        }
+        if let Some(limit) = self.max_bytes {
+            // Check size every 128 messages to catch the limit without per-message stat cost.
+            if self.sequence.is_multiple_of(128) {
+                self.writer.flush()?;
+                // A stat failure just skips the check — never abort a session.
+                if std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0) >= limit {
+                    self.over_limit = true;
+                }
+            }
         }
 
         Ok(())
@@ -129,26 +163,41 @@ impl McapRecorder {
 }
 
 fn recorder_thread_fn(
+    cfg: RecorderCfg,
     recorder: McapRecorder,
     record_rx: Receiver<RecordMsg>,
     stop_rx: crossbeam_channel::Receiver<()>,
     record_failed: Arc<AtomicBool>,
 ) {
-    if let Err(e) = recorder_loop(recorder, record_rx, stop_rx) {
+    if let Err(e) = recorder_loop(cfg, recorder, record_rx, stop_rx) {
         eprintln!("recorder: write error: {e}");
         record_failed.store(true, Ordering::Relaxed);
     }
 }
 
+/// Finalize the current part and open the next one.
+fn rotate(recorder: McapRecorder, cfg: &RecorderCfg, part: u32) -> anyhow::Result<McapRecorder> {
+    recorder.finish()?;
+    McapRecorder::open(cfg, part)
+}
+
 fn recorder_loop(
+    cfg: RecorderCfg,
     mut recorder: McapRecorder,
     record_rx: Receiver<RecordMsg>,
     stop_rx: crossbeam_channel::Receiver<()>,
 ) -> anyhow::Result<()> {
+    let mut part: u32 = 0;
     loop {
         crossbeam_channel::select! {
             recv(record_rx) -> result => match result {
-                Ok(msg) => write_record(&mut recorder, msg)?,
+                Ok(msg) => {
+                    write_record(&mut recorder, msg)?;
+                    if recorder.over_limit {
+                        part += 1;
+                        recorder = rotate(recorder, &cfg, part)?;
+                    }
+                }
                 Err(_) => break,
             },
             recv(stop_rx) -> _ => break,
@@ -157,6 +206,10 @@ fn recorder_loop(
     // Drain any messages that arrived before stop.
     while let Ok(msg) = record_rx.try_recv() {
         write_record(&mut recorder, msg)?;
+        if recorder.over_limit {
+            part += 1;
+            recorder = rotate(recorder, &cfg, part)?;
+        }
     }
     recorder.finish()
 }
@@ -179,18 +232,36 @@ pub(super) fn spawn_recorder(
     receiver: Receiver<RecordMsg>,
     _gap_count: Arc<AtomicU64>,
     record_failed: Arc<AtomicBool>,
+    max_bytes: Option<u64>,
 ) -> anyhow::Result<crossbeam_channel::Sender<()>> {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let filename = format!("recording_{secs}.mcap");
-    let path = output_dir.join(filename);
 
-    let recorder = McapRecorder::new(&path, registry, schema_bytes)?;
+    // Distinct ZMQ/Proto topics to pre-seed in every part (MQTT topics register
+    // dynamically on first sight, per part).
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut zmq_topics: Vec<String> = Vec::new();
+    for id in registry.iter_ids() {
+        if let Some(topic) = registry.config(id).topic.clone() {
+            if seen.insert(topic.clone()) {
+                zmq_topics.push(topic);
+            }
+        }
+    }
+
+    let cfg = RecorderCfg {
+        output_dir: output_dir.to_path_buf(),
+        session_secs: secs,
+        schema_bytes: schema_bytes.to_vec(),
+        zmq_topics,
+        max_bytes,
+    };
+    let recorder = McapRecorder::open(&cfg, 0)?;
     let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
     let rf = record_failed.clone();
-    std::thread::spawn(move || recorder_thread_fn(recorder, receiver, stop_rx, rf));
+    std::thread::spawn(move || recorder_thread_fn(cfg, recorder, receiver, stop_rx, rf));
     Ok(stop_tx)
 }
 
@@ -221,7 +292,7 @@ type = "float"
         let schema_bytes = b"fake_fds_bytes".to_vec();
 
         let (tx, rx) = record_channel();
-        let handle = start_recording(dir.path(), &registry, schema_bytes, rx).unwrap();
+        let handle = start_recording(dir.path(), &registry, schema_bytes, rx, None).unwrap();
 
         tx.try_send(RecordMsg::Proto { topic: Arc::from("accel"), data: vec![0x01, 0x02], ts: 1_000_000_000 })
             .unwrap();
@@ -263,7 +334,7 @@ type = "float"
         let dir = tempfile::tempdir().unwrap();
         let registry = minimal_registry();
         let (tx, rx) = record_channel();
-        let handle = start_recording(dir.path(), &registry, vec![], rx).unwrap();
+        let handle = start_recording(dir.path(), &registry, vec![], rx, None).unwrap();
 
         // "gyro" is not in the registry — should be silently dropped
         tx.try_send(RecordMsg::Proto { topic: Arc::from("gyro"), data: vec![0xFF], ts: 1_000 }).unwrap();
@@ -292,7 +363,7 @@ type = "float"
         let registry = minimal_registry();
         let (tx, rx) = record_channel();
         // Shared schema empty: MQTT topics carry their own.
-        let handle = start_recording(dir.path(), &registry, vec![], rx).unwrap();
+        let handle = start_recording(dir.path(), &registry, vec![], rx, None).unwrap();
 
         tx.try_send(RecordMsg::DynamicProto {
             topic: Arc::from("home/temp"),
@@ -350,7 +421,7 @@ type = "float"
         let dir = tempfile::tempdir().unwrap();
         let registry = minimal_registry();
         let (tx, rx) = record_channel();
-        let handle = start_recording(dir.path(), &registry, vec![], rx).unwrap();
+        let handle = start_recording(dir.path(), &registry, vec![], rx, None).unwrap();
 
         let mqtt_schema: &[u8] = b"mqtt_schema_for_accel";
         tx.try_send(RecordMsg::DynamicProto {
@@ -386,5 +457,54 @@ type = "float"
         let schema_data = messages[0].channel.schema.as_ref().unwrap().data.as_ref();
         assert_eq!(schema_data, mqtt_schema, "DynamicProto message was recorded under the wrong schema");
     }
-}
 
+    #[test]
+    fn rotates_into_numbered_parts_when_over_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = minimal_registry();
+        let (tx, rx) = record_channel();
+        // Tiny 8 KiB cap forces several rollovers over a few thousand messages.
+        let handle = start_recording(dir.path(), &registry, vec![], rx, Some(8 * 1024)).unwrap();
+
+        let n = 4000i64;
+        for i in 0..n {
+            // 64-byte payloads so total >> cap after compression.
+            tx.try_send(RecordMsg::Proto { topic: Arc::from("accel"), data: vec![(i % 256) as u8; 64], ts: i + 1 })
+                .unwrap();
+        }
+        drop(tx);
+        drop(handle);
+        std::thread::sleep(std::time::Duration::from_millis(400));
+
+        // Collect parts, sorted by name → they are recording_{secs}_000.mcap, _001, …
+        let mut parts: Vec<std::path::PathBuf> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|x| x == "mcap").unwrap_or(false))
+            .collect();
+        parts.sort();
+        assert!(parts.len() >= 2, "expected multiple parts, got {}", parts.len());
+        // First part is suffix _000.
+        assert!(parts[0].file_name().unwrap().to_str().unwrap().contains("_000.mcap"));
+        // Every part is finalized (summary readable, non-empty chunk index).
+        for p in &parts {
+            let bytes = std::fs::read(p).unwrap();
+            let summary = mcap::Summary::read(&bytes).unwrap().expect("finalized summary");
+            assert!(!summary.chunk_indexes.is_empty(), "part {p:?} has no chunk index");
+        }
+
+        // Stitched round-trip at the MCAP layer: every written message survives,
+        // across all parts, in timestamp order.
+        let mut all_ts: Vec<u64> = Vec::new();
+        for p in &parts {
+            let bytes = std::fs::read(p).unwrap();
+            for m in mcap::MessageStream::new(&bytes).unwrap() {
+                all_ts.push(m.unwrap().log_time);
+            }
+        }
+        assert_eq!(all_ts.len(), n as usize, "all messages must be preserved across parts");
+        all_ts.sort_unstable();
+        assert_eq!(all_ts.first(), Some(&1));
+        assert_eq!(all_ts.last(), Some(&(n as u64)));
+    }
+}
