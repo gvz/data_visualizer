@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 
+pub mod lazy;
 pub mod mqtt_schema;
 pub mod playback;
 pub mod queue;
