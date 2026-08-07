@@ -111,16 +111,6 @@ impl SnapshotAcc {
     }
 }
 
-/// Last (newest) sample of a snapshot, if any.
-fn snapshot_last(snap: &ChannelSnapshot) -> Option<(i64, Sample)> {
-    match snap {
-        ChannelSnapshot::Float { ts, vals } => Some((*ts.last()?, Sample::Float(*vals.last()?))),
-        ChannelSnapshot::Int { ts, vals } => Some((*ts.last()?, Sample::Int(*vals.last()?))),
-        ChannelSnapshot::Bool { ts, vals } => Some((*ts.last()?, Sample::Bool(*vals.last()? != 0))),
-        ChannelSnapshot::Text { lines } => lines.last().map(|(t, l)| (*t, Sample::Text(l.clone()))),
-    }
-}
-
 /// Fold one decoded chunk into the envelope (numeric) and retained text.
 fn fold_chunk(chunk: &DecodedChunk, envelope: &mut Envelope, text: &mut [Option<Vec<(i64, String)>>]) {
     for (ch, cs) in chunk.channels.iter().enumerate() {
@@ -331,13 +321,27 @@ impl ChannelStore for PlaybackStore {
             let idx = lines.partition_point(|(t, _)| *t <= end_ns);
             return (idx > 0).then(|| (lines[idx - 1].0, Sample::Text(lines[idx - 1].1.clone())));
         }
-        // Newest numeric sample at or before end_ns: slice the window and take
-        // the last. (Refined to a targeted single-chunk decode in a later change.)
-        let snap = self.snapshot(
-            channel,
-            TimeWindow { start_ns: i64::MIN, end_ns: end_ns.saturating_add(1) },
-        );
-        snapshot_last(&snap)
+        // Numeric: scan candidate spans (start_ns <= end_ns) from latest to
+        // earliest, decoding via the cache, and return the first chunk that
+        // holds a sample <= end_ns. Only the containing chunk is decoded.
+        let mut candidates: Vec<(usize, usize, i64)> = Vec::new(); // (source, span_idx, start_ns)
+        for (si, src) in self.sources.iter().enumerate() {
+            for (k, span) in src.spans().iter().enumerate() {
+                if span.start_ns <= end_ns {
+                    candidates.push((si, k, span.start_ns));
+                }
+            }
+        }
+        candidates.sort_by_key(|(_, _, s)| *s);
+        for (si, k, _) in candidates.into_iter().rev() {
+            let chunk = self
+                .cache
+                .get_or_insert_with((si, k), || self.sources[si].decode_chunk(k, &self.metas));
+            if let Some(hit) = chunk.last_le(ch, end_ns) {
+                return Some(hit);
+            }
+        }
+        None
     }
 
     fn channel_meta(&self, channel: ChannelId) -> &ChannelMeta {
@@ -493,6 +497,25 @@ type = "float"
                 .unwrap();
         }
         writer.finish().unwrap();
+    }
+
+    #[test]
+    fn latest_at_decodes_correct_chunk_across_span_boundary() {
+        let (schema, _d, registry) = make_proto_and_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("l.mcap");
+        // Small chunk size → many chunks, so 3500 lands in a non-last chunk and
+        // the targeted decode must select the right span.
+        let msgs: Vec<(i64, f32)> = (0..4000).map(|i| (i as i64 + 1, i as f32)).collect();
+        write_test_mcap_chunked(&path, &schema, &msgs, 4096);
+        let store = PlaybackStore::load(&path, &registry).unwrap();
+        let id = registry.id("accel.x").unwrap();
+        let (t, s) = store.latest_at(id, 3500).unwrap();
+        assert_eq!(t, 3500);
+        match s {
+            Sample::Float(v) => assert!((v - 3499.0).abs() < 1e-6),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
