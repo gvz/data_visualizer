@@ -1,6 +1,18 @@
+//! Recording and playback of MCAP telemetry.
+//!
+//! Playback is memory-mapped and decodes chunks on demand: each recording is
+//! `mmap`ed and indexed by chunk time-bounds, and a read decodes only the few
+//! chunks overlapping the requested window. Resident memory is bounded by the
+//! decoded-chunk cache (512 MB default), the per-channel min/max envelope
+//! (16384 buckets/channel) used for near-whole-file overviews, and retained
+//! text — so recordings larger than RAM play back. Caveats: text/log channels
+//! are still retained in full, and very-wide zooms serve a decimated min/max
+//! overview rather than exact samples.
+
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 
+pub mod lazy;
 pub mod mqtt_schema;
 pub mod playback;
 pub mod queue;
