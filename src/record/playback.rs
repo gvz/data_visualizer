@@ -3,7 +3,9 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
 use crate::config::ChannelRegistry;
-use crate::record::lazy::{ChanSamples, ChunkCache, DecodedChunk, Envelope, RecordingSource};
+use crate::record::lazy::{
+    ChanSamples, ChunkCache, ChunkDecodeBuf, DecodedChunk, Envelope, RecordingSource,
+};
 use crate::store::ChannelStore;
 use crate::types::{
     ChannelId, ChannelMeta, ChannelSnapshot, NumericVal, Sample, SampleType, TimeWindow,
@@ -191,17 +193,60 @@ impl PlaybackStore {
             _ => (0, 0),
         };
 
-        // One pass builds the envelope + retained text; retains no numeric.
+        // One parallel pass builds the envelope + retained text, retaining no
+        // raw numeric samples. MCAP chunks are independently compressed, so we
+        // split all (source, chunk) jobs across worker threads; each folds into
+        // a thread-local envelope + text, then we merge.
         let nchannels = metas.len();
         let mut envelope = Envelope::new(nchannels, start_ns, duration_ns, ENVELOPE_BUCKETS);
         let mut text: Vec<Option<Vec<(i64, String)>>> = metas
             .iter()
             .map(|m| (m.sample_type == SampleType::Text).then(Vec::new))
             .collect();
-        for src in &sources {
-            for k in 0..src.spans().len() {
-                let chunk = src.decode_chunk(k, &metas);
-                fold_chunk(&chunk, &mut envelope, &mut text);
+
+        let jobs: Vec<(usize, usize)> = sources
+            .iter()
+            .enumerate()
+            .flat_map(|(si, s)| (0..s.spans().len()).map(move |k| (si, k)))
+            .collect();
+        let nthreads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let workers = nthreads.min(jobs.len().max(1));
+        type Partial = (Envelope, Vec<Option<Vec<(i64, String)>>>);
+        let partials: Vec<Partial> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..workers)
+                .map(|w| {
+                    let lo = w * jobs.len() / workers;
+                    let hi = (w + 1) * jobs.len() / workers;
+                    let sources = &sources;
+                    let metas = &metas;
+                    let jobs = &jobs;
+                    scope.spawn(move || -> Partial {
+                        let mut env =
+                            Envelope::new(nchannels, start_ns, duration_ns, ENVELOPE_BUCKETS);
+                        let mut txt: Vec<Option<Vec<(i64, String)>>> = metas
+                            .iter()
+                            .map(|m| (m.sample_type == SampleType::Text).then(Vec::new))
+                            .collect();
+                        for &(si, k) in &jobs[lo..hi] {
+                            let buf = ChunkDecodeBuf::from_metas(metas);
+                            let _ = sources[si].decode_into(&sources[si].spans()[k], &buf);
+                            let chunk = buf.freeze();
+                            fold_chunk(&chunk, &mut env, &mut txt);
+                        }
+                        (env, txt)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("envelope worker panicked")).collect()
+        });
+        for (penv, ptxt) in partials {
+            envelope.merge(&penv);
+            for (ch, slot) in ptxt.into_iter().enumerate() {
+                if let (Some(dst), Some(src)) =
+                    (text.get_mut(ch).and_then(|o| o.as_mut()), slot)
+                {
+                    dst.extend(src);
+                }
             }
         }
         // Text must end sorted by time (files may interleave).
@@ -389,6 +434,90 @@ type = "float"
             }).unwrap();
         }
         writer.finish().unwrap();
+    }
+
+    /// Like `write_test_mcap` but forces a small target chunk size, so a modest
+    /// message count still produces many independently-compressed chunks.
+    fn write_test_mcap_chunked(
+        path: &std::path::Path,
+        schema: &ProtoSchema,
+        messages: &[(i64, f32)],
+        chunk_size: u64,
+    ) {
+        use prost_reflect::prost::Message as _;
+        use prost_reflect::{DynamicMessage, Value};
+        use std::borrow::Cow;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let pool = schema.pool_for_test();
+        let batch_desc = pool.get_message_by_name("AccelBatch").unwrap();
+        let sample_desc = pool.get_message_by_name("AccelBatch.Sample").unwrap();
+        let t_field = sample_desc.get_field_by_name("t_ns").unwrap();
+        let x_field = sample_desc.get_field_by_name("x").unwrap();
+        let samples_field = batch_desc.get_field_by_name("samples").unwrap();
+
+        let channel = Arc::new(mcap::Channel {
+            topic: "accel".to_string(),
+            schema: Some(Arc::new(mcap::Schema {
+                name: "protobuf".to_string(),
+                encoding: "protobuf".to_string(),
+                data: Cow::Owned(schema.schema_bytes().to_vec()),
+            })),
+            message_encoding: "protobuf".to_string(),
+            metadata: BTreeMap::new(),
+        });
+        let file = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+        let mut writer = mcap::WriteOptions::new()
+            .chunk_size(Some(chunk_size))
+            .create(file)
+            .unwrap();
+        for (t_ns, x) in messages {
+            let list = vec![{
+                let mut s = DynamicMessage::new(sample_desc.clone());
+                s.set_field(&t_field, Value::I64(*t_ns));
+                s.set_field(&x_field, Value::F32(*x));
+                Value::Message(s)
+            }];
+            let mut batch = DynamicMessage::new(batch_desc.clone());
+            batch.set_field(&samples_field, Value::List(list));
+            let data = batch.encode_to_vec();
+            writer
+                .write(&mcap::Message {
+                    channel: channel.clone(),
+                    sequence: 0,
+                    log_time: *t_ns as u64,
+                    publish_time: *t_ns as u64,
+                    data: Cow::Owned(data),
+                })
+                .unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn wide_window_uses_envelope_overview() {
+        let (schema, _d, registry) = make_proto_and_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.mcap");
+        // 40k samples > ENVELOPE_BUCKETS (16384) so the overview is decimated;
+        // a 4 KiB target chunk size forces far more than CHUNK_BUDGET chunks so
+        // a whole-file window takes the overview path.
+        let msgs: Vec<(i64, f32)> =
+            (0..40_000).map(|i| (i as i64 * 1_000_000 + 1, (i % 7) as f32)).collect();
+        write_test_mcap_chunked(&path, &schema, &msgs, 4096);
+        let store = PlaybackStore::load(&path, &registry).unwrap();
+        let id = registry.id("accel.x").unwrap();
+        let all = TimeWindow { start_ns: i64::MIN, end_ns: i64::MAX };
+        let snap = store.snapshot(id, all);
+        match snap {
+            ChannelSnapshot::Float { ts, .. } => {
+                assert!(!ts.is_empty());
+                assert!(ts.len() < 40_000, "overview must be decimated, got {}", ts.len());
+                assert!(ts.windows(2).all(|w| w[0] <= w[1]), "overview must be time-ordered");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 
     #[test]
