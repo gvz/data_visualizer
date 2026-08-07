@@ -856,6 +856,7 @@ dependencies = [
  "egui_plot",
  "egui_tiles",
  "mcap",
+ "memmap2",
  "numpy",
  "prost",
  "prost-build",
