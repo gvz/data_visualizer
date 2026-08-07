@@ -101,21 +101,30 @@ impl McapRecorder {
             data,
         )?;
 
+        // Two triggers for the size check so both high- and low-rate streams roll
+        // near the cap: every 1 second (bounds overshoot for slow streams that
+        // never reach 128 messages/sec) and every 128 messages (bounds overshoot
+        // for fast streams that fill the file within a single second).
         if self.last_flush.elapsed() >= Duration::from_secs(1) {
-            self.writer.flush()?;
+            self.flush_and_check_size()?;
             self.last_flush = Instant::now();
-        }
-        if let Some(limit) = self.max_bytes {
-            // Check size every 128 messages to catch the limit without per-message stat cost.
-            if self.sequence.is_multiple_of(128) {
-                self.writer.flush()?;
-                // A stat failure just skips the check — never abort a session.
-                if std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0) >= limit {
-                    self.over_limit = true;
-                }
-            }
+        } else if self.sequence.is_multiple_of(128) {
+            self.flush_and_check_size()?;
         }
 
+        Ok(())
+    }
+
+    /// Flush the buffered writer and, when a `max_bytes` limit is set, mark the
+    /// part `over_limit` once the on-disk file reaches the cap.
+    fn flush_and_check_size(&mut self) -> anyhow::Result<()> {
+        self.writer.flush()?;
+        if let Some(limit) = self.max_bytes {
+            // A stat failure just skips the check — never abort a session.
+            if std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0) >= limit {
+                self.over_limit = true;
+            }
+        }
         Ok(())
     }
 
