@@ -1,38 +1,27 @@
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
-
-use anyhow::Context;
+use std::sync::Arc;
 
 use crate::config::ChannelRegistry;
-use crate::ingest::router::{ChannelBinding, TopicRouter};
-use crate::record::lazy::source::{decode_message, plan_file, time_bounds};
+use crate::record::lazy::{ChanSamples, ChunkCache, DecodedChunk, Envelope, RecordingSource};
 use crate::store::ChannelStore;
 use crate::types::{
     ChannelId, ChannelMeta, ChannelSnapshot, NumericVal, Sample, SampleType, TimeWindow,
 };
 
-enum PlaybackChannel {
-    Float { ts: Vec<i64>, vals: Vec<f64> },
-    Int { ts: Vec<i64>, vals: Vec<i64> },
-    Bool { ts: Vec<i64>, vals: Vec<u8> },
-    Text { lines: Vec<(i64, String)> },
-}
-
-impl PlaybackChannel {
-    fn for_type(sample_type: SampleType) -> Self {
-        match sample_type {
-            SampleType::Float => PlaybackChannel::Float { ts: vec![], vals: vec![] },
-            SampleType::Int => PlaybackChannel::Int { ts: vec![], vals: vec![] },
-            SampleType::Bool => PlaybackChannel::Bool { ts: vec![], vals: vec![] },
-            SampleType::Text => PlaybackChannel::Text { lines: vec![] },
-        }
-    }
-}
+const ENVELOPE_BUCKETS: usize = 16384;
+const CACHE_BYTES: usize = 512 * 1024 * 1024;
+const CHUNK_BUDGET: usize = 16;
 
 pub struct PlaybackStore {
-    channels: Vec<Mutex<PlaybackChannel>>,
+    /// One memory-mapped recording per stitched file.
+    sources: Vec<RecordingSource>,
+    /// Numeric channels' decimated min/max overview, built once at load.
+    envelope: Envelope,
+    /// Text/log channels retained in full; `None` for non-text channels.
+    text: Vec<Option<Vec<(i64, String)>>>,
+    /// Byte-budgeted LRU of decoded chunks for the detail path.
+    cache: ChunkCache,
     metas: Vec<ChannelMeta>,
     pub position_ns: Arc<AtomicI64>,
     pub duration_ns: i64,
@@ -41,82 +30,124 @@ pub struct PlaybackStore {
     /// must not connect the sample before one of these to the sample at/after
     /// it, so the join between two recordings is drawn as a gap, not a line.
     breaks: Vec<i64>,
+    /// Above this many overlapping chunks a read serves the envelope overview
+    /// instead of decoding every chunk.
+    chunk_budget: usize,
 }
 
-impl PlaybackStore {
-    fn new(registry: &ChannelRegistry) -> Self {
-        let channels = registry
-            .iter_ids()
-            .map(|id| Mutex::new(PlaybackChannel::for_type(registry.meta(id).sample_type)))
-            .collect();
-        let metas = registry.iter_ids().map(|id| registry.meta(id).clone()).collect();
-        Self {
-            channels,
-            metas,
-            position_ns: Arc::new(AtomicI64::new(0)),
-            duration_ns: 0,
-            start_ns: 0,
-            breaks: Vec::new(),
-        }
+/// Concatenates same-variant channel snapshots in decode order. Chunks are
+/// internally time-sorted and decoded in start-time order, so the result stays
+/// time-ordered.
+enum SnapshotAcc {
+    Empty,
+    Float { ts: Vec<i64>, vals: Vec<f64> },
+    Int { ts: Vec<i64>, vals: Vec<i64> },
+    Bool { ts: Vec<i64>, vals: Vec<u8> },
+    Text { lines: Vec<(i64, String)> },
+}
+
+impl SnapshotAcc {
+    fn new() -> Self {
+        SnapshotAcc::Empty
     }
 
-    fn sort_and_finalize(&mut self) {
-        let mut global_min = i64::MAX;
-        let mut global_max = i64::MIN;
-
-        for ch in &self.channels {
-            let mut ch = ch.lock().unwrap();
-            match &mut *ch {
-                PlaybackChannel::Float { ts, vals } => {
-                    let mut pairs: Vec<(i64, f64)> =
-                        ts.iter().copied().zip(vals.iter().copied()).collect();
-                    pairs.sort_unstable_by_key(|(t, _)| *t);
-                    *ts = pairs.iter().map(|(t, _)| *t).collect();
-                    *vals = pairs.iter().map(|(_, v)| *v).collect();
-                    if let (Some(&mn), Some(&mx)) = (ts.first(), ts.last()) {
-                        global_min = global_min.min(mn);
-                        global_max = global_max.max(mx);
-                    }
+    fn extend(&mut self, snap: ChannelSnapshot) {
+        match snap {
+            ChannelSnapshot::Float { ts, vals } => {
+                if let SnapshotAcc::Empty = self {
+                    *self = SnapshotAcc::Float { ts: vec![], vals: vec![] };
                 }
-                PlaybackChannel::Int { ts, vals } => {
-                    let mut pairs: Vec<(i64, i64)> =
-                        ts.iter().copied().zip(vals.iter().copied()).collect();
-                    pairs.sort_unstable_by_key(|(t, _)| *t);
-                    *ts = pairs.iter().map(|(t, _)| *t).collect();
-                    *vals = pairs.iter().map(|(_, v)| *v).collect();
-                    if let (Some(&mn), Some(&mx)) = (ts.first(), ts.last()) {
-                        global_min = global_min.min(mn);
-                        global_max = global_max.max(mx);
-                    }
+                if let SnapshotAcc::Float { ts: t, vals: v } = self {
+                    t.extend(ts);
+                    v.extend(vals);
                 }
-                PlaybackChannel::Bool { ts, vals } => {
-                    let mut pairs: Vec<(i64, u8)> =
-                        ts.iter().copied().zip(vals.iter().copied()).collect();
-                    pairs.sort_unstable_by_key(|(t, _)| *t);
-                    *ts = pairs.iter().map(|(t, _)| *t).collect();
-                    *vals = pairs.iter().map(|(_, v)| *v).collect();
-                    if let (Some(&mn), Some(&mx)) = (ts.first(), ts.last()) {
-                        global_min = global_min.min(mn);
-                        global_max = global_max.max(mx);
-                    }
+            }
+            ChannelSnapshot::Int { ts, vals } => {
+                if let SnapshotAcc::Empty = self {
+                    *self = SnapshotAcc::Int { ts: vec![], vals: vec![] };
                 }
-                PlaybackChannel::Text { lines } => {
-                    lines.sort_unstable_by_key(|(t, _)| *t);
-                    if let (Some((mn, _)), Some((mx, _))) = (lines.first(), lines.last()) {
-                        global_min = global_min.min(*mn);
-                        global_max = global_max.max(*mx);
-                    }
+                if let SnapshotAcc::Int { ts: t, vals: v } = self {
+                    t.extend(ts);
+                    v.extend(vals);
+                }
+            }
+            ChannelSnapshot::Bool { ts, vals } => {
+                if let SnapshotAcc::Empty = self {
+                    *self = SnapshotAcc::Bool { ts: vec![], vals: vec![] };
+                }
+                if let SnapshotAcc::Bool { ts: t, vals: v } = self {
+                    t.extend(ts);
+                    v.extend(vals);
+                }
+            }
+            ChannelSnapshot::Text { lines } => {
+                if let SnapshotAcc::Empty = self {
+                    *self = SnapshotAcc::Text { lines: vec![] };
+                }
+                if let SnapshotAcc::Text { lines: l } = self {
+                    l.extend(lines);
                 }
             }
         }
-
-        if global_min <= global_max {
-            self.start_ns = global_min;
-            self.duration_ns = global_max - global_min;
-            self.position_ns.store(global_min, Ordering::Relaxed);
-        }
     }
 
+    /// Finish, returning a typed-empty snapshot of `fallback` when nothing was
+    /// accumulated (so a panel still sees the channel's real variant).
+    fn into_snapshot(self, fallback: SampleType) -> ChannelSnapshot {
+        match self {
+            SnapshotAcc::Float { ts, vals } => ChannelSnapshot::Float { ts, vals },
+            SnapshotAcc::Int { ts, vals } => ChannelSnapshot::Int { ts, vals },
+            SnapshotAcc::Bool { ts, vals } => ChannelSnapshot::Bool { ts, vals },
+            SnapshotAcc::Text { lines } => ChannelSnapshot::Text { lines },
+            SnapshotAcc::Empty => match fallback {
+                SampleType::Int => ChannelSnapshot::Int { ts: vec![], vals: vec![] },
+                SampleType::Bool => ChannelSnapshot::Bool { ts: vec![], vals: vec![] },
+                SampleType::Text => ChannelSnapshot::Text { lines: vec![] },
+                SampleType::Float => ChannelSnapshot::Float { ts: vec![], vals: vec![] },
+            },
+        }
+    }
+}
+
+/// Last (newest) sample of a snapshot, if any.
+fn snapshot_last(snap: &ChannelSnapshot) -> Option<(i64, Sample)> {
+    match snap {
+        ChannelSnapshot::Float { ts, vals } => Some((*ts.last()?, Sample::Float(*vals.last()?))),
+        ChannelSnapshot::Int { ts, vals } => Some((*ts.last()?, Sample::Int(*vals.last()?))),
+        ChannelSnapshot::Bool { ts, vals } => Some((*ts.last()?, Sample::Bool(*vals.last()? != 0))),
+        ChannelSnapshot::Text { lines } => lines.last().map(|(t, l)| (*t, Sample::Text(l.clone()))),
+    }
+}
+
+/// Fold one decoded chunk into the envelope (numeric) and retained text.
+fn fold_chunk(chunk: &DecodedChunk, envelope: &mut Envelope, text: &mut [Option<Vec<(i64, String)>>]) {
+    for (ch, cs) in chunk.channels.iter().enumerate() {
+        match cs {
+            ChanSamples::Float { ts, vals } => {
+                for (t, v) in ts.iter().zip(vals) {
+                    envelope.fold_numeric(ch, *t, *v);
+                }
+            }
+            ChanSamples::Int { ts, vals } => {
+                for (t, v) in ts.iter().zip(vals) {
+                    envelope.fold_numeric(ch, *t, *v as f64);
+                }
+            }
+            ChanSamples::Bool { ts, vals } => {
+                for (t, v) in ts.iter().zip(vals) {
+                    envelope.fold_numeric(ch, *t, *v as f64);
+                }
+            }
+            ChanSamples::Text { lines } => {
+                if let Some(Some(dst)) = text.get_mut(ch) {
+                    dst.extend(lines.iter().cloned());
+                }
+            }
+        }
+    }
+}
+
+impl PlaybackStore {
     pub fn load(path: &Path, registry: &ChannelRegistry) -> anyhow::Result<Arc<Self>> {
         Self::load_many(std::slice::from_ref(&path), registry)
     }
@@ -127,237 +158,141 @@ impl PlaybackStore {
     /// files sit on one shared timeline at their original times. The start time
     /// of each file after the first is recorded as a break so a line plot does
     /// not draw a segment bridging the gap between two recordings.
+    ///
+    /// Each file is memory-mapped and indexed by chunk time-bounds; a single
+    /// pass folds samples into a decimated min/max envelope (numeric) and full
+    /// retention (text), keeping no raw numeric samples. Reads decode the few
+    /// chunks overlapping the requested window on demand.
     pub fn load_many(paths: &[&Path], registry: &ChannelRegistry) -> anyhow::Result<Arc<Self>> {
         anyhow::ensure!(!paths.is_empty(), "no recording files to load");
 
-        // Per-file decode plan, retained through the decode phase. The file's
-        // bytes are held so the parallel phase can stream chunks without a
-        // second read from disk.
-        struct FilePlan {
-            bytes: Vec<u8>,
-            router: TopicRouter,
-            reconstructed: HashMap<String, Vec<ChannelBinding>>,
-            /// (min, max) sample time in the file, if it has any data.
-            bounds: Option<(i64, i64)>,
-        }
-
-        // Phase 1: learn schemas and register channels for every file BEFORE
-        // building the store, so its per-channel slots cover every file's
-        // channels (a later file may introduce a new one).
-        let mut plans = Vec::with_capacity(paths.len());
+        // Open (mmap + index + routing) every file first, registering any
+        // reconstructed channels BEFORE we snapshot the registry into metas, so
+        // metas cover every file's channels.
+        let mut sources = Vec::with_capacity(paths.len());
         for path in paths {
-            let bytes = std::fs::read(path)
-                .with_context(|| format!("reading MCAP file {}", path.display()))?;
-            let (router, reconstructed) = plan_file(&bytes, registry)?;
-            let bounds = time_bounds(&bytes)
-                .with_context(|| format!("reading time bounds of {}", path.display()))?;
-            plans.push(FilePlan { bytes, router, reconstructed, bounds });
+            sources.push(RecordingSource::open(path, registry)?);
         }
 
-        // Build the store AFTER all add_dynamic calls so every channel exists.
-        let mut store = Self::new(registry);
-
-        // Phase 2: decode each file into the store, preserving original
-        // timestamps. MCAP chunks are independently compressed, so we split a
-        // file's chunks across worker threads — each decodes into its own local
-        // buffer (no lock contention), then we merge. Decompression and the
-        // reflective protobuf decode are the load's dominant cost and both
-        // parallelise cleanly this way.
-        let nthreads = std::thread::available_parallelism().map_or(1, |n| n.get());
-        for plan in &plans {
-            // Chunk count from the summary index. Unchunked or unfinalised files
-            // (no summary) fall back to a single-threaded linear scan.
-            let nchunks = mcap::Summary::read(&plan.bytes)
-                .context("reading MCAP summary")?
-                .map_or(0, |s| s.chunk_indexes.len());
-
-            if nchunks == 0 {
-                for message in mcap::MessageStream::new(&plan.bytes)
-                    .context("opening MCAP message stream")?
-                {
-                    let msg = message.context("reading MCAP message")?;
-                    decode_message(&msg, &plan.router, &plan.reconstructed, &store);
-                }
-                continue;
-            }
-
-            let workers = nthreads.min(nchunks);
-            let bytes = &plan.bytes;
-            let router = &plan.router;
-            let reconstructed = &plan.reconstructed;
-            let buffers: Vec<anyhow::Result<PlaybackStore>> = std::thread::scope(|scope| {
-                let handles: Vec<_> = (0..workers)
-                    .map(|w| {
-                        // Contiguous chunk range [lo, hi) for this worker.
-                        let lo = w * nchunks / workers;
-                        let hi = (w + 1) * nchunks / workers;
-                        scope.spawn(move || -> anyhow::Result<PlaybackStore> {
-                            // Re-read the (cheap) summary per thread: it borrows
-                            // `bytes`, so it can't be shared across the scope.
-                            let summary = mcap::Summary::read(bytes)
-                                .context("reading MCAP summary")?
-                                .context("MCAP summary missing")?;
-                            let buf = PlaybackStore::new(registry);
-                            for ci in lo..hi {
-                                let index = &summary.chunk_indexes[ci];
-                                for message in summary
-                                    .stream_chunk(bytes, index)
-                                    .context("streaming MCAP chunk")?
-                                {
-                                    let msg = message.context("reading MCAP message")?;
-                                    decode_message(&msg, router, reconstructed, &buf);
-                                }
-                            }
-                            Ok(buf)
-                        })
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| h.join().expect("decode worker panicked"))
-                    .collect()
-            });
-            for buf in buffers {
-                store.merge_from(buf?);
-            }
-        }
-
-        // A line break sits at the start of every dataset except the earliest in
-        // time — order-independent, so it works no matter what order the files
-        // were picked in. The earliest file's start needs no break (nothing
-        // precedes it).
-        let mut mins: Vec<i64> = plans.iter().filter_map(|p| p.bounds.map(|(mn, _)| mn)).collect();
+        // Timeline + breaks from per-file bounds (no decode). A line break sits
+        // at the start of every dataset except the earliest in time —
+        // order-independent, so it works no matter what order the files were
+        // picked in.
+        let global_min = sources.iter().filter_map(|s| s.bounds.map(|(mn, _)| mn)).min();
+        let global_max = sources.iter().filter_map(|s| s.bounds.map(|(_, mx)| mx)).max();
+        let mut mins: Vec<i64> = sources.iter().filter_map(|s| s.bounds.map(|(mn, _)| mn)).collect();
         mins.sort_unstable();
-        store.breaks = mins.into_iter().skip(1).collect();
+        let breaks: Vec<i64> = mins.into_iter().skip(1).collect();
 
-        store.sort_and_finalize();
-        Ok(Arc::new(store))
-    }
+        let metas: Vec<ChannelMeta> =
+            registry.iter_ids().map(|id| registry.meta(id).clone()).collect();
+        let (start_ns, duration_ns) = match (global_min, global_max) {
+            (Some(mn), Some(mx)) if mn <= mx => (mn, mx - mn),
+            _ => (0, 0),
+        };
 
-    /// Append every channel's samples from `other` onto this store. Both stores
-    /// are built from the same registry, so their channel slots line up by index.
-    /// Order is not preserved — [`sort_and_finalize`](Self::sort_and_finalize)
-    /// re-sorts afterwards.
-    fn merge_from(&mut self, other: PlaybackStore) {
-        for (dst, src) in self.channels.iter().zip(other.channels) {
-            let mut dst = dst.lock().unwrap();
-            match (&mut *dst, src.into_inner().unwrap()) {
-                (
-                    PlaybackChannel::Float { ts, vals },
-                    PlaybackChannel::Float { ts: t2, vals: v2 },
-                ) => {
-                    ts.extend(t2);
-                    vals.extend(v2);
-                }
-                (PlaybackChannel::Int { ts, vals }, PlaybackChannel::Int { ts: t2, vals: v2 }) => {
-                    ts.extend(t2);
-                    vals.extend(v2);
-                }
-                (
-                    PlaybackChannel::Bool { ts, vals },
-                    PlaybackChannel::Bool { ts: t2, vals: v2 },
-                ) => {
-                    ts.extend(t2);
-                    vals.extend(v2);
-                }
-                (PlaybackChannel::Text { lines }, PlaybackChannel::Text { lines: l2 }) => {
-                    lines.extend(l2);
-                }
-                _ => {}
+        // One pass builds the envelope + retained text; retains no numeric.
+        let nchannels = metas.len();
+        let mut envelope = Envelope::new(nchannels, start_ns, duration_ns, ENVELOPE_BUCKETS);
+        let mut text: Vec<Option<Vec<(i64, String)>>> = metas
+            .iter()
+            .map(|m| (m.sample_type == SampleType::Text).then(Vec::new))
+            .collect();
+        for src in &sources {
+            for k in 0..src.spans().len() {
+                let chunk = src.decode_chunk(k, &metas);
+                fold_chunk(&chunk, &mut envelope, &mut text);
             }
         }
+        // Text must end sorted by time (files may interleave).
+        for slot in text.iter_mut().flatten() {
+            slot.sort_by_key(|(t, _)| *t);
+        }
+
+        Ok(Arc::new(Self {
+            sources,
+            envelope,
+            text,
+            cache: ChunkCache::new(CACHE_BYTES),
+            metas,
+            position_ns: Arc::new(AtomicI64::new(start_ns)),
+            duration_ns,
+            start_ns,
+            breaks,
+            chunk_budget: CHUNK_BUDGET,
+        }))
     }
 
+    /// Wide-zoom read: the channel's envelope buckets intersecting the window,
+    /// wrapped as the channel's numeric snapshot variant.
+    fn snapshot_overview(&self, ch: usize, window: TimeWindow) -> ChannelSnapshot {
+        let pts = self.envelope.read(ch, window);
+        let ts: Vec<i64> = pts.iter().map(|(t, _)| *t).collect();
+        match self.metas.get(ch).map(|m| m.sample_type).unwrap_or(SampleType::Float) {
+            SampleType::Int => {
+                ChannelSnapshot::Int { ts, vals: pts.iter().map(|(_, v)| *v as i64).collect() }
+            }
+            SampleType::Bool => ChannelSnapshot::Bool {
+                ts,
+                vals: pts.iter().map(|(_, v)| (*v != 0.0) as u8).collect(),
+            },
+            _ => ChannelSnapshot::Float { ts, vals: pts.iter().map(|(_, v)| *v).collect() },
+        }
+    }
 }
 
 impl ChannelStore for PlaybackStore {
-    fn write_numeric(&self, channel: ChannelId, ts: i64, val: NumericVal) {
-        let mut ch = self.channels[channel.0 as usize].lock().unwrap();
-        match (&mut *ch, val) {
-            (PlaybackChannel::Float { ts: tvec, vals }, NumericVal::Float(v)) => {
-                tvec.push(ts);
-                vals.push(v);
-            }
-            (PlaybackChannel::Int { ts: tvec, vals }, NumericVal::Int(v)) => {
-                tvec.push(ts);
-                vals.push(v);
-            }
-            (PlaybackChannel::Bool { ts: tvec, vals }, NumericVal::Bool(v)) => {
-                tvec.push(ts);
-                vals.push(v as u8);
-            }
-            _ => {}
-        }
-    }
-
-    fn write_text(&self, channel: ChannelId, ts: i64, line: String) {
-        let mut ch = self.channels[channel.0 as usize].lock().unwrap();
-        if let PlaybackChannel::Text { lines } = &mut *ch {
-            lines.push((ts, line));
-        }
-    }
+    // Playback is read-only: samples come from the mmapped files, not writes.
+    fn write_numeric(&self, _channel: ChannelId, _ts: i64, _val: NumericVal) {}
+    fn write_text(&self, _channel: ChannelId, _ts: i64, _line: String) {}
 
     fn snapshot(&self, channel: ChannelId, window: TimeWindow) -> ChannelSnapshot {
-        let ch = self.channels[channel.0 as usize].lock().unwrap();
-        match &*ch {
-            PlaybackChannel::Float { ts, vals } => {
-                let start = ts.partition_point(|&t| t < window.start_ns);
-                let end = ts.partition_point(|&t| t < window.end_ns);
-                ChannelSnapshot::Float {
-                    ts: ts[start..end].to_vec(),
-                    vals: vals[start..end].to_vec(),
-                }
-            }
-            PlaybackChannel::Int { ts, vals } => {
-                let start = ts.partition_point(|&t| t < window.start_ns);
-                let end = ts.partition_point(|&t| t < window.end_ns);
-                ChannelSnapshot::Int {
-                    ts: ts[start..end].to_vec(),
-                    vals: vals[start..end].to_vec(),
-                }
-            }
-            PlaybackChannel::Bool { ts, vals } => {
-                let start = ts.partition_point(|&t| t < window.start_ns);
-                let end = ts.partition_point(|&t| t < window.end_ns);
-                ChannelSnapshot::Bool {
-                    ts: ts[start..end].to_vec(),
-                    vals: vals[start..end].to_vec(),
-                }
-            }
-            PlaybackChannel::Text { lines } => {
-                let start = lines.partition_point(|(t, _)| *t < window.start_ns);
-                let end = lines.partition_point(|(t, _)| *t < window.end_ns);
-                ChannelSnapshot::Text { lines: lines[start..end].to_vec() }
+        let ch = channel.0 as usize;
+        // Text: retained full, exact slice at all zooms.
+        if let Some(Some(lines)) = self.text.get(ch) {
+            let s = lines.partition_point(|(t, _)| *t < window.start_ns);
+            let e = lines.partition_point(|(t, _)| *t < window.end_ns);
+            return ChannelSnapshot::Text { lines: lines[s..e].to_vec() };
+        }
+        // Numeric: gather overlapping chunks across sources, sorted by start time.
+        let mut overlaps: Vec<(i64, usize, usize)> = Vec::new(); // (start_ns, source, span_idx)
+        for (si, src) in self.sources.iter().enumerate() {
+            for span_idx in src.overlapping(window) {
+                overlaps.push((src.spans()[span_idx].start_ns, si, span_idx));
             }
         }
+        // Overview when the window is too wide to decode exactly.
+        if overlaps.len() > self.chunk_budget {
+            return self.snapshot_overview(ch, window);
+        }
+        overlaps.sort_by_key(|(t, _, _)| *t);
+        let mut acc = SnapshotAcc::new();
+        for (_, si, span_idx) in overlaps {
+            let chunk = self
+                .cache
+                .get_or_insert_with((si, span_idx), || self.sources[si].decode_chunk(span_idx, &self.metas));
+            acc.extend(chunk.window(ch, window));
+        }
+        acc.into_snapshot(self.metas.get(ch).map(|m| m.sample_type).unwrap_or(SampleType::Float))
     }
 
     fn latest(&self, channel: ChannelId) -> Option<(i64, Sample)> {
-        let pos = self.position_ns.load(Ordering::Relaxed);
-        let ch = self.channels[channel.0 as usize].lock().unwrap();
-        match &*ch {
-            PlaybackChannel::Float { ts, vals } => {
-                // Last index where ts <= pos
-                let idx = ts.partition_point(|&t| t <= pos);
-                if idx == 0 { return None; }
-                Some((ts[idx - 1], Sample::Float(vals[idx - 1])))
-            }
-            PlaybackChannel::Int { ts, vals } => {
-                let idx = ts.partition_point(|&t| t <= pos);
-                if idx == 0 { return None; }
-                Some((ts[idx - 1], Sample::Int(vals[idx - 1])))
-            }
-            PlaybackChannel::Bool { ts, vals } => {
-                let idx = ts.partition_point(|&t| t <= pos);
-                if idx == 0 { return None; }
-                Some((ts[idx - 1], Sample::Bool(vals[idx - 1] != 0)))
-            }
-            PlaybackChannel::Text { lines } => {
-                let idx = lines.partition_point(|(t, _)| *t <= pos);
-                if idx == 0 { return None; }
-                Some((lines[idx - 1].0, Sample::Text(lines[idx - 1].1.clone())))
-            }
+        self.latest_at(channel, self.position_ns.load(Ordering::Relaxed))
+    }
+
+    fn latest_at(&self, channel: ChannelId, end_ns: i64) -> Option<(i64, Sample)> {
+        let ch = channel.0 as usize;
+        if let Some(Some(lines)) = self.text.get(ch) {
+            let idx = lines.partition_point(|(t, _)| *t <= end_ns);
+            return (idx > 0).then(|| (lines[idx - 1].0, Sample::Text(lines[idx - 1].1.clone())));
         }
+        // Newest numeric sample at or before end_ns: slice the window and take
+        // the last. (Refined to a targeted single-chunk decode in a later change.)
+        let snap = self.snapshot(
+            channel,
+            TimeWindow { start_ns: i64::MIN, end_ns: end_ns.saturating_add(1) },
+        );
+        snapshot_last(&snap)
     }
 
     fn channel_meta(&self, channel: ChannelId) -> &ChannelMeta {
@@ -454,6 +389,43 @@ type = "float"
             }).unwrap();
         }
         writer.finish().unwrap();
+    }
+
+    #[test]
+    fn snapshot_acc_concatenates_same_variant() {
+        let mut acc = SnapshotAcc::new();
+        acc.extend(ChannelSnapshot::Float { ts: vec![1, 2], vals: vec![1.0, 2.0] });
+        acc.extend(ChannelSnapshot::Float { ts: vec![3], vals: vec![3.0] });
+        match acc.into_snapshot(SampleType::Float) {
+            ChannelSnapshot::Float { ts, vals } => {
+                assert_eq!(ts, vec![1, 2, 3]);
+                assert_eq!(vals, vec![1.0, 2.0, 3.0]);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detail_snapshot_matches_exact_samples() {
+        let (schema, _d, registry) = make_proto_and_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.mcap");
+        write_test_mcap(
+            &path,
+            &schema,
+            &[(1_000_000_000, 1.0), (2_000_000_000, 2.0), (3_000_000_000, 3.0)],
+        );
+        let store = PlaybackStore::load(&path, &registry).unwrap();
+        let id = registry.id("accel.x").unwrap();
+        // Narrow window (few chunks) → exact raw samples.
+        let snap = store.snapshot(id, TimeWindow { start_ns: 1_000_000_000, end_ns: 3_000_000_000 });
+        match snap {
+            ChannelSnapshot::Float { ts, vals } => {
+                assert_eq!(ts, vec![1_000_000_000, 2_000_000_000]);
+                assert!((vals[0] - 1.0).abs() < 1e-9 && (vals[1] - 2.0).abs() < 1e-9);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 
     #[test]
