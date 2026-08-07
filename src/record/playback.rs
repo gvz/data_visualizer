@@ -1,52 +1,17 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
-use prost_reflect::{Kind, MessageDescriptor};
 
 use crate::config::ChannelRegistry;
-use crate::ingest::decode::decode_batch;
-use crate::ingest::loader::ProtoSchema;
 use crate::ingest::router::{ChannelBinding, TopicRouter};
+use crate::record::lazy::source::{decode_message, plan_file, time_bounds};
 use crate::store::ChannelStore;
 use crate::types::{
     ChannelId, ChannelMeta, ChannelSnapshot, NumericVal, Sample, SampleType, TimeWindow,
 };
-
-/// The fully-qualified name of the single message defined by an embedded schema,
-/// e.g. "mqtt.HomeSensorsTemperature". None if the set defines no message.
-fn first_message_name(schema_bytes: &[u8]) -> Option<String> {
-    use prost_reflect::prost::Message as _;
-    let fds = prost_types::FileDescriptorSet::decode(schema_bytes).ok()?;
-    for file in &fds.file {
-        if let Some(msg) = file.message_type.first() {
-            // prost-types 0.13 exposes these as plain Option<String> fields
-            // (no name()/package() accessor methods).
-            let name = msg.name.as_deref().unwrap_or_default();
-            return match file.package.as_deref() {
-                None | Some("") => Some(name.to_string()),
-                Some(pkg) => Some(format!("{pkg}.{name}")),
-            };
-        }
-    }
-    None
-}
-
-/// Map the generated `value` field's protobuf kind to a SampleType.
-fn value_sample_type(desc: &MessageDescriptor) -> Option<SampleType> {
-    let field = desc.get_field_by_name("value")?;
-    Some(match field.kind() {
-        Kind::Double | Kind::Float => SampleType::Float,
-        Kind::Int64 | Kind::Int32 | Kind::Uint64 | Kind::Uint32
-        | Kind::Sint64 | Kind::Sint32 | Kind::Fixed64 | Kind::Fixed32
-        | Kind::Sfixed64 | Kind::Sfixed32 => SampleType::Int,
-        Kind::Bool => SampleType::Bool,
-        Kind::String => SampleType::Text,
-        _ => return None,
-    })
-}
 
 enum PlaybackChannel {
     Float { ts: Vec<i64>, vals: Vec<f64> },
@@ -183,8 +148,8 @@ impl PlaybackStore {
         for path in paths {
             let bytes = std::fs::read(path)
                 .with_context(|| format!("reading MCAP file {}", path.display()))?;
-            let (router, reconstructed) = Self::plan_file(&bytes, registry)?;
-            let bounds = Self::time_bounds(&bytes)
+            let (router, reconstructed) = plan_file(&bytes, registry)?;
+            let bounds = time_bounds(&bytes)
                 .with_context(|| format!("reading time bounds of {}", path.display()))?;
             plans.push(FilePlan { bytes, router, reconstructed, bounds });
         }
@@ -211,7 +176,7 @@ impl PlaybackStore {
                     .context("opening MCAP message stream")?
                 {
                     let msg = message.context("reading MCAP message")?;
-                    Self::decode_message(&msg, &plan.router, &plan.reconstructed, &store);
+                    decode_message(&msg, &plan.router, &plan.reconstructed, &store);
                 }
                 continue;
             }
@@ -240,7 +205,7 @@ impl PlaybackStore {
                                     .context("streaming MCAP chunk")?
                                 {
                                     let msg = message.context("reading MCAP message")?;
-                                    Self::decode_message(&msg, router, reconstructed, &buf);
+                                    decode_message(&msg, router, reconstructed, &buf);
                                 }
                             }
                             Ok(buf)
@@ -267,25 +232,6 @@ impl PlaybackStore {
 
         store.sort_and_finalize();
         Ok(Arc::new(store))
-    }
-
-    /// Decode one MCAP message into `store` using the file's routing. ZMQ topics
-    /// resolve through the registry router; the rest fall back to reconstructed
-    /// (MQTT/generated) bindings.
-    fn decode_message(
-        msg: &mcap::Message,
-        router: &TopicRouter,
-        reconstructed: &HashMap<String, Vec<ChannelBinding>>,
-        store: &dyn ChannelStore,
-    ) {
-        let topic = msg.channel.topic.as_str();
-        let zmq = router.bindings_for(topic);
-        let bindings: &[ChannelBinding] = if zmq.is_empty() {
-            reconstructed.get(topic).map(Vec::as_slice).unwrap_or(&[])
-        } else {
-            zmq
-        };
-        decode_batch(&msg.data, bindings, store);
     }
 
     /// Append every channel's samples from `other` onto this store. Both stores
@@ -322,111 +268,6 @@ impl PlaybackStore {
         }
     }
 
-    /// Learn one embedded schema per topic and build the routing bindings for a
-    /// single file, registering any reconstructed (MQTT/generated) channels on
-    /// the shared registry. Prefers the MCAP summary section — channel/schema
-    /// records are indexed in the footer, so no message chunk is decompressed.
-    /// Files with no summary (e.g. a crash mid-recording) fall back to a scan.
-    fn plan_file(
-        bytes: &[u8],
-        registry: &ChannelRegistry,
-    ) -> anyhow::Result<(TopicRouter, HashMap<String, Vec<ChannelBinding>>)> {
-        let mut topic_schemas: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-        let summary = mcap::Summary::read(bytes).context("reading MCAP summary")?;
-        match summary.filter(|s| !s.channels.is_empty()) {
-            Some(summary) => {
-                for channel in summary.channels.values() {
-                    if let Some(schema) = &channel.schema {
-                        topic_schemas
-                            .entry(channel.topic.clone())
-                            .or_insert_with(|| schema.data.to_vec());
-                    }
-                }
-            }
-            None => {
-                for message in mcap::MessageStream::new(bytes)
-                    .context("opening MCAP message stream")?
-                {
-                    let msg = message.context("reading MCAP message")?;
-                    if let Some(schema) = &msg.channel.schema {
-                        topic_schemas
-                            .entry(msg.channel.topic.clone())
-                            .or_insert_with(|| schema.data.to_vec());
-                    }
-                }
-            }
-        }
-
-        // Merge all embedded schemas into one pool; route known ZMQ topics.
-        let set_refs: Vec<&[u8]> = topic_schemas.values().map(Vec::as_slice).collect();
-        let merged = ProtoSchema::from_descriptor_sets(&set_refs);
-        let router = TopicRouter::build(registry, &merged);
-
-        // Reconstruct topics with no registry binding (MQTT / generated messages).
-        let mut reconstructed: HashMap<String, Vec<ChannelBinding>> = HashMap::new();
-        for (topic, schema_bytes) in &topic_schemas {
-            if !router.bindings_for(topic).is_empty() {
-                continue;
-            }
-            let Some(full) = first_message_name(schema_bytes) else { continue };
-            let Some(desc) = merged.message_by_name(&full) else { continue };
-            if desc.get_field_by_name("t_ns").is_none() {
-                continue;
-            }
-            let Some(sample_type) = value_sample_type(&desc) else { continue };
-            let id = registry.add_dynamic(topic, topic, sample_type);
-            if registry.meta(id).sample_type != sample_type {
-                eprintln!(
-                    "replay: topic {:?} already registered as {:?}, but this file records it as {:?}; skipping",
-                    topic,
-                    registry.meta(id).sample_type,
-                    sample_type
-                );
-                continue;
-            }
-            reconstructed.insert(
-                topic.clone(),
-                vec![ChannelBinding {
-                    id,
-                    msg_desc: desc,
-                    val_path: vec!["value".to_string()],
-                    ts_path: vec!["t_ns".to_string()],
-                    eu_scale: 1.0,
-                    eu_offset: 0.0,
-                    sample_type,
-                }],
-            );
-        }
-
-        Ok((router, reconstructed))
-    }
-
-    /// The (min, max) message time in a file. Uses the summary statistics when
-    /// present (no decompression); otherwise scans message log times. `log_time`
-    /// equals the sample `t_ns` the recorder writes, so this matches the decoded
-    /// sample timeline used for stitching. Returns None for an empty file.
-    fn time_bounds(bytes: &[u8]) -> anyhow::Result<Option<(i64, i64)>> {
-        if let Some(summary) = mcap::Summary::read(bytes).context("reading MCAP summary")? {
-            if let Some(stats) = summary.stats {
-                if stats.message_count > 0 {
-                    return Ok(Some((
-                        stats.message_start_time as i64,
-                        stats.message_end_time as i64,
-                    )));
-                }
-            }
-        }
-        let mut min = i64::MAX;
-        let mut max = i64::MIN;
-        for message in mcap::MessageStream::new(bytes)
-            .context("opening MCAP message stream")?
-        {
-            let t = message.context("reading MCAP message")?.log_time as i64;
-            min = min.min(t);
-            max = max.max(t);
-        }
-        Ok((min <= max).then_some((min, max)))
-    }
 }
 
 impl ChannelStore for PlaybackStore {
@@ -902,6 +743,7 @@ type = "float"
 
     #[test]
     fn value_sample_type_maps_kinds() {
+        use crate::record::lazy::source::{first_message_name, value_sample_type};
         use crate::record::mqtt_schema::DynamicProtoRegistry;
         let mut reg = DynamicProtoRegistry::new();
         // Each first payload locks a distinct type; grab the generated descriptor
