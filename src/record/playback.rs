@@ -15,6 +15,24 @@ const ENVELOPE_BUCKETS: usize = 16384;
 const CACHE_BYTES: usize = 512 * 1024 * 1024;
 const CHUNK_BUDGET: usize = 16;
 
+/// Tunable memory knobs. `Default` uses the module constants; tests override
+/// them to force eviction on small inputs.
+pub(crate) struct Caps {
+    pub cache_bytes: usize,
+    pub envelope_buckets: usize,
+    pub chunk_budget: usize,
+}
+
+impl Default for Caps {
+    fn default() -> Self {
+        Caps {
+            cache_bytes: CACHE_BYTES,
+            envelope_buckets: ENVELOPE_BUCKETS,
+            chunk_budget: CHUNK_BUDGET,
+        }
+    }
+}
+
 pub struct PlaybackStore {
     /// One memory-mapped recording per stitched file.
     sources: Vec<RecordingSource>,
@@ -156,7 +174,17 @@ impl PlaybackStore {
     /// retention (text), keeping no raw numeric samples. Reads decode the few
     /// chunks overlapping the requested window on demand.
     pub fn load_many(paths: &[&Path], registry: &ChannelRegistry) -> anyhow::Result<Arc<Self>> {
+        Self::load_many_with(paths, registry, Caps::default())
+    }
+
+    /// [`load_many`](Self::load_many) with explicit memory caps (test hook).
+    pub(crate) fn load_many_with(
+        paths: &[&Path],
+        registry: &ChannelRegistry,
+        caps: Caps,
+    ) -> anyhow::Result<Arc<Self>> {
         anyhow::ensure!(!paths.is_empty(), "no recording files to load");
+        let Caps { cache_bytes, envelope_buckets, chunk_budget } = caps;
 
         // Open (mmap + index + routing) every file first, registering any
         // reconstructed channels BEFORE we snapshot the registry into metas, so
@@ -188,7 +216,7 @@ impl PlaybackStore {
         // split all (source, chunk) jobs across worker threads; each folds into
         // a thread-local envelope + text, then we merge.
         let nchannels = metas.len();
-        let mut envelope = Envelope::new(nchannels, start_ns, duration_ns, ENVELOPE_BUCKETS);
+        let mut envelope = Envelope::new(nchannels, start_ns, duration_ns, envelope_buckets);
         let mut text: Vec<Option<Vec<(i64, String)>>> = metas
             .iter()
             .map(|m| (m.sample_type == SampleType::Text).then(Vec::new))
@@ -212,7 +240,7 @@ impl PlaybackStore {
                     let jobs = &jobs;
                     scope.spawn(move || -> Partial {
                         let mut env =
-                            Envelope::new(nchannels, start_ns, duration_ns, ENVELOPE_BUCKETS);
+                            Envelope::new(nchannels, start_ns, duration_ns, envelope_buckets);
                         let mut txt: Vec<Option<Vec<(i64, String)>>> = metas
                             .iter()
                             .map(|m| (m.sample_type == SampleType::Text).then(Vec::new))
@@ -248,13 +276,13 @@ impl PlaybackStore {
             sources,
             envelope,
             text,
-            cache: ChunkCache::new(CACHE_BYTES),
+            cache: ChunkCache::new(cache_bytes),
             metas,
             position_ns: Arc::new(AtomicI64::new(start_ns)),
             duration_ns,
             start_ns,
             breaks,
-            chunk_budget: CHUNK_BUDGET,
+            chunk_budget,
         }))
     }
 
@@ -273,6 +301,12 @@ impl PlaybackStore {
             },
             _ => ChannelSnapshot::Float { ts, vals: pts.iter().map(|(_, v)| *v).collect() },
         }
+    }
+
+    /// Bytes currently retained by the decoded-chunk cache (test hook).
+    #[cfg(test)]
+    pub(crate) fn cache_retained_bytes(&self) -> usize {
+        self.cache.retained_bytes()
     }
 }
 
@@ -497,6 +531,28 @@ type = "float"
                 .unwrap();
         }
         writer.finish().unwrap();
+    }
+
+    #[test]
+    fn cache_stays_within_cap_while_scrubbing() {
+        let (schema, _d, registry) = make_proto_and_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scrub.mcap");
+        // Many small chunks so scrubbing touches many distinct cache keys.
+        let msgs: Vec<(i64, f32)> = (0..8000).map(|i| (i as i64 + 1, i as f32)).collect();
+        write_test_mcap_chunked(&path, &schema, &msgs, 2048);
+        let caps = Caps { cache_bytes: 64 * 1024, envelope_buckets: 1024, chunk_budget: 4 };
+        let store = PlaybackStore::load_many_with(&[&path], &registry, caps).unwrap();
+        let id = registry.id("accel.x").unwrap();
+        for start in (0..8000i64).step_by(200) {
+            let w = TimeWindow { start_ns: start, end_ns: start + 100 };
+            let _ = store.snapshot(id, w);
+            assert!(
+                store.cache_retained_bytes() <= 64 * 1024,
+                "cache exceeded cap: {}",
+                store.cache_retained_bytes()
+            );
+        }
     }
 
     #[test]
