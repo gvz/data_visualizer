@@ -7,6 +7,17 @@ yourself. You can record a session and scrub back through it later.
 
 Written in Rust on top of [egui](https://github.com/emilk/egui).
 
+## Documentation
+
+- **[User guide](https://gvz.github.io/data_visualizer/)** — getting started,
+  configuration, data sources, panels, recording & playback, and scripting.
+  Built with mdBook from `docs/book/` and published to GitHub Pages.
+- **[API docs](https://gvz.github.io/data_visualizer/api/)** — rustdoc for the
+  crate.
+
+Build the guide locally with `mdbook serve docs/book` (mdBook is in the `nix
+develop` shell).
+
 ## What it does
 
 - Reads live data from MQTT, WebSocket, ZeroMQ, and InfluxDB line protocol.

@@ -1,9 +1,11 @@
 name: Docs
 
-# Build the rustdoc API docs and publish them to GitHub Pages. Pages must be
-# configured with "Source: GitHub Actions" (Settings → Pages). libgtk-3-dev is
-# needed to compile the crate; libzmq/libsodium are vendored and built from
-# source by zeromq-src (the runner ships CMake), so no system ZeroMQ is needed.
+# Build the mdBook user guide and the rustdoc API docs, then publish both to
+# GitHub Pages as one site: the user guide at the root, the API docs under
+# /api/. Pages must be configured with "Source: GitHub Actions"
+# (Settings → Pages). libgtk-3-dev is needed to compile the crate;
+# libzmq/libsodium are vendored and built from source by zeromq-src (the runner
+# ships CMake), so no system ZeroMQ is needed.
 
 on:
   push:
@@ -14,6 +16,9 @@ on:
 concurrency:
   group: pages
   cancel-in-progress: true
+
+env:
+  MDBOOK_VERSION: "0.4.40"
 
 jobs:
   build:
@@ -31,19 +36,36 @@ jobs:
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
 
-      - name: Build docs
+      - name: Install mdBook
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -sSL "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build the user guide
+        run: mdbook build docs/book
+
+      - name: Build the API docs
         run: cargo doc --no-deps --locked
         env:
           # Fail the build on broken intra-doc links.
           RUSTDOCFLAGS: -D warnings
 
-      - name: Redirect root to the crate index
-        run: echo '<meta http-equiv="refresh" content="0; url=datavis/index.html">' > target/doc/index.html
+      - name: Assemble the Pages site
+        run: |
+          # User guide at the root, rustdoc API docs under /api/.
+          rm -rf site
+          cp -r docs/book/book site
+          mkdir -p site/api
+          cp -r target/doc/. site/api/
+          # /api/ lands on the crate index.
+          echo '<meta http-equiv="refresh" content="0; url=datavis/index.html">' > site/api/index.html
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: target/doc
+          path: site
 
   deploy:
     needs: build
