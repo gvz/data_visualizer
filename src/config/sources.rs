@@ -79,6 +79,48 @@ impl SourcesConfig {
     }
 }
 
+impl SourcesConfig {
+    /// Convert every entry in this config into a `SourceSpec` suitable for
+    /// passing to `SourceManager::add`.
+    pub fn specs(&self) -> Vec<crate::ingest::SourceSpec> {
+        use crate::ingest::SourceSpec as S;
+        let mut v = Vec::new();
+        for z in &self.zmq {
+            v.push(S::Zmq { endpoint: z.endpoint.clone(), schema: z.schema.clone() });
+        }
+        for m in &self.mqtt {
+            v.push(S::Mqtt { broker: m.broker.clone(), client_id: m.client_id.clone() });
+        }
+        for w in &self.websocket {
+            v.push(S::WebSocket { listen: w.listen.clone() });
+        }
+        for b in &self.bridge {
+            v.push(S::Bridge(b.clone()));
+        }
+        v
+    }
+
+    /// Append a `SourceSpec` to the appropriate sub-list.
+    ///
+    /// Used by `SourceManager` when persisting a GUI-added source back to
+    /// `SourcesConfig` before writing `config.toml`.
+    pub fn push(&mut self, spec: &crate::ingest::SourceSpec) {
+        use crate::ingest::SourceSpec as S;
+        match spec {
+            S::Zmq { endpoint, schema } => self.zmq.push(ZmqSourceConfig {
+                endpoint: endpoint.clone(),
+                schema: schema.clone(),
+            }),
+            S::Mqtt { broker, client_id } => self.mqtt.push(MqttSourceConfig {
+                broker: broker.clone(),
+                client_id: client_id.clone(),
+            }),
+            S::WebSocket { listen } => self.websocket.push(WsSourceConfig { listen: listen.clone() }),
+            S::Bridge(cfg) => self.bridge.push(cfg.clone()),
+        }
+    }
+}
+
 use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, value};
 
 impl SourcesConfig {

@@ -10,6 +10,7 @@ pub mod bridge;
 pub mod decode;
 pub mod lineproto;
 pub mod loader;
+pub mod manager;
 pub mod mqtt;
 pub mod router;
 pub mod scalar;
@@ -17,6 +18,7 @@ pub mod source;
 pub mod thread;
 pub mod websocket;
 
+pub use manager::{LiveSource, SourceKind, SourceManager, SourceSpec};
 pub use mqtt::{MqttConfig, MqttSource};
 pub use source::{DataSource, Discovery, SourceHandle};
 pub use websocket::{WsConfig, WsSource};
