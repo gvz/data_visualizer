@@ -104,12 +104,26 @@ pub struct SourceManager {
     channels: Arc<ChannelRegistry>,
     sources: Vec<LiveSource>,
     next_id: u64,
+    /// Discovery maps shared by every MQTT/WebSocket source this manager
+    /// spawns, so any number of discovery-capable sources present a single
+    /// unified topic list and one routing table. Seeded once from the
+    /// registry's `mqtt_topic` channels; survives individual source removal.
+    mqtt_topic_map: Arc<MqttTopicMap>,
+    mqtt_discovered: Arc<Mutex<BTreeMap<String, String>>>,
 }
 
 impl SourceManager {
     /// Create an empty manager backed by `store` and `channels`.
     pub fn new(store: Arc<dyn ChannelStore>, channels: Arc<ChannelRegistry>) -> Self {
-        Self { store, channels, sources: Vec::new(), next_id: 0 }
+        let mqtt_topic_map = crate::ingest::source::topic_map_from_registry(channels.as_ref());
+        Self {
+            store,
+            channels,
+            sources: Vec::new(),
+            next_id: 0,
+            mqtt_topic_map,
+            mqtt_discovered: Arc::new(Mutex::new(BTreeMap::new())),
+        }
     }
 
     /// Build and spawn a source from `spec`.
@@ -132,20 +146,22 @@ impl SourceManager {
                 Box::new(src).spawn(self.store.clone())
             }
             SourceSpec::Mqtt { broker, client_id } => {
-                let src = crate::ingest::MqttSource::new(
+                let mut src = crate::ingest::MqttSource::new(
                     crate::ingest::MqttConfig {
                         broker_url: broker.clone(),
                         client_id: client_id.clone(),
                     },
                     self.channels.as_ref(),
                 );
+                src.share(self.mqtt_topic_map.clone(), self.mqtt_discovered.clone());
                 Box::new(src).spawn(self.store.clone())
             }
             SourceSpec::WebSocket { listen } => {
-                let src = crate::ingest::WsSource::new(
+                let mut src = crate::ingest::WsSource::new(
                     crate::ingest::WsConfig { listen: listen.clone() },
                     self.channels.as_ref(),
                 );
+                src.share(self.mqtt_topic_map.clone(), self.mqtt_discovered.clone());
                 Box::new(src).spawn(self.store.clone())
             }
             SourceSpec::Bridge(cfg) => {
@@ -224,17 +240,21 @@ impl SourceManager {
         Vec::new()
     }
 
-    /// Topic-discovery maps from the first source that supports runtime
-    /// discovery (MQTT / WebSocket).
+    /// The shared topic-discovery maps, if any discovery-capable source
+    /// (MQTT / WebSocket) is currently running.
     ///
-    /// Returns `None` if no source provides discovery.
+    /// Every MQTT/WebSocket source spawned by this manager shares one
+    /// `discovered` list and one routing `topic_map`, so the returned pair
+    /// reflects ALL such sources at once — a topic seen by any source appears
+    /// here, and a drag-to-bind written here routes on whichever source
+    /// actually receives that topic. Returns `None` when no discovery-capable
+    /// source is active.
     pub fn discovery(&self) -> Option<(Arc<Mutex<BTreeMap<String, String>>>, Arc<MqttTopicMap>)> {
-        for s in &self.sources {
-            if let Some(d) = &s.handle.discovery {
-                return Some((d.discovered.clone(), d.topic_map.clone()));
-            }
-        }
-        None
+        let has_discovery = self
+            .sources
+            .iter()
+            .any(|s| matches!(s.kind, SourceKind::Mqtt | SourceKind::WebSocket));
+        has_discovery.then(|| (self.mqtt_discovered.clone(), self.mqtt_topic_map.clone()))
     }
 
     /// All currently-running sources, in insertion order.
@@ -283,5 +303,31 @@ mod tests {
         let mut m = mgr();
         m.remove(999);
         assert_eq!(m.sources().len(), 0);
+    }
+
+    #[test]
+    fn multiple_discovery_sources_share_one_topic_map() {
+        use crate::types::{ChannelId, SampleType};
+        let mut m = mgr();
+        // Two WebSocket sources (ephemeral ports, no external dependency).
+        let id1 = m.add(&SourceSpec::WebSocket { listen: "127.0.0.1:0".into() }, true).unwrap();
+        let _id2 = m.add(&SourceSpec::WebSocket { listen: "127.0.0.1:0".into() }, true).unwrap();
+
+        // A bind written through the shared discovery map...
+        let (_disc, map) = m.discovery().expect("discovery active with WS sources");
+        map.write().unwrap().insert("topic/x".into(), (ChannelId(0), SampleType::Float));
+
+        // ...survives removal of the FIRST source, proving the map is shared by
+        // the manager rather than owned by a single source.
+        m.remove(id1);
+        let (_disc2, map2) = m.discovery().expect("second WS source still provides discovery");
+        assert!(map2.read().unwrap().contains_key("topic/x"));
+
+        // Once every discovery-capable source is gone, discovery() is None.
+        let remaining: Vec<u64> = m.sources().iter().map(|s| s.id).collect();
+        for id in remaining {
+            m.remove(id);
+        }
+        assert!(m.discovery().is_none());
     }
 }

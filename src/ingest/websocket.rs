@@ -34,13 +34,30 @@ pub struct WsConfig {
 pub struct WsSource {
     config: WsConfig,
     pub(crate) topic_map: Arc<MqttTopicMap>,
+    pub(crate) discovered: Arc<Mutex<BTreeMap<String, String>>>,
 }
 
 impl WsSource {
     /// Create a new WebSocket source from `config`, pre-seeding the topic map
     /// from any `mqtt_topic` channels already in `registry`.
     pub fn new(config: WsConfig, registry: &ChannelRegistry) -> Self {
-        Self { config, topic_map: topic_map_from_registry(registry) }
+        Self {
+            config,
+            topic_map: topic_map_from_registry(registry),
+            discovered: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    /// Replace this source's discovery maps with shared ones, so that several
+    /// discovery-capable sources managed together present a single unified
+    /// topic list and routing table. Call before [`spawn`](DataSource::spawn).
+    pub(crate) fn share(
+        &mut self,
+        topic_map: Arc<MqttTopicMap>,
+        discovered: Arc<Mutex<BTreeMap<String, String>>>,
+    ) {
+        self.topic_map = topic_map;
+        self.discovered = discovered;
     }
 }
 
@@ -50,8 +67,7 @@ impl DataSource for WsSource {
     }
 
     fn spawn(self: Box<Self>, store: Arc<dyn ChannelStore>) -> SourceHandle {
-        let discovered: Arc<Mutex<BTreeMap<String, String>>> =
-            Arc::new(Mutex::new(BTreeMap::new()));
+        let discovered = self.discovered.clone();
         let record_sender: Arc<Mutex<Option<Sender<RecordMsg>>>> = Arc::new(Mutex::new(None));
         let conn_state = Arc::new(AtomicU8::new(CONNECTING));
 

@@ -36,13 +36,30 @@ pub struct MqttConfig {
 pub struct MqttSource {
     config: MqttConfig,
     pub(crate) topic_map: Arc<MqttTopicMap>,
+    pub(crate) discovered: Arc<Mutex<BTreeMap<String, String>>>,
 }
 
 impl MqttSource {
     /// Create a new MQTT source from `config`, pre-seeding the topic map from
     /// any `mqtt_topic` channels already in `registry`.
     pub fn new(config: MqttConfig, registry: &ChannelRegistry) -> Self {
-        Self { config, topic_map: crate::ingest::source::topic_map_from_registry(registry) }
+        Self {
+            config,
+            topic_map: crate::ingest::source::topic_map_from_registry(registry),
+            discovered: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    /// Replace this source's discovery maps with shared ones, so that several
+    /// discovery-capable sources managed together present a single unified
+    /// topic list and routing table. Call before [`spawn`](DataSource::spawn).
+    pub(crate) fn share(
+        &mut self,
+        topic_map: Arc<MqttTopicMap>,
+        discovered: Arc<Mutex<BTreeMap<String, String>>>,
+    ) {
+        self.topic_map = topic_map;
+        self.discovered = discovered;
     }
 }
 
@@ -52,8 +69,7 @@ impl DataSource for MqttSource {
     }
 
     fn spawn(self: Box<Self>, store: Arc<dyn ChannelStore>) -> SourceHandle {
-        let discovered: Arc<Mutex<BTreeMap<String, String>>> =
-            Arc::new(Mutex::new(BTreeMap::new()));
+        let discovered = self.discovered.clone();
         let (host, port) = parse_broker_url(&self.config.broker_url);
         let mut opts = MqttOptions::new(self.config.client_id.clone(), host, port);
         opts.set_keep_alive(Duration::from_secs(30));
