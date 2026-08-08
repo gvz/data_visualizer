@@ -79,6 +79,73 @@ impl SourcesConfig {
     }
 }
 
+use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, value};
+
+impl SourcesConfig {
+    pub fn merge_into(&self, existing: &str) -> anyhow::Result<String> {
+        let mut doc: DocumentMut = existing.parse().context("parsing existing config")?;
+        doc.remove("sources");
+        if self.is_empty() {
+            return Ok(doc.to_string());
+        }
+        let mut sources = Table::new();
+        sources.set_implicit(true);
+
+        let mut zmq = ArrayOfTables::new();
+        for z in &self.zmq {
+            let mut t = Table::new();
+            t["endpoint"] = value(z.endpoint.as_str());
+            t["schema"] = value(z.schema.as_str());
+            zmq.push(t);
+        }
+        if !zmq.is_empty() { sources.insert("zmq", Item::ArrayOfTables(zmq)); }
+
+        let mut mqtt = ArrayOfTables::new();
+        for m in &self.mqtt {
+            let mut t = Table::new();
+            t["broker"] = value(m.broker.as_str());
+            t["client_id"] = value(m.client_id.as_str());
+            mqtt.push(t);
+        }
+        if !mqtt.is_empty() { sources.insert("mqtt", Item::ArrayOfTables(mqtt)); }
+
+        let mut ws = ArrayOfTables::new();
+        for w in &self.websocket {
+            let mut t = Table::new();
+            t["listen"] = value(w.listen.as_str());
+            ws.push(t);
+        }
+        if !ws.is_empty() { sources.insert("websocket", Item::ArrayOfTables(ws)); }
+
+        let mut bridge = ArrayOfTables::new();
+        for b in &self.bridge {
+            let mut t = Table::new();
+            t["name"] = value(b.name.as_str());
+            t["command"] = value(b.command.as_str());
+            let mut a = Array::new();
+            for arg in &b.args { a.push(arg.clone()); }
+            t["args"] = value(a);
+            bridge.push(t);
+        }
+        if !bridge.is_empty() { sources.insert("bridge", Item::ArrayOfTables(bridge)); }
+
+        doc.insert("sources", Item::Table(sources));
+        Ok(doc.to_string())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.zmq.is_empty() && self.mqtt.is_empty()
+            && self.websocket.is_empty() && self.bridge.is_empty()
+    }
+
+    pub fn save(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        let existing = std::fs::read_to_string(path).unwrap_or_default();
+        let out = self.merge_into(&existing)?;
+        std::fs::write(path, out).with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,5 +185,35 @@ args = ["--fast"]
     fn absent_section_is_empty() {
         let c = SourcesConfig::from_toml_str("default_window_s = 5.0\n").unwrap();
         assert!(c.zmq.is_empty() && c.mqtt.is_empty() && c.websocket.is_empty() && c.bridge.is_empty());
+    }
+
+    #[test]
+    fn save_preserves_other_sections_and_round_trips() {
+        let existing = r#"default_window_s = 30.0
+
+[defaults]
+max_rate = 100000  # keep me
+
+# hand-authored channel
+[channels."volt.l1"]
+type = "float"
+"#;
+        let mut c = SourcesConfig::default();
+        c.zmq.push(ZmqSourceConfig { endpoint: "tcp://x:1".into(), schema: "s.proto".into() });
+        c.mqtt.push(MqttSourceConfig { broker: "h:1883".into(), client_id: "datavis".into() });
+        let out = c.merge_into(existing).unwrap();
+        assert!(out.contains("# keep me"), "comment preserved");
+        assert!(out.contains("[channels.\"volt.l1\"]"), "channels preserved");
+        let reparsed = SourcesConfig::from_toml_str(&out).unwrap();
+        assert_eq!(reparsed, c);
+    }
+
+    #[test]
+    fn save_with_empty_sources_removes_table() {
+        let existing = "[[sources.zmq]]\nendpoint=\"a\"\nschema=\"b\"\n[defaults]\nmax_rate=1\n";
+        let out = SourcesConfig::default().merge_into(existing).unwrap();
+        let reparsed = SourcesConfig::from_toml_str(&out).unwrap();
+        assert!(reparsed.zmq.is_empty());
+        assert!(out.contains("[defaults]"));
     }
 }
