@@ -253,9 +253,13 @@ neither is required to launch.
 
 ## Out of scope / known limitations
 
-- **Multiple simultaneous discovery sources:** the sidebar binds to the first
-  active MQTT/WS source. Running two at once shows only the first's discovered
-  topics (routing still works per-source). Full aggregation is deferred.
+- **Multiple simultaneous discovery sources:** RESOLVED. Every MQTT/WebSocket
+  source spawned by a `SourceManager` shares one `discovered` list and one
+  `topic_map`, so the sidebar shows topics from all of them and a drag-to-bind
+  routes on whichever source receives that topic. (Remaining narrow limitation:
+  with two ZMQ sources carrying *different* proto schemas, only the first
+  schema is embedded in an MCAP recording header, since `schema_bytes()` is
+  first-non-empty.)
 - No editing of a running source in place — stop and re-add to change fields.
 - No reordering/priority UI; sources are independent.
 - CLI-spawned ephemeral sources are not shown as editable rows distinct from
