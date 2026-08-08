@@ -37,6 +37,7 @@ pub fn start_recording(
     registry: &crate::config::ChannelRegistry,
     schema_bytes: Vec<u8>,
     receiver: crossbeam_channel::Receiver<RecordMsg>,
+    max_bytes: Option<u64>,
 ) -> anyhow::Result<RecordHandle> {
     let gap_count = Arc::new(AtomicU64::new(0));
     let record_failed = Arc::new(AtomicBool::new(false));
@@ -47,10 +48,7 @@ pub fn start_recording(
         receiver,
         gap_count.clone(),
         record_failed.clone(),
+        max_bytes,
     )?;
-    Ok(RecordHandle {
-        gap_count,
-        record_failed,
-        stop_tx,
-    })
+    Ok(RecordHandle { gap_count, record_failed, stop_tx })
 }

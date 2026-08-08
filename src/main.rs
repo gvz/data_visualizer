@@ -135,6 +135,12 @@ fn main() -> anyhow::Result<()> {
         (status, tx, disabled, script_metas)
     };
 
+    let record_max_bytes = datavis::config::RecordingConfig::from_toml_str(
+        &std::fs::read_to_string(&layout_path).unwrap_or_default(),
+    )
+    .map(|c| c.max_bytes())
+    .unwrap_or(None);
+
     let registry = PanelRegistry::with_builtins();
     let workspace = Workspace::from_config(&layout, &registry, channels.as_ref());
     let dyn_store: Arc<dyn ChannelStore> = store;
@@ -154,6 +160,7 @@ fn main() -> anyhow::Result<()> {
         script_commands,
         script_disabled,
         script_metas,
+        record_max_bytes,
     );
 
     // On Windows the interpreter ships beside the exe under `python/`. Point the

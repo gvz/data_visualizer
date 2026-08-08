@@ -11,3 +11,9 @@
 #   unit = "V"
 
 default_window_s = 10.0
+
+# Auto-split live recordings once the .mcap file on disk reaches this many MB.
+# Parts are named recording_<secs>_000.mcap, _001, ... and replay stitched
+# together. Omit the section or set 0 to keep a single file.
+# [recording]
+# max_file_mb = 512

@@ -228,6 +228,8 @@ pub struct DataVisApp {
     /// only killed when the app exits, not during `DataVisApp::new`.
     #[allow(dead_code)]
     _bridge_guards: Vec<crate::ingest::source::ChildGuard>,
+    /// On-disk size cap for auto-split, from `[recording] max_file_mb`.
+    record_max_bytes: Option<u64>,
 }
 
 impl DataVisApp {
@@ -247,6 +249,7 @@ impl DataVisApp {
         script_commands: crossbeam_channel::Sender<ScriptCommand>,
         script_disabled: Arc<Mutex<Option<String>>>,
         script_metas: SharedMetas,
+        record_max_bytes: Option<u64>,
     ) -> Self {
         let DerivedIngest {
             conn_states,
@@ -304,6 +307,7 @@ impl DataVisApp {
             script_disabled,
             script_panel_state: Default::default(),
             _bridge_guards: child_guards,
+            record_max_bytes,
         }
     }
 
@@ -382,6 +386,7 @@ impl DataVisApp {
             &self.channels,
             self.ingest_schema_bytes.clone(),
             rx,
+            self.record_max_bytes,
         ) {
             Ok(handle) => {
                 self.record_handle = Some(handle);
