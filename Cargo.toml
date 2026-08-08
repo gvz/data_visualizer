@@ -51,12 +51,15 @@ prost-build = "0.13"
 # tools, not library dependencies — install with:
 #   cargo install cargo-machete
 #   cargo install cargo-udeps   # requires a nightly toolchain
+#   cargo install mdbook        # builds the user guide under docs/book/
 # and run with:
 #   cargo machete
 #   cargo +nightly udeps
+#   mdbook build docs/book   # or: mdbook serve docs/book
 [package.metadata.dev-tools]
 cargo-machete = "0.9"
 cargo-udeps = "0.1"
+mdbook = "0.4"
 
 # Debian packaging (cargo-deb). Runtime library dependencies are resolved
 # automatically from the linked binary via dpkg-shlibdeps ($auto). The .deb

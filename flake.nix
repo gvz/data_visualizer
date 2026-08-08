@@ -65,6 +65,8 @@
             rust
             pkg-config
             cargo-vet
+            # Builds the user guide under docs/book/ (mdbook build|serve).
+            mdbook
           ];
 
           buildInputs = with pkgs; [

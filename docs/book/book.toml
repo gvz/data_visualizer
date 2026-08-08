@@ -1,0 +1,16 @@
+[book]
+title = "datavis — User Guide"
+description = "A desktop tool for watching streaming telemetry in real time: live sources, panels, recording, playback, and scripting."
+authors = ["The datavis contributors"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+git-repository-url = ""
+edit-url-template = ""
+
+[output.html.fold]
+enable = true
+level = 1
