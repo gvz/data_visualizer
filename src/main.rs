@@ -24,10 +24,10 @@ fn main() -> anyhow::Result<()> {
     let demo_freq = arg_value(&args, "--demo-freq")
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(1.0);
-    let endpoint =
-        arg_value(&args, "--endpoint").unwrap_or_else(|| "tcp://localhost:5555".to_string());
-    let schema_path =
-        arg_value(&args, "--schema").unwrap_or_else(|| "schema.proto".to_string());
+    // Parsed as Option so the ZMQ source only starts when one was passed; the
+    // defaults are applied at the point of use, inside the gated branch.
+    let endpoint = arg_value(&args, "--endpoint");
+    let schema_path = arg_value(&args, "--schema");
     let mqtt_endpoint = arg_value(&args, "--mqtt-endpoint");
     let mut layout_path = PathBuf::from("config.toml");
 
@@ -78,9 +78,12 @@ fn main() -> anyhow::Result<()> {
     // no CLI source and relies on `[sources]` / the GUI.
     if demo {
         datavis::demo::spawn_demo(store.clone(), channels.as_ref(), demo_freq);
-    } else if arg_value(&args, "--endpoint").is_some() || arg_value(&args, "--schema").is_some() {
+    } else if endpoint.is_some() || schema_path.is_some() {
         if let Err(e) = manager.add(
-            &datavis::ingest::SourceSpec::Zmq { endpoint, schema: schema_path.clone() },
+            &datavis::ingest::SourceSpec::Zmq {
+                endpoint: endpoint.unwrap_or_else(|| "tcp://localhost:5555".to_string()),
+                schema: schema_path.unwrap_or_else(|| "schema.proto".to_string()),
+            },
             false,
         ) {
             eprintln!("ingest: failed to start ({e}); running without live data");
