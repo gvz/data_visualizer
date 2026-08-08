@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::Sender;
@@ -71,6 +71,7 @@ impl DataSource for WsSource {
             discovery: Some(Discovery { discovered, topic_map: self.topic_map }),
             schema_bytes: None,
             child_guard: None,
+            stop: Arc::new(AtomicBool::new(false)),
         }
     }
 }

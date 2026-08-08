@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::AtomicU8;
+use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -77,6 +77,7 @@ impl DataSource for MqttSource {
             discovery: Some(Discovery { discovered, topic_map: self.topic_map }),
             schema_bytes: None,
             child_guard: None,
+            stop: Arc::new(AtomicBool::new(false)),
         }
     }
 }

@@ -21,7 +21,7 @@ pub use runner::ScriptState;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -360,6 +360,7 @@ impl DataSource for ScriptEngine {
             discovery: None,
             schema_bytes: None,
             child_guard: None,
+            stop: Arc::new(AtomicBool::new(false)),
         }
     }
 }

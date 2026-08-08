@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -14,11 +14,15 @@ pub fn run_loop(
     store: Arc<dyn ChannelStore>,
     state: Arc<AtomicU8>,
     record_sender: Arc<std::sync::Mutex<Option<crossbeam_channel::Sender<RecordMsg>>>>,
+    stop: Arc<AtomicBool>,
 ) {
     let mut backoff_ms = 100u64;
     loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         state.store(CONNECTING, Ordering::Relaxed);
-        match connect_and_recv(&endpoint, &router, store.as_ref(), &state, &record_sender) {
+        match connect_and_recv(&endpoint, &router, store.as_ref(), &state, &record_sender, &stop) {
             Ok(()) => {
                 backoff_ms = 100;
             }
@@ -37,7 +41,12 @@ fn connect_and_recv(
     store: &dyn ChannelStore,
     state: &Arc<AtomicU8>,
     record_sender: &Arc<std::sync::Mutex<Option<crossbeam_channel::Sender<RecordMsg>>>>,
+    stop: &Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
+    if stop.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+
     let ctx = zmq::Context::new();
     let socket = ctx.socket(zmq::SUB)?;
     socket.set_rcvtimeo(1_000)?;
@@ -50,6 +59,9 @@ fn connect_and_recv(
     let mut last_live = Instant::now() - Duration::from_secs(10);
 
     loop {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         match socket.recv_multipart(0) {
             Ok(parts) if parts.len() >= 2 => {
                 let topic = std::str::from_utf8(&parts[0]).unwrap_or("");
@@ -75,6 +87,9 @@ fn connect_and_recv(
                 // Malformed multipart (wrong frame count); ignore.
             }
             Err(zmq::Error::EAGAIN) => {
+                if stop.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
                 if last_live.elapsed() > Duration::from_secs(5) {
                     state.store(TIMEOUT, Ordering::Relaxed);
                 }
@@ -83,5 +98,27 @@ fn connect_and_recv(
                 return Err(e.into());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn connect_and_recv_returns_when_stopped() {
+        // No publisher on this port → recv times out (EAGAIN) each second.
+        // With stop set, connect_and_recv must return Ok(()) promptly.
+        let router = crate::ingest::router::TopicRouter::empty();
+        let store: Arc<dyn crate::store::ChannelStore> =
+            Arc::new(crate::store::LiveStore::from_registry(
+                &crate::config::ChannelRegistry::from_toml_str("").unwrap()));
+        let state = Arc::new(AtomicU8::new(crate::ingest::CONNECTING));
+        let rec = Arc::new(std::sync::Mutex::new(None));
+        let stop = Arc::new(AtomicBool::new(true)); // already stopped
+        let r = connect_and_recv("tcp://localhost:5599", &router, store.as_ref(),
+                                 &state, &rec, &stop);
+        assert!(r.is_ok());
     }
 }

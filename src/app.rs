@@ -1232,6 +1232,7 @@ mod tests {
             discovery: None,
             schema_bytes: None,
             child_guard: None,
+            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let h1 = make_handle("a");
         let h2 = make_handle("b");
@@ -1265,6 +1266,7 @@ mod tests {
             }),
             schema_bytes: None,
             child_guard: None,
+            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let zmq = SourceHandle {
             name: "zmq".into(),
@@ -1273,6 +1275,7 @@ mod tests {
             discovery: None,
             schema_bytes: Some(vec![1, 2, 3]),
             child_guard: None,
+            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let d = DerivedIngest::from_handles(vec![mqtt, zmq]);
         assert_eq!(d.record_sender_slots.len(), 2);
@@ -1305,6 +1308,7 @@ mod tests {
             discovery: None,
             schema_bytes: None,
             child_guard: Some(guard),
+            stop: Arc::new(AtomicBool::new(false)),
         };
         let derived = DerivedIngest::from_handles(vec![handle]);
         // Guard must be retained — stop should still be false.

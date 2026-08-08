@@ -90,6 +90,7 @@ impl DataSource for SubprocessSource {
             discovery: None,
             schema_bytes: Some(schema_bytes),
             child_guard: Some(ChildGuard { stop, current }),
+            stop: Arc::new(AtomicBool::new(false)),
         }
     }
 }

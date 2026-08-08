@@ -77,6 +77,9 @@ pub struct SourceHandle {
     /// Present only for `SubprocessSource`: kills the child on shutdown. All
     /// other sources set this to `None`.
     pub child_guard: Option<ChildGuard>,
+    /// Signals the background thread to stop. Set to `true` by
+    /// `SourceManager::remove` to tear the source down cleanly.
+    pub stop: Arc<AtomicBool>,
 }
 
 /// Kills a spawned child process when dropped. `SubprocessSource` puts one in
@@ -154,6 +157,7 @@ mod tests {
             discovery: Some(discovery),
             schema_bytes: None,
             child_guard: None,
+            stop: Arc::new(AtomicBool::new(false)),
         };
         assert_eq!(h.name, "mqtt");
         assert!(h.discovery.is_some());

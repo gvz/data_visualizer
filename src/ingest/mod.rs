@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU8;
+use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::{Arc, Mutex};
 
 use crate::config::ChannelRegistry;
@@ -75,13 +75,15 @@ impl source::DataSource for ZmqSource {
         let conn_state = Arc::new(AtomicU8::new(CONNECTING));
         let record_sender: Arc<Mutex<Option<crossbeam_channel::Sender<RecordMsg>>>> =
             Arc::new(Mutex::new(None));
+        let stop = Arc::new(AtomicBool::new(false));
 
         let state_clone = conn_state.clone();
         let sender_clone = record_sender.clone();
         let endpoint = self.endpoint.clone();
         let router = self.router;
+        let stop_clone = stop.clone();
         std::thread::spawn(move || {
-            thread::run_loop(endpoint, router, store, state_clone, sender_clone);
+            thread::run_loop(endpoint, router, store, state_clone, sender_clone, stop_clone);
         });
 
         source::SourceHandle {
@@ -91,6 +93,7 @@ impl source::DataSource for ZmqSource {
             discovery: None,
             schema_bytes: Some(self.schema_bytes),
             child_guard: None,
+            stop,
         }
     }
 }

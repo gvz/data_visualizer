@@ -21,6 +21,12 @@ pub struct TopicRouter {
 }
 
 impl TopicRouter {
+    /// Return a router with no bindings. Useful for tests that need a
+    /// `TopicRouter` without a schema file.
+    pub fn empty() -> Self {
+        Self { map: HashMap::new() }
+    }
+
     pub fn build(registry: &ChannelRegistry, schema: &ProtoSchema) -> Self {
         let mut map: HashMap<String, Vec<ChannelBinding>> = HashMap::new();
         for id in registry.iter_ids() {
