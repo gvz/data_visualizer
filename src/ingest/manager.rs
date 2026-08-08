@@ -85,6 +85,13 @@ impl LiveSource {
     pub fn spec(&self) -> Option<&SourceSpec> {
         self.spec.as_ref()
     }
+
+    /// Raw connection-state value for this source (`CONNECTING`, `LIVE`, or `TIMEOUT`).
+    ///
+    /// Use the constants in [`crate::ingest`] to interpret the result.
+    pub fn conn_state(&self) -> u8 {
+        self.handle.conn_state.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// Runtime registry of active data sources.

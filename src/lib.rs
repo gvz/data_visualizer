@@ -144,6 +144,7 @@
 pub mod app;
 pub mod channel_tree;
 pub mod config;
+pub mod data_source_window;
 pub mod demo;
 pub mod dynamic_channel;
 pub mod ingest;

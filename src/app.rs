@@ -170,6 +170,10 @@ pub struct DataVisApp {
     script_panel_state: crate::script::panel::ScriptPanelState,
     /// On-disk size cap for auto-split, from `[recording] max_file_mb`.
     record_max_bytes: Option<u64>,
+    /// Whether the Data Sources window is currently open.
+    data_source_window_open: bool,
+    /// Transient form state for the Data Sources window's "Add source" form.
+    add_source_form: crate::data_source_window::AddSourceForm,
 }
 
 impl DataVisApp {
@@ -235,6 +239,8 @@ impl DataVisApp {
             script_disabled,
             script_panel_state: Default::default(),
             record_max_bytes,
+            data_source_window_open: false,
+            add_source_form: Default::default(),
         }
     }
 
@@ -455,6 +461,9 @@ impl DataVisApp {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
+                if ui.button("Data Source").clicked() {
+                    self.data_source_window_open = !self.data_source_window_open;
+                }
             });
         });
     }
@@ -1094,6 +1103,14 @@ impl eframe::App for DataVisApp {
             self.workspace
                 .ui(ui, self.store.as_ref(), &self.channels, &self.registry, mqtt_ctx);
         });
+
+        crate::data_source_window::show(
+            ctx,
+            &mut self.data_source_window_open,
+            &mut self.manager,
+            &mut self.add_source_form,
+            &self.layout_path,
+        );
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
