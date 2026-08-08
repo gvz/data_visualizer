@@ -112,8 +112,9 @@ fn accept_loop(
                 let rec = record_sender.clone();
                 let state = conn_state.clone();
                 let clients = clients.clone();
+                let stop = stop.clone();
                 std::thread::spawn(move || {
-                    serve_client(sock, map, disc, store, rec, state, clients);
+                    serve_client(sock, map, disc, store, rec, state, clients, stop);
                 });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -140,6 +141,7 @@ fn serve_client(
     record_sender: Arc<Mutex<Option<Sender<RecordMsg>>>>,
     conn_state: Arc<AtomicU8>,
     clients: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
 ) {
     let mut ws = match tungstenite::accept(stream) {
         Ok(ws) => ws,
@@ -148,12 +150,21 @@ fn serve_client(
             return;
         }
     };
+    // Give reads a timeout so this thread wakes periodically to observe `stop`.
+    // Without it, `ws.read()` blocks forever on an idle-but-connected client and
+    // the thread would outlive `SourceManager::remove` (leaking the socket and
+    // its store/record_sender Arcs). tungstenite treats a timed-out read as a
+    // recoverable `WouldBlock`/`TimedOut` IO error and resumes on the next read.
+    ws.get_ref().set_read_timeout(Some(std::time::Duration::from_millis(500))).ok();
     if clients.fetch_add(1, Ordering::Relaxed) == 0 {
         conn_state.store(LIVE, Ordering::Relaxed);
     }
 
     let mut ingest = ScalarIngest::new(discovered, topic_map, store, record_sender);
     loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         match ws.read() {
             Ok(tungstenite::Message::Text(text)) => {
                 let now = crate::types::now_ns();
@@ -165,6 +176,13 @@ fn serve_client(
             }
             Ok(tungstenite::Message::Close(_)) => break,
             Ok(_) => {} // binary/ping/pong ignored; tungstenite auto-replies pings
+            Err(tungstenite::Error::Io(ref e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // Read timed out — loop back to re-check `stop`.
+                continue;
+            }
             Err(e) => {
                 eprintln!("websocket: read: {e}");
                 break;
@@ -187,7 +205,7 @@ mod tests {
     use crate::types::Sample;
     use std::collections::BTreeMap;
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -231,9 +249,10 @@ mod tests {
             conn_state.clone(),
             clients.clone(),
         );
+        let s_stop = Arc::new(AtomicBool::new(false));
         std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            serve_client(stream, s_map, s_disc, s_store, s_rec, s_state, s_clients);
+            serve_client(stream, s_map, s_disc, s_store, s_rec, s_state, s_clients, s_stop);
         });
 
         let (mut ws, _resp) =
