@@ -157,10 +157,13 @@ impl SourceManager {
                 Box::new(src).spawn(self.store.clone())
             }
             SourceSpec::WebSocket { listen } => {
-                let mut src = crate::ingest::WsSource::new(
+                // Bind eagerly so a failure (e.g. the port is already in use by
+                // another source) surfaces here as an error instead of failing
+                // silently in the background thread.
+                let mut src = crate::ingest::WsSource::bind(
                     crate::ingest::WsConfig { listen: listen.clone() },
                     self.channels.as_ref(),
-                );
+                )?;
                 src.share(self.mqtt_topic_map.clone(), self.mqtt_discovered.clone());
                 Box::new(src).spawn(self.store.clone())
             }
@@ -303,6 +306,19 @@ mod tests {
         let mut m = mgr();
         m.remove(999);
         assert_eq!(m.sources().len(), 0);
+    }
+
+    #[test]
+    fn websocket_bind_failure_errors_and_adds_nothing() {
+        // Occupy a port for the duration of the test, then try to add a
+        // WebSocket source on the same address: the eager bind must fail so
+        // `add` returns Err and no zombie source is left behind.
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = occupied.local_addr().unwrap().to_string();
+        let mut m = mgr();
+        let r = m.add(&SourceSpec::WebSocket { listen: addr }, true);
+        assert!(r.is_err(), "binding an already-occupied port must error");
+        assert_eq!(m.sources().len(), 0, "a source that failed to bind must not be added");
     }
 
     #[test]

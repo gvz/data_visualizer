@@ -3,6 +3,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use anyhow::Context;
 use crossbeam_channel::Sender;
 
 use crate::config::ChannelRegistry;
@@ -35,17 +36,40 @@ pub struct WsSource {
     config: WsConfig,
     pub(crate) topic_map: Arc<MqttTopicMap>,
     pub(crate) discovered: Arc<Mutex<BTreeMap<String, String>>>,
+    /// Pre-bound listener when built via [`WsSource::bind`]; `None` when built
+    /// via [`WsSource::new`] (the accept loop binds lazily in that case).
+    listener: Option<TcpListener>,
 }
 
 impl WsSource {
     /// Create a new WebSocket source from `config`, pre-seeding the topic map
-    /// from any `mqtt_topic` channels already in `registry`.
+    /// from any `mqtt_topic` channels already in `registry`. The listen port is
+    /// bound lazily when the source is spawned.
     pub fn new(config: WsConfig, registry: &ChannelRegistry) -> Self {
         Self {
             config,
             topic_map: topic_map_from_registry(registry),
             discovered: Arc::new(Mutex::new(BTreeMap::new())),
+            listener: None,
         }
+    }
+
+    /// Create a WebSocket source and bind its listen port **eagerly**, so a bind
+    /// failure (e.g. the port is already in use by another source) is reported
+    /// to the caller instead of failing silently in the background thread.
+    ///
+    /// # Errors
+    /// Returns `Err` if `config.listen` cannot be bound.
+    pub fn bind(config: WsConfig, registry: &ChannelRegistry) -> anyhow::Result<Self> {
+        let listener = TcpListener::bind(&config.listen)
+            .with_context(|| format!("binding WebSocket listener on {}", config.listen))?;
+        listener.set_nonblocking(true).ok();
+        Ok(Self {
+            config,
+            topic_map: topic_map_from_registry(registry),
+            discovered: Arc::new(Mutex::new(BTreeMap::new())),
+            listener: Some(listener),
+        })
     }
 
     /// Replace this source's discovery maps with shared ones, so that several
@@ -74,13 +98,14 @@ impl DataSource for WsSource {
         let stop = Arc::new(AtomicBool::new(false));
 
         let listen = self.config.listen.clone();
+        let listener = self.listener;
         let map = self.topic_map.clone();
         let disc = discovered.clone();
         let rec = record_sender.clone();
         let state = conn_state.clone();
         let stop_flag = stop.clone();
         std::thread::spawn(move || {
-            accept_loop(listen, map, disc, store, rec, state, stop_flag);
+            accept_loop(listen, listener, map, disc, store, rec, state, stop_flag);
         });
 
         SourceHandle {
@@ -97,8 +122,10 @@ impl DataSource for WsSource {
 
 /// Bind and accept connections, one serving thread per client. A bind failure
 /// logs and exits the thread (app keeps running, conn_state stays CONNECTING).
+#[allow(clippy::too_many_arguments)]
 fn accept_loop(
     listen: String,
+    listener: Option<TcpListener>,
     topic_map: Arc<MqttTopicMap>,
     discovered: Arc<Mutex<BTreeMap<String, String>>>,
     store: Arc<dyn ChannelStore>,
@@ -106,14 +133,22 @@ fn accept_loop(
     conn_state: Arc<AtomicU8>,
     stop: Arc<AtomicBool>,
 ) {
-    let listener = match TcpListener::bind(&listen) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("websocket: bind {listen} failed: {e}");
-            return;
-        }
+    // Use the pre-bound listener from `WsSource::bind` if present; otherwise bind
+    // lazily here (the `WsSource::new` path, used by tests). Either way the
+    // listener is non-blocking so the accept loop can poll `stop`.
+    let listener = match listener {
+        Some(l) => l,
+        None => match TcpListener::bind(&listen) {
+            Ok(l) => {
+                l.set_nonblocking(true).ok();
+                l
+            }
+            Err(e) => {
+                eprintln!("websocket: bind {listen} failed: {e}");
+                return;
+            }
+        },
     };
-    listener.set_nonblocking(true).ok();
     let clients = Arc::new(AtomicUsize::new(0));
     loop {
         if stop.load(Ordering::Relaxed) {
