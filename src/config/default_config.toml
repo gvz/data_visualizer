@@ -17,3 +17,22 @@ default_window_s = 10.0
 # together. Omit the section or set 0 to keep a single file.
 # [recording]
 # max_file_mb = 512
+
+# Live data sources. The Data Source window (the button next to File) adds,
+# starts, and stops these at runtime and writes changes back here. Each kind is
+# an array, so you can declare several. Delete this entry if you don't use ZMQ.
+[[sources.zmq]]
+endpoint = "tcp://localhost:5555"
+schema = "schema.proto"
+
+# [[sources.mqtt]]
+# broker = "localhost:1883"
+# client_id = "datavis"
+
+# [[sources.websocket]]
+# listen = "0.0.0.0:9001"
+
+# [[sources.bridge]]
+# name = "my-adapter"
+# command = "/path/to/adapter"
+# args = []

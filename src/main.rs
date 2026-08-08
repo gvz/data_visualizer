@@ -51,42 +51,55 @@ fn main() -> anyhow::Result<()> {
 
     // The runtime source registry. The status indicator aggregates every
     // source's conn_state (LIVE if any source is live), so add order does not
-    // affect it. Sources spawned here from CLI flags are ephemeral (persist =
-    // false): they are not written back to config.toml.
+    // affect it.
     let manager_store: Arc<dyn ChannelStore> = store.clone();
     let mut manager = datavis::ingest::SourceManager::new(manager_store, channels.clone());
 
+    // Persistent sources: everything declared in the `[sources]` table of
+    // config.toml (zmq / mqtt / websocket / bridge). These are the set the
+    // Data Source window manages and writes back, so they are added with
+    // persist = true.
+    let config_text = std::fs::read_to_string(&layout_path).unwrap_or_default();
+    match datavis::config::SourcesConfig::from_toml_str(&config_text) {
+        Ok(sources_cfg) => {
+            for spec in sources_cfg.specs() {
+                if let Err(e) = manager.add(&spec, true) {
+                    eprintln!("source: failed to start {}: {e}", spec.label());
+                }
+            }
+        }
+        Err(e) => eprintln!("config: ignoring malformed [sources]: {e}"),
+    }
+
+    // Ephemeral CLI sources (persist = false — never written to config). These
+    // are one-off overrides layered on top of the persistent set. `--demo` runs
+    // the built-in demo instead of any live source. The ZMQ source starts only
+    // when `--endpoint` or `--schema` is passed explicitly; a bare launch spawns
+    // no CLI source and relies on `[sources]` / the GUI.
     if demo {
         datavis::demo::spawn_demo(store.clone(), channels.as_ref(), demo_freq);
-    } else if let Err(e) = manager.add(
-        &datavis::ingest::SourceSpec::Zmq { endpoint, schema: schema_path.clone() },
-        false,
-    ) {
-        eprintln!("ingest: failed to start ({e}); running without live data");
+    } else if arg_value(&args, "--endpoint").is_some() || arg_value(&args, "--schema").is_some() {
+        if let Err(e) = manager.add(
+            &datavis::ingest::SourceSpec::Zmq { endpoint, schema: schema_path.clone() },
+            false,
+        ) {
+            eprintln!("ingest: failed to start ({e}); running without live data");
+        }
     }
 
     if let Some(broker) = mqtt_endpoint {
-        let _ = manager.add(
+        if let Err(e) = manager.add(
             &datavis::ingest::SourceSpec::Mqtt { broker, client_id: "datavis".to_string() },
             false,
-        );
+        ) {
+            eprintln!("mqtt: failed to start ({e})");
+        }
     }
 
     if let Some(listen) = arg_value(&args, "--ws-listen") {
-        let _ = manager.add(&datavis::ingest::SourceSpec::WebSocket { listen }, false);
-    }
-
-    // External bridges declared in [[sources.bridge]]: spawn each org-provided
-    // adapter. datavis owns the child process lifecycle. (Config-driven
-    // persistence of the full [sources] table is added in a later change.)
-    let config_text = std::fs::read_to_string(&layout_path).unwrap_or_default();
-    match datavis::ingest::bridge::BridgeConfig::list_from_toml_str(&config_text) {
-        Ok(bridges) => {
-            for bridge in bridges {
-                let _ = manager.add(&datavis::ingest::SourceSpec::Bridge(bridge), false);
-            }
+        if let Err(e) = manager.add(&datavis::ingest::SourceSpec::WebSocket { listen }, false) {
+            eprintln!("websocket: failed to start ({e})");
         }
-        Err(e) => eprintln!("config: ignoring malformed [[sources.bridge]]: {e}"),
     }
 
     // Scripting engine: load the [scripts] section, discover *.py in its dir,
@@ -262,20 +275,26 @@ fn print_help() {
 USAGE:
     datavis [OPTIONS]
 
+All flags are optional. Data sources are normally configured in the Data
+Source window (the button next to File) or the [sources] table of config.toml;
+these flags spawn extra one-off sources that are NOT written back to config.
+
 OPTIONS:
     --demo                    Run with the built-in demo source (no live inputs).
     --demo-freq <HZ>          Sine frequency for the demo source. [default: 1.0]
-    --endpoint <ADDR>         ZMQ SUB endpoint for live proto data.
-                              [default: tcp://localhost:5555]
-    --schema <PATH>           Proto schema file for the ZMQ source.
+    --endpoint <ADDR>         Start an extra ZMQ SUB source at this endpoint.
+                              Only starts the ZMQ source when --endpoint or
+                              --schema is given. [default: tcp://localhost:5555]
+    --schema <PATH>           Proto schema file for the --endpoint ZMQ source.
                               [default: schema.proto]
-    --mqtt-endpoint <ADDR>    MQTT broker as \"host:port\" (or \"host\", port 1883).
-                              Enables the MQTT source; off when omitted.
-    --ws-listen <ADDR>        Bind a WebSocket server (\"host:port\") that receives
-                              InfluxDB line protocol. Off when omitted.
+    --mqtt-endpoint <ADDR>    Start an extra MQTT source. Broker as \"host:port\"
+                              (or \"host\", port 1883). Off when omitted.
+    --ws-listen <ADDR>        Start an extra WebSocket server (\"host:port\") that
+                              receives InfluxDB line protocol. Off when omitted.
     -h, --help                Print this help and exit.
 
-Channels and layout share config.toml; the layout section persists there.
-The status indicator reads LIVE if any configured source is receiving data."
+Persistent sources live in the [sources] table of config.toml; channels and
+layout share the same file. The status indicator reads LIVE if any source is
+receiving data."
     );
 }
