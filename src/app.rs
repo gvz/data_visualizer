@@ -81,60 +81,6 @@ pub(crate) enum AppMode {
     Replay(ReplayState),
 }
 
-/// Ingest-derived fields collapsed from the running sources. `mqtt_topics`,
-/// `mqtt_topic_map` and `ingest_schema_bytes` take the first source that
-/// provides each (today at most one does). `conn_states` keeps EVERY source's
-/// state so the status indicator can aggregate — showing LIVE when any source
-/// is live rather than following one arbitrary source that may have no data.
-pub(crate) struct DerivedIngest {
-    pub conn_states: Vec<Arc<std::sync::atomic::AtomicU8>>,
-    pub record_sender_slots:
-        Vec<Arc<Mutex<Option<crossbeam_channel::Sender<crate::record::RecordMsg>>>>>,
-    pub ingest_schema_bytes: Vec<u8>,
-    pub mqtt_topics: Option<Arc<Mutex<BTreeMap<String, String>>>>,
-    pub mqtt_topic_map: Option<Arc<crate::dynamic_channel::MqttTopicMap>>,
-    /// RAII guards that kill bridge child processes on drop. Held here so they
-    /// survive `from_handles` and can be moved into the owning app struct.
-    pub child_guards: Vec<crate::ingest::source::ChildGuard>,
-}
-
-impl DerivedIngest {
-    pub(crate) fn from_handles(handles: Vec<crate::ingest::SourceHandle>) -> Self {
-        let mut conn_states = Vec::new();
-        let mut record_sender_slots = Vec::new();
-        let mut ingest_schema_bytes = Vec::new();
-        let mut mqtt_topics = None;
-        let mut mqtt_topic_map = None;
-        let mut child_guards = Vec::new();
-        for h in handles {
-            record_sender_slots.push(h.record_sender);
-            conn_states.push(h.conn_state);
-            if let Some(bytes) = h.schema_bytes {
-                if ingest_schema_bytes.is_empty() {
-                    ingest_schema_bytes = bytes;
-                }
-            }
-            if let Some(d) = h.discovery {
-                if mqtt_topics.is_none() {
-                    mqtt_topics = Some(d.discovered);
-                    mqtt_topic_map = Some(d.topic_map);
-                }
-            }
-            if let Some(g) = h.child_guard {
-                child_guards.push(g);
-            }
-        }
-        Self {
-            conn_states,
-            record_sender_slots,
-            ingest_schema_bytes,
-            mqtt_topics,
-            mqtt_topic_map,
-            child_guards,
-        }
-    }
-}
-
 /// Coarse connection status across all sources for the live indicator. `LIVE`
 /// wins if any source is live (we are receiving data); otherwise `CONNECTING`
 /// while any source is still trying, else `TIMEOUT`. `None` means no sources
@@ -171,7 +117,11 @@ pub struct DataVisApp {
     /// When set, `status` is cleared once this instant passes. Used for
     /// transient confirmations (e.g. "layout saved") that should not linger.
     status_clear_at: Option<Instant>,
-    conn_states: Vec<Arc<std::sync::atomic::AtomicU8>>,
+    /// Owns every live data source and spawns/tears them down at runtime.
+    /// Ingest-derived views (conn states, record-sender slots, schema bytes,
+    /// MQTT discovery) are computed from it on demand so they stay correct as
+    /// sources are added and removed.
+    manager: crate::ingest::SourceManager,
     mode: AppMode,
     /// In-flight recording load. The MCAP decode runs on a worker thread so the
     /// UI stays responsive; the result arrives here and is applied on the frame
@@ -179,19 +129,13 @@ pub struct DataVisApp {
     pending_load: Option<(String, crossbeam_channel::Receiver<anyhow::Result<Arc<PlaybackStore>>>)>,
     // Recording state
     record_handle: Option<RecordHandle>,
-    record_sender_slots: Vec<Arc<Mutex<Option<crossbeam_channel::Sender<crate::record::RecordMsg>>>>>,
-    ingest_schema_bytes: Vec<u8>,
     // Channel picker sidebar
     channel_tree: ChannelTree,
     /// Live channel tree saved while a replay rebuilds the picker; restored on close.
     saved_channel_tree: Option<ChannelTree>,
     sidebar_visible: bool,
-    /// MQTT discovered topics — populated by the MQTT ingest thread via `#`.
-    mqtt_topics: Option<Arc<Mutex<BTreeMap<String, String>>>>,
-    /// Shared topic→channel routing table; extended when an MQTT topic is
-    /// dropped onto a panel so the ingest thread starts routing it.
-    mqtt_topic_map: Option<Arc<crate::dynamic_channel::MqttTopicMap>>,
-    /// Snapshot of mqtt_topics updated at 1 Hz so the UI doesn't lock every frame.
+    /// Snapshot of the active MQTT/WS source's discovered topics, refreshed at
+    /// 1 Hz from `manager.discovery()` so the UI doesn't lock every frame.
     mqtt_snapshot: BTreeMap<String, String>,
     mqtt_snapshot_at: Instant,
     dark_mode: bool,
@@ -224,10 +168,6 @@ pub struct DataVisApp {
     script_commands: crossbeam_channel::Sender<ScriptCommand>,
     script_disabled: Arc<Mutex<Option<String>>>,
     script_panel_state: crate::script::panel::ScriptPanelState,
-    /// Holds bridge `ChildGuard`s for the app's lifetime so child processes are
-    /// only killed when the app exits, not during `DataVisApp::new`.
-    #[allow(dead_code)]
-    _bridge_guards: Vec<crate::ingest::source::ChildGuard>,
     /// On-disk size cap for auto-split, from `[recording] max_file_mb`.
     record_max_bytes: Option<u64>,
 }
@@ -239,7 +179,7 @@ impl DataVisApp {
         registry: PanelRegistry,
         workspace: Workspace,
         layout_path: PathBuf,
-        sources: Vec<crate::ingest::SourceHandle>,
+        manager: crate::ingest::SourceManager,
         live_view_ns: Arc<AtomicI64>,
         live_history_s: f64,
         default_window_s: f64,
@@ -251,14 +191,6 @@ impl DataVisApp {
         script_metas: SharedMetas,
         record_max_bytes: Option<u64>,
     ) -> Self {
-        let DerivedIngest {
-            conn_states,
-            record_sender_slots,
-            ingest_schema_bytes,
-            mqtt_topics,
-            mqtt_topic_map,
-            child_guards,
-        } = DerivedIngest::from_handles(sources);
         let panel_type = registry
             .pickable_type_names()
             .first()
@@ -277,17 +209,13 @@ impl DataVisApp {
             focus_screen_field: false,
             status: String::new(),
             status_clear_at: None,
-            conn_states,
+            manager,
             mode: AppMode::Live,
             pending_load: None,
             record_handle: None,
-            record_sender_slots,
-            ingest_schema_bytes,
             channel_tree,
             saved_channel_tree: None,
             sidebar_visible: true,
-            mqtt_topics,
-            mqtt_topic_map,
             mqtt_snapshot: BTreeMap::new(),
             mqtt_snapshot_at: Instant::now() - Duration::from_secs(2),
             dark_mode: false,
@@ -306,7 +234,6 @@ impl DataVisApp {
             script_commands,
             script_disabled,
             script_panel_state: Default::default(),
-            _bridge_guards: child_guards,
             record_max_bytes,
         }
     }
@@ -372,19 +299,20 @@ impl DataVisApp {
     }
 
     fn start_recording(&mut self) {
-        if self.record_sender_slots.is_empty() {
+        let slots = self.manager.record_sender_slots();
+        if slots.is_empty() {
             self.status = "Recording unavailable (no ingest source)".to_string();
             return;
         }
         let (tx, rx) = crate::record::record_channel();
         // Install the sender into every active ingest source (mpmc queue).
-        for slot in &self.record_sender_slots {
+        for slot in &slots {
             *slot.lock().unwrap() = Some(tx.clone());
         }
         match start_recording(
             Path::new("."),
             &self.channels,
-            self.ingest_schema_bytes.clone(),
+            self.manager.schema_bytes(),
             rx,
             self.record_max_bytes,
         ) {
@@ -394,7 +322,7 @@ impl DataVisApp {
             }
             Err(e) => {
                 // Remove senders since the recorder won't consume them.
-                for slot in &self.record_sender_slots {
+                for slot in &slots {
                     *slot.lock().unwrap() = None;
                 }
                 self.status = format!("Record failed: {e}");
@@ -404,7 +332,7 @@ impl DataVisApp {
 
     fn stop_recording(&mut self) {
         // Remove senders first so ingest stops queuing, then drop handle to signal recorder.
-        for slot in &self.record_sender_slots {
+        for slot in &self.manager.record_sender_slots() {
             *slot.lock().unwrap() = None;
         }
         self.record_handle = None;
@@ -661,7 +589,7 @@ impl DataVisApp {
                         let (label, color) = if self.live_paused {
                             ("PAUSED", amber)
                         } else {
-                            match aggregate_conn_state(&self.conn_states) {
+                            match aggregate_conn_state(&self.manager.conn_states()) {
                                 None | Some(crate::ingest::LIVE) => ("LIVE", green),
                                 Some(crate::ingest::CONNECTING) => ("CONNECTING", amber),
                                 Some(crate::ingest::TIMEOUT) => ("TIMEOUT", red),
@@ -1128,13 +1056,15 @@ impl eframe::App for DataVisApp {
         // re-bind channels that were unknown at layout-load time — e.g. a
         // drop-created (dynamic) MQTT channel whose topic has just reappeared
         // after a restart. Runs regardless of sidebar visibility.
-        if self.mqtt_topics.is_some() && self.mqtt_snapshot_at.elapsed() >= Duration::from_secs(1) {
-            if let Some(arc) = &self.mqtt_topics {
-                self.mqtt_snapshot = arc.lock().unwrap().clone();
+        let discovery = self.manager.discovery();
+        if discovery.is_some() && self.mqtt_snapshot_at.elapsed() >= Duration::from_secs(1) {
+            if let Some((topics, _)) = &discovery {
+                self.mqtt_snapshot = topics.lock().unwrap().clone();
             }
             self.mqtt_snapshot_at = Instant::now();
             if matches!(self.mode, AppMode::Live) {
-                let mqtt_ctx = self.mqtt_topic_map.as_deref().map(|tm| (tm, &self.mqtt_snapshot));
+                let mqtt_ctx =
+                    discovery.as_ref().map(|(_, map)| (map.as_ref(), &self.mqtt_snapshot));
                 self.workspace.refresh_bindings(&self.channels, self.store.as_ref(), mqtt_ctx);
             }
         }
@@ -1151,16 +1081,16 @@ impl eframe::App for DataVisApp {
             self.channel_picker_side(ctx);
         }
 
+        // Dynamic MQTT-topic binding is only offered in Live mode, where
+        // `self.store` is the growable LiveStore. `discovery` (from the active
+        // MQTT/WS source, if any) is resolved before the closure so its Arcs
+        // outlive the borrow.
+        let mqtt_ctx = if matches!(self.mode, AppMode::Live) {
+            discovery.as_ref().map(|(_, map)| (map.as_ref(), &self.mqtt_snapshot))
+        } else {
+            None
+        };
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Dynamic MQTT-topic binding is only offered in Live mode, where
-            // `self.store` is the growable LiveStore.
-            let mqtt_ctx = if matches!(self.mode, AppMode::Live) {
-                self.mqtt_topic_map
-                    .as_deref()
-                    .map(|tm| (tm, &self.mqtt_snapshot))
-            } else {
-                None
-            };
             self.workspace
                 .ui(ui, self.store.as_ref(), &self.channels, &self.registry, mqtt_ctx);
         });
@@ -1247,76 +1177,6 @@ mod tests {
             *slot.lock().unwrap() = None;
         }
         assert!(slots.iter().all(|s| s.lock().unwrap().is_none()));
-    }
-
-    #[test]
-    fn derives_ingest_fields_from_handles() {
-        use crate::ingest::{Discovery, SourceHandle};
-        use std::collections::BTreeMap;
-        use std::sync::atomic::AtomicU8;
-        use std::sync::{Arc, Mutex, RwLock};
-
-        let mqtt = SourceHandle {
-            name: "mqtt".into(),
-            conn_state: Arc::new(AtomicU8::new(0)),
-            record_sender: Arc::new(Mutex::new(None)),
-            discovery: Some(Discovery {
-                discovered: Arc::new(Mutex::new(BTreeMap::new())),
-                topic_map: Arc::new(RwLock::new(std::collections::HashMap::new())),
-            }),
-            schema_bytes: None,
-            child_guard: None,
-            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        };
-        let zmq = SourceHandle {
-            name: "zmq".into(),
-            conn_state: Arc::new(AtomicU8::new(1)),
-            record_sender: Arc::new(Mutex::new(None)),
-            discovery: None,
-            schema_bytes: Some(vec![1, 2, 3]),
-            child_guard: None,
-            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        };
-        let d = DerivedIngest::from_handles(vec![mqtt, zmq]);
-        assert_eq!(d.record_sender_slots.len(), 2);
-        assert_eq!(d.ingest_schema_bytes, vec![1, 2, 3]);
-        assert!(d.mqtt_topics.is_some());
-        assert!(d.mqtt_topic_map.is_some());
-        // Every source's conn_state is kept (mqtt CONNECTING=0, zmq LIVE=1).
-        assert_eq!(d.conn_states.len(), 2);
-    }
-
-    #[test]
-    fn from_handles_retains_child_guards() {
-        // Regression test: ChildGuard must NOT be dropped during from_handles.
-        // Before the fix, h.child_guard was silently dropped at the end of each
-        // loop iteration because DerivedIngest had no field for it, triggering
-        // ChildGuard::drop which sets stop=true and kills the child.
-        use crate::ingest::SourceHandle;
-        use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-        use std::sync::{Arc, Mutex};
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let guard = crate::ingest::source::ChildGuard {
-            stop: stop.clone(),
-            current: Arc::new(Mutex::new(None)),
-        };
-        let handle = SourceHandle {
-            name: "bridge".into(),
-            conn_state: Arc::new(AtomicU8::new(0)),
-            record_sender: Arc::new(Mutex::new(None)),
-            discovery: None,
-            schema_bytes: None,
-            child_guard: Some(guard),
-            stop: Arc::new(AtomicBool::new(false)),
-        };
-        let derived = DerivedIngest::from_handles(vec![handle]);
-        // Guard must be retained — stop should still be false.
-        assert_eq!(derived.child_guards.len(), 1);
-        assert!(!stop.load(Ordering::SeqCst), "ChildGuard was dropped prematurely by from_handles");
-        // Dropping DerivedIngest must fire the guard (sets stop=true).
-        drop(derived);
-        assert!(stop.load(Ordering::SeqCst), "ChildGuard::drop did not fire when DerivedIngest was dropped");
     }
 
     #[test]

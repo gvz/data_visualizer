@@ -21,6 +21,9 @@ pub enum SourceKind {
     Mqtt,
     WebSocket,
     Bridge,
+    /// A pre-spawned internal source adopted via [`SourceManager::adopt`]
+    /// (e.g. the scripting engine). Not user-configurable and never persisted.
+    Internal,
 }
 
 /// Full specification for one data source, used both to spawn it and (for
@@ -70,14 +73,17 @@ pub struct LiveSource {
     /// `true` for sources added via the config file or GUI (will be written
     /// back to `config.toml`); `false` for ephemeral CLI-only sources.
     pub persist: bool,
-    spec: SourceSpec,
+    /// The spec used to create this source, or `None` for adopted internal
+    /// sources (the scripting engine) that have no config representation.
+    spec: Option<SourceSpec>,
     handle: SourceHandle,
 }
 
 impl LiveSource {
-    /// The specification that was used to create this source.
-    pub fn spec(&self) -> &SourceSpec {
-        &self.spec
+    /// The specification that was used to create this source, if any. Internal
+    /// adopted sources return `None`.
+    pub fn spec(&self) -> Option<&SourceSpec> {
+        self.spec.as_ref()
     }
 }
 
@@ -149,10 +155,29 @@ impl SourceManager {
             kind: spec.kind(),
             label: spec.label(),
             persist,
-            spec: spec.clone(),
+            spec: Some(spec.clone()),
             handle,
         });
         Ok(id)
+    }
+
+    /// Adopt an already-spawned [`SourceHandle`] that has no [`SourceSpec`] —
+    /// e.g. the scripting engine, which is a `DataSource` but not a
+    /// user-configurable one. It participates in the derived views (its
+    /// `record_sender`/`conn_state` join the aggregate) but is marked
+    /// `Internal`, never persisted, and not shown as a configurable row.
+    pub fn adopt(&mut self, handle: SourceHandle, label: String) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.sources.push(LiveSource {
+            id,
+            kind: SourceKind::Internal,
+            label,
+            persist: false,
+            spec: None,
+            handle,
+        });
+        id
     }
 
     /// Stop and remove the source with the given `id`.

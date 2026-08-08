@@ -5,9 +5,11 @@ use anyhow::{anyhow, Context};
 
 use datavis::app::DataVisApp;
 use datavis::config::{ChannelRegistry, LayoutConfig, DEFAULT_CONFIG_TOML};
-use datavis::ingest::{
-    DataSource, IngestConfig, MqttConfig, MqttSource, WsConfig, WsSource, ZmqSource,
-};
+// Only the scripting engine spawns a source directly here (via `adopt`); every
+// other source is built inside `SourceManager`. So `DataSource` is only in use
+// when the scripting feature is enabled.
+#[cfg(feature = "scripting")]
+use datavis::ingest::DataSource;
 use datavis::store::{ChannelStore, LiveStore};
 use datavis::viz::PanelRegistry;
 use datavis::workspace::Workspace;
@@ -47,45 +49,41 @@ fn main() -> anyhow::Result<()> {
         .map(|id| channels.as_ref().meta(id).history_s)
         .fold(5.0_f64, f64::max);
 
-    // The status indicator aggregates every source's conn_state (LIVE if any
-    // source is live), so push order does not affect it. Schema/discovery are
-    // each provided by a single source, so order is irrelevant there too.
-    let mut sources: Vec<datavis::ingest::SourceHandle> = Vec::new();
+    // The runtime source registry. The status indicator aggregates every
+    // source's conn_state (LIVE if any source is live), so add order does not
+    // affect it. Sources spawned here from CLI flags are ephemeral (persist =
+    // false): they are not written back to config.toml.
+    let manager_store: Arc<dyn ChannelStore> = store.clone();
+    let mut manager = datavis::ingest::SourceManager::new(manager_store, channels.clone());
 
     if demo {
         datavis::demo::spawn_demo(store.clone(), channels.as_ref(), demo_freq);
-    } else {
-        let config = IngestConfig {
-            endpoint,
-            proto_path: PathBuf::from(&schema_path),
-        };
-        match ZmqSource::build(config, channels.as_ref()) {
-            Ok(src) => sources.push(Box::new(src).spawn(store.clone())),
-            Err(e) => eprintln!("ingest: failed to start ({e}); running without live data"),
-        }
+    } else if let Err(e) = manager.add(
+        &datavis::ingest::SourceSpec::Zmq { endpoint, schema: schema_path.clone() },
+        false,
+    ) {
+        eprintln!("ingest: failed to start ({e}); running without live data");
     }
 
     if let Some(broker) = mqtt_endpoint {
-        let src = MqttSource::new(
-            MqttConfig { broker_url: broker, client_id: "datavis".to_string() },
-            channels.as_ref(),
+        let _ = manager.add(
+            &datavis::ingest::SourceSpec::Mqtt { broker, client_id: "datavis".to_string() },
+            false,
         );
-        sources.push(Box::new(src).spawn(store.clone()));
     }
 
     if let Some(listen) = arg_value(&args, "--ws-listen") {
-        let src = WsSource::new(WsConfig { listen }, channels.as_ref());
-        sources.push(Box::new(src).spawn(store.clone()));
+        let _ = manager.add(&datavis::ingest::SourceSpec::WebSocket { listen }, false);
     }
 
-    // External bridges: spawn each org-provided adapter declared in
-    // [[sources.bridge]]. datavis owns the child process lifecycle.
+    // External bridges declared in [[sources.bridge]]: spawn each org-provided
+    // adapter. datavis owns the child process lifecycle. (Config-driven
+    // persistence of the full [sources] table is added in a later change.)
     let config_text = std::fs::read_to_string(&layout_path).unwrap_or_default();
     match datavis::ingest::bridge::BridgeConfig::list_from_toml_str(&config_text) {
         Ok(bridges) => {
             for bridge in bridges {
-                let src = datavis::ingest::bridge::SubprocessSource::new(bridge, channels.as_ref());
-                sources.push(Box::new(src).spawn(store.clone()));
+                let _ = manager.add(&datavis::ingest::SourceSpec::Bridge(bridge), false);
             }
         }
         Err(e) => eprintln!("config: ignoring malformed [[sources.bridge]]: {e}"),
@@ -117,7 +115,7 @@ fn main() -> anyhow::Result<()> {
         let script_commands = engine.commands();
         let script_disabled = engine.disabled_reason();
         let script_metas = engine.script_metas();
-        sources.push(Box::new(engine).spawn(store.clone()));
+        manager.adopt(Box::new(engine).spawn(store.clone()), "scripting".to_string());
         (script_status, script_commands, script_disabled, script_metas)
     };
 
@@ -150,7 +148,7 @@ fn main() -> anyhow::Result<()> {
         registry,
         workspace,
         layout_path,
-        sources,
+        manager,
         live_view_ns,
         live_history_s,
         layout.default_window_s,
