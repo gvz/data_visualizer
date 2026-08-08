@@ -104,7 +104,7 @@ fn connect_and_recv(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn connect_and_recv_returns_when_stopped() {
