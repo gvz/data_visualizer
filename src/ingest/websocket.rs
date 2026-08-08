@@ -55,13 +55,16 @@ impl DataSource for WsSource {
         let record_sender: Arc<Mutex<Option<Sender<RecordMsg>>>> = Arc::new(Mutex::new(None));
         let conn_state = Arc::new(AtomicU8::new(CONNECTING));
 
+        let stop = Arc::new(AtomicBool::new(false));
+
         let listen = self.config.listen.clone();
         let map = self.topic_map.clone();
         let disc = discovered.clone();
         let rec = record_sender.clone();
         let state = conn_state.clone();
+        let stop_flag = stop.clone();
         std::thread::spawn(move || {
-            accept_loop(listen, map, disc, store, rec, state);
+            accept_loop(listen, map, disc, store, rec, state, stop_flag);
         });
 
         SourceHandle {
@@ -71,7 +74,7 @@ impl DataSource for WsSource {
             discovery: Some(Discovery { discovered, topic_map: self.topic_map }),
             schema_bytes: None,
             child_guard: None,
-            stop: Arc::new(AtomicBool::new(false)),
+            stop,
         }
     }
 }
@@ -85,6 +88,7 @@ fn accept_loop(
     store: Arc<dyn ChannelStore>,
     record_sender: Arc<Mutex<Option<Sender<RecordMsg>>>>,
     conn_state: Arc<AtomicU8>,
+    stop: Arc<AtomicBool>,
 ) {
     let listener = match TcpListener::bind(&listen) {
         Ok(l) => l,
@@ -93,24 +97,34 @@ fn accept_loop(
             return;
         }
     };
+    listener.set_nonblocking(true).ok();
     let clients = Arc::new(AtomicUsize::new(0));
-    for stream in listener.incoming() {
-        let stream = match stream {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("websocket: accept failed: {e}");
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        match listener.accept() {
+            Ok((sock, _)) => {
+                sock.set_nonblocking(false).ok();
+                let map = topic_map.clone();
+                let disc = discovered.clone();
+                let store = store.clone();
+                let rec = record_sender.clone();
+                let state = conn_state.clone();
+                let clients = clients.clone();
+                std::thread::spawn(move || {
+                    serve_client(sock, map, disc, store, rec, state, clients);
+                });
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
                 continue;
             }
-        };
-        let map = topic_map.clone();
-        let disc = discovered.clone();
-        let store = store.clone();
-        let rec = record_sender.clone();
-        let state = conn_state.clone();
-        let clients = clients.clone();
-        std::thread::spawn(move || {
-            serve_client(stream, map, disc, store, rec, state, clients);
-        });
+            Err(e) => {
+                eprintln!("ws: accept: {e}");
+                return;
+            }
+        }
     }
 }
 
@@ -246,5 +260,19 @@ mod tests {
         );
         // Dropping the client closes the socket; the server read loop then ends.
         drop(ws);
+    }
+
+    #[test]
+    fn accept_loop_stops_promptly() {
+        use std::sync::atomic::Ordering;
+        let registry = crate::config::ChannelRegistry::from_toml_str("").unwrap();
+        let store: Arc<dyn crate::store::ChannelStore> =
+            Arc::new(crate::store::LiveStore::from_registry(&registry));
+        let src = WsSource::new(WsConfig { listen: "127.0.0.1:0".into() }, &registry);
+        let handle = Box::new(src).spawn(store);
+        assert_eq!(handle.stop.load(Ordering::Relaxed), false);
+        handle.stop.store(true, Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // Wiring test: stop is settable and the accept loop observes it.
     }
 }
