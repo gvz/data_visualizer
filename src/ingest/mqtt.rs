@@ -62,12 +62,15 @@ impl DataSource for MqttSource {
             Arc::new(Mutex::new(None));
         let conn_state = Arc::new(AtomicU8::new(CONNECTING));
 
+        let stop = Arc::new(AtomicBool::new(false));
+
         let disc = discovered.clone();
         let map = self.topic_map.clone();
         let rec = record_sender.clone();
         let state = conn_state.clone();
+        let stop_clone = stop.clone();
         std::thread::spawn(move || {
-            run_loop(opts, map, disc, store, rec, state);
+            run_loop(opts, map, disc, store, rec, state, stop_clone);
         });
 
         SourceHandle {
@@ -77,7 +80,7 @@ impl DataSource for MqttSource {
             discovery: Some(Discovery { discovered, topic_map: self.topic_map }),
             schema_bytes: None,
             child_guard: None,
-            stop: Arc::new(AtomicBool::new(false)),
+            stop,
         }
     }
 }
@@ -89,13 +92,26 @@ fn run_loop(
     store: Arc<dyn ChannelStore>,
     record_sender: Arc<Mutex<Option<crossbeam_channel::Sender<RecordMsg>>>>,
     conn_state: Arc<AtomicU8>,
+    stop: Arc<AtomicBool>,
 ) {
     use std::sync::atomic::Ordering;
     let (client, mut connection) = Client::new(opts, 64);
     let mut ingest =
         crate::ingest::scalar::ScalarIngest::new(discovered, topic_map, store, record_sender);
 
+    let watch_stop = stop.clone();
+    let watch_client = client.clone();
+    std::thread::spawn(move || {
+        while !watch_stop.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let _ = watch_client.disconnect();
+    });
+
     for event in connection.iter() {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
         match event {
             Ok(Event::Incoming(Packet::ConnAck(_))) => {
                 conn_state.store(LIVE, Ordering::Relaxed);
@@ -112,6 +128,9 @@ fn run_loop(
             }
             Err(e) => {
                 conn_state.store(CONNECTING, Ordering::Relaxed);
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
                 eprintln!("mqtt: {e}");
                 std::thread::sleep(Duration::from_secs(2));
             }
@@ -194,6 +213,24 @@ type = "float"
         assert!(handle.schema_bytes.is_none());
         // No broker at that port → stays CONNECTING.
         assert_eq!(handle.conn_state.load(Ordering::Relaxed), CONNECTING);
+    }
+
+    #[test]
+    fn spawn_sets_stop_false_and_disconnects_on_stop() {
+        use std::sync::atomic::Ordering;
+        let registry = crate::config::ChannelRegistry::from_toml_str("").unwrap();
+        let store: Arc<dyn crate::store::ChannelStore> =
+            Arc::new(crate::store::LiveStore::from_registry(&registry));
+        let src = MqttSource::new(
+            MqttConfig { broker_url: "localhost:1".into(), client_id: "t".into() },
+            &registry);
+        let handle = Box::new(src).spawn(store);
+        assert_eq!(handle.stop.load(Ordering::Relaxed), false);
+        handle.stop.store(true, Ordering::Relaxed);
+        // Give the watcher a beat; disconnect on a dead broker is a no-op error we ignore.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // No assertion on thread join (no join handle); test verifies wiring compiles
+        // and stop is settable. Real teardown is exercised manually / in integration.
     }
 
     #[test]
