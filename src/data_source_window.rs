@@ -180,8 +180,10 @@ fn show_contents(
 
     if let Some(id) = stop_id {
         manager.remove(id);
-        if let Err(e) = persist(config_path, manager) {
-            form.last_error = Some(format!("persist error: {e}"));
+        match persist(config_path, manager) {
+            // Clear any stale error from a previous failed action on success.
+            Ok(()) => form.last_error = None,
+            Err(e) => form.last_error = Some(format!("persist error: {e}")),
         }
     }
 
@@ -273,7 +275,7 @@ fn show_contents(
     ui.add_space(6.0);
 
     // Error display
-    if let Some(ref err) = form.last_error.clone() {
+    if let Some(err) = &form.last_error {
         ui.colored_label(egui::Color32::RED, format!("Error: {err}"));
     }
 
