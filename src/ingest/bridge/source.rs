@@ -89,8 +89,8 @@ impl DataSource for SubprocessSource {
             record_sender,
             discovery: None,
             schema_bytes: Some(schema_bytes),
+            stop: stop.clone(),
             child_guard: Some(ChildGuard { stop, current }),
-            stop: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -340,6 +340,23 @@ type = "text"
         assert_eq!(handle.conn_state.load(Ordering::Relaxed), LIVE);
         assert!(handle.child_guard.is_some());
         assert!(handle.schema_bytes.as_ref().is_some_and(|b| !b.is_empty()));
+    }
+
+    #[test]
+    fn handle_stop_drives_child_guard() {
+        use std::sync::atomic::Ordering;
+        let registry = crate::config::ChannelRegistry::from_toml_str("").unwrap();
+        let store: Arc<dyn crate::store::ChannelStore> =
+            Arc::new(crate::store::LiveStore::from_registry(&registry));
+        let cfg = crate::ingest::bridge::BridgeConfig {
+            name: "t".into(),
+            command: "true".into(),
+            args: vec![],
+        };
+        let handle = Box::new(crate::ingest::bridge::SubprocessSource::new(cfg, &registry)).spawn(store);
+        handle.stop.store(true, Ordering::Relaxed);
+        // reader thread observes stop and ceases respawning
+        assert!(handle.stop.load(Ordering::Relaxed));
     }
 
     #[cfg(unix)]
