@@ -4,6 +4,9 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use iced::widget::{column, container, row, text};
+use iced::{Element, Length, Task};
+
 use crate::channel_tree::ChannelTree;
 use crate::config::{ChannelRegistry, LayoutConfig};
 use crate::record::playback::PlaybackStore;
@@ -14,6 +17,21 @@ use crate::script::{ScriptCommand, SharedMetas, SharedStatus};
 use crate::viz::PanelRegistry;
 
 use super::message::Message;
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Repaint interval when the store is actively writing new samples (~60 fps).
+const FAST_INTERVAL_MS: u64 = 16;
+/// Repaint interval when the store has been idle (no new writes).
+const SLOW_INTERVAL_MS: u64 = 250;
+/// How long the store must be idle before we drop to the slow interval.
+const IDLE_THRESHOLD: Duration = Duration::from_millis(500);
+
+// ---------------------------------------------------------------------------
+// Sub-types
+// ---------------------------------------------------------------------------
 
 pub(crate) struct ReplayState {
     pub store: Arc<PlaybackStore>,
@@ -52,6 +70,8 @@ pub struct DataVisApp {
     pub(crate) live_paused: bool,
     pub(crate) live_pause_ns: i64,
     pub(crate) last_write_seq: u64,
+    /// When the store last advanced (write_seq changed). Used to detect idle.
+    pub(crate) last_write_advance: Instant,
     pub(crate) default_window_s: f64,
     pub(crate) _available_scripts: Vec<String>,
     pub(crate) script_instances: Vec<ScriptInstance>,
@@ -105,6 +125,7 @@ impl DataVisApp {
             live_paused: false,
             live_pause_ns: 0,
             last_write_seq: 0,
+            last_write_advance: Instant::now(),
             default_window_s,
             _available_scripts: available_scripts,
             script_instances,
@@ -117,33 +138,264 @@ impl DataVisApp {
         }
     }
 
-    pub fn update(&mut self, message: Message, _now: std::time::Instant) -> iced::Task<Message> {
+    // -----------------------------------------------------------------------
+    // Adaptive repaint helpers
+    // -----------------------------------------------------------------------
+
+    /// Returns the repaint interval for a given activity state.
+    ///
+    /// `advanced = true`  → store is writing new samples → fast (~60 fps).
+    /// `advanced = false` → store is idle                → slow heartbeat.
+    pub fn interval_for(advanced: bool) -> Duration {
+        if advanced {
+            Duration::from_millis(FAST_INTERVAL_MS)
+        } else {
+            Duration::from_millis(SLOW_INTERVAL_MS)
+        }
+    }
+
+    /// Current desired repaint interval based on whether the store is idle.
+    pub fn desired_interval(&self) -> Duration {
+        let idle = self.last_write_advance.elapsed() >= IDLE_THRESHOLD;
+        Self::interval_for(!idle)
+    }
+
+    // -----------------------------------------------------------------------
+    // iced interface
+    // -----------------------------------------------------------------------
+
+    pub fn update(&mut self, message: Message, _now: std::time::Instant) -> Task<Message> {
         match message {
             Message::Tick => {
+                // Adaptive repaint: check if the store has new data.
+                let seq = self.store.write_seq();
+                if seq != self.last_write_seq {
+                    self.last_write_seq = seq;
+                    self.last_write_advance = Instant::now();
+                }
+                // TODO(T5): sync visible panels
                 self.expire_status();
-                iced::Task::none()
+                Task::none()
+            }
+
+            // Fully wired toggles.
+            Message::ToggleSidebar => {
+                self.sidebar_visible = !self.sidebar_visible;
+                Task::none()
+            }
+            Message::OpenDataSource => {
+                self.data_source_window_open = true;
+                Task::none()
+            }
+            Message::CloseDataSource => {
+                self.data_source_window_open = false;
+                Task::none()
+            }
+
+            // Stubs — real implementations arrive in later tasks.
+            Message::Load => {
+                self.set_transient_status("Load recording — coming in a later task");
+                Task::none()
+            }
+            Message::SaveLayout => {
+                self.set_transient_status("Save layout — coming in a later task");
+                Task::none()
+            }
+            Message::SaveLayoutAs => {
+                self.set_transient_status("Save layout as — coming in a later task");
+                Task::none()
+            }
+            Message::LoadLayoutFrom => {
+                self.set_transient_status("Load layout from — coming in a later task");
+                Task::none()
+            }
+            Message::StartRecord => {
+                self.set_transient_status("Start recording — coming in a later task");
+                Task::none()
+            }
+            Message::StopRecord => {
+                self.set_transient_status("Stop recording — coming in a later task");
+                Task::none()
+            }
+            Message::OpenRecording => {
+                self.set_transient_status("Open recording — coming in a later task");
+                Task::none()
+            }
+            Message::AddPanel => {
+                self.set_transient_status("Add panel — coming in a later task");
+                Task::none()
+            }
+            Message::AddScreen => {
+                self.set_transient_status("Add screen — coming in a later task");
+                Task::none()
+            }
+            Message::Panel(_pane_id, _panel_msg) => {
+                // TODO(T5): route to workspace panels
+                Task::none()
             }
         }
     }
 
-    pub fn view(&self) -> iced::Element<'_, Message> {
-        // Task 4 fills the real layout; for now a labelled placeholder proves launch.
-        iced::widget::container(iced::widget::text(format!("datavis — {}", self.status)))
-            .center(iced::Length::Fill)
-            .into()
+    pub fn view(&self) -> Element<'_, Message> {
+        let is_replaying = matches!(self.mode, AppMode::Replay(_));
+
+        // Menu + toolbar row.
+        let top_bar = self.menu_toolbar_row();
+
+        // Sidebar placeholder (shown when sidebar_visible).
+        let sidebar = container(text("Sidebar"))
+            .width(Length::Fixed(220.0))
+            .height(Length::Fill)
+            .style(|theme: &iced::Theme| {
+                let palette = theme.extended_palette();
+                container::Style {
+                    background: Some(palette.background.weak.color.into()),
+                    ..container::Style::default()
+                }
+            });
+
+        // Workspace placeholder (always shown).
+        let workspace = container(text("Workspace"))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center(Length::Fill);
+
+        // Main content row: optional sidebar + workspace.
+        let content_row: Element<'_, Message> = if self.sidebar_visible {
+            row![sidebar, workspace].into()
+        } else {
+            row![workspace].into()
+        };
+
+        // Timeline placeholder (shown only during replay).
+        let timeline = container(text("Timeline"))
+            .width(Length::Fill)
+            .height(Length::Fixed(80.0))
+            .style(|theme: &iced::Theme| {
+                let palette = theme.extended_palette();
+                container::Style {
+                    background: Some(palette.background.strong.color.into()),
+                    ..container::Style::default()
+                }
+            });
+
+        // Status bar.
+        let status_bar = container(text(self.status.as_str()).size(13))
+            .width(Length::Fill)
+            .padding(4);
+
+        // Full layout.
+        if is_replaying {
+            column![top_bar, content_row, timeline, status_bar]
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else {
+            column![top_bar, content_row, status_bar]
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        }
     }
 
     pub fn subscription(&self) -> iced::Subscription<Message> {
-        iced::time::every(std::time::Duration::from_millis(250)).map(|_| Message::Tick)
+        iced::time::every(self.desired_interval()).map(|_| Message::Tick)
     }
+
+    // -----------------------------------------------------------------------
+    // View helpers
+    // -----------------------------------------------------------------------
+
+    /// Renders the combined menu + toolbar row.
+    fn menu_toolbar_row(&self) -> Element<'_, Message> {
+        use iced::widget::button;
+
+        // File menu buttons (flat for now; real menus via Task 13).
+        let btn_save = button(text("Save layout"))
+            .on_press(Message::SaveLayout);
+        let btn_save_as = button(text("Save layout as…"))
+            .on_press(Message::SaveLayoutAs);
+        let btn_load = button(text("Load layout"))
+            .on_press(Message::Load);
+        let btn_load_from = button(text("Load layout from…"))
+            .on_press(Message::LoadLayoutFrom);
+
+        // Data source toggle.
+        let ds_label = if self.data_source_window_open { "Close Data Source" } else { "Data Source" };
+        let btn_data_source = button(text(ds_label))
+            .on_press(if self.data_source_window_open {
+                Message::CloseDataSource
+            } else {
+                Message::OpenDataSource
+            });
+
+        // Sidebar toggle.
+        let sidebar_label = if self.sidebar_visible { "Hide Sidebar" } else { "Show Sidebar" };
+        let btn_sidebar = button(text(sidebar_label))
+            .on_press(Message::ToggleSidebar);
+
+        // Panel / screen management.
+        let btn_add_panel = button(text("+ Panel"))
+            .on_press(Message::AddPanel);
+        let btn_add_screen = button(text("+ Screen"))
+            .on_press(Message::AddScreen);
+
+        // Recording controls (stubs until Task 14).
+        let btn_record: Element<'_, Message> = if self.record_handle.is_some() {
+            button(text("Stop Recording"))
+                .on_press(Message::StopRecord)
+                .into()
+        } else {
+            button(text("Record"))
+                .on_press(Message::StartRecord)
+                .into()
+        };
+        let btn_open_rec = button(text("Open Recording"))
+            .on_press(Message::OpenRecording);
+
+        container(
+            row![
+                btn_save,
+                btn_save_as,
+                btn_load,
+                btn_load_from,
+                btn_data_source,
+                btn_sidebar,
+                btn_add_panel,
+                btn_add_screen,
+                btn_record,
+                btn_open_rec,
+            ]
+            .spacing(4)
+            .padding(4),
+        )
+        .width(Length::Fill)
+        .style(|theme: &iced::Theme| {
+            let palette = theme.extended_palette();
+            container::Style {
+                background: Some(palette.background.strong.color.into()),
+                ..container::Style::default()
+            }
+        })
+        .into()
+    }
+
+    // -----------------------------------------------------------------------
+    // Internals
+    // -----------------------------------------------------------------------
 
     fn expire_status(&mut self) {
         if let Some(t) = self.status_clear_at {
-            if std::time::Instant::now() >= t {
+            if Instant::now() >= t {
                 self.status.clear();
                 self.status_clear_at = None;
             }
         }
+    }
+
+    fn set_transient_status(&mut self, msg: impl Into<String>) {
+        self.status = msg.into();
+        self.status_clear_at = Some(Instant::now() + Duration::from_secs(3));
     }
 
     /// Current layout config (default_window_s only for now; workspace reintroduced Task 5).
@@ -194,5 +446,83 @@ impl DataVisApp {
         self.live_view_offset_ns = 0;
         self.live_paused = false;
         self.status = "Replay closed".to_string();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_store_drops_repaint_rate() {
+        // desired_interval() returns the fast interval right after a write-seq bump,
+        // and the slow interval once write_seq has been unchanged past the idle window.
+        let fast = DataVisApp::interval_for(/*advanced=*/true);
+        let slow = DataVisApp::interval_for(false);
+        assert!(fast < slow);
+    }
+
+    /// Build a minimal `DataVisApp` for unit tests.
+    #[cfg(test)]
+    fn make_test_app() -> DataVisApp {
+        use std::sync::Arc;
+        use crate::viz::PanelRegistry;
+        use crate::store::LiveStore;
+        use crate::config::ChannelRegistry;
+
+        let channels = Arc::new(ChannelRegistry::from_toml_str("").unwrap());
+        let store = Arc::new(LiveStore::from_registry(&channels));
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let live_view_ns = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let script_status = Arc::new(std::sync::Mutex::new(Default::default()));
+        let script_metas = Arc::new(std::sync::Mutex::new(Default::default()));
+        let script_disabled = Arc::new(std::sync::Mutex::new(None));
+        let manager = crate::ingest::SourceManager::new(store.clone(), channels.clone());
+
+        DataVisApp::new(
+            PanelRegistry::with_builtins(),
+            store,
+            channels,
+            PathBuf::from("layout.toml"),
+            manager,
+            live_view_ns,
+            60.0,
+            10.0,
+            vec![],
+            vec![],
+            script_status,
+            tx,
+            script_disabled,
+            script_metas,
+            None,
+        )
+    }
+
+    #[test]
+    fn toggle_sidebar_flips_bool() {
+        let mut app = make_test_app();
+
+        assert!(app.sidebar_visible, "sidebar starts visible");
+        let now = Instant::now();
+        app.update(Message::ToggleSidebar, now);
+        assert!(!app.sidebar_visible, "sidebar hidden after toggle");
+        app.update(Message::ToggleSidebar, now);
+        assert!(app.sidebar_visible, "sidebar visible again after second toggle");
+    }
+
+    #[test]
+    fn open_close_data_source_flips_bool() {
+        let mut app = make_test_app();
+
+        assert!(!app.data_source_window_open, "window starts closed");
+        let now = Instant::now();
+        app.update(Message::OpenDataSource, now);
+        assert!(app.data_source_window_open, "window opens");
+        app.update(Message::CloseDataSource, now);
+        assert!(!app.data_source_window_open, "window closes");
     }
 }
