@@ -11,6 +11,7 @@ use datavis::config::{ChannelRegistry, LayoutConfig, DEFAULT_CONFIG_TOML};
 use datavis::ingest::DataSource;
 use datavis::store::{ChannelStore, LiveStore};
 use datavis::ui::DataVisApp;
+use datavis::viz::PanelRegistry;
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -155,6 +156,7 @@ fn main() -> anyhow::Result<()> {
 
     let dyn_store: Arc<dyn ChannelStore> = store;
     let app = DataVisApp::new(
+        PanelRegistry::with_builtins(),
         dyn_store,
         channels,
         layout_path,

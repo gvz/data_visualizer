@@ -11,6 +11,7 @@ use crate::record::RecordHandle;
 use crate::store::ChannelStore;
 use crate::script::config::ScriptInstance;
 use crate::script::{ScriptCommand, SharedMetas, SharedStatus};
+use crate::viz::PanelRegistry;
 
 use super::message::Message;
 
@@ -27,9 +28,9 @@ pub(crate) enum AppMode {
 }
 
 /// Top-level iced app — fields carried over from the egui DataVisApp.
-/// registry / workspace / add_panel / add_source_form are dropped here
-/// and reintroduced by Tasks 3/5/12/14.
+/// workspace / add_panel / add_source_form are reintroduced by Tasks 5/12/14.
 pub struct DataVisApp {
+    pub(crate) registry: PanelRegistry,
     pub(crate) store: Arc<dyn ChannelStore>,
     pub(crate) live_store: Arc<dyn ChannelStore>,
     pub(crate) channels: Arc<ChannelRegistry>,
@@ -64,6 +65,7 @@ pub struct DataVisApp {
 
 impl DataVisApp {
     pub fn new(
+        registry: PanelRegistry,
         store: Arc<dyn ChannelStore>,
         channels: Arc<ChannelRegistry>,
         layout_path: PathBuf,
@@ -81,6 +83,7 @@ impl DataVisApp {
     ) -> Self {
         let channel_tree = ChannelTree::build(channels.as_ref());
         Self {
+            registry,
             live_store: store.clone(),
             store,
             channels,
