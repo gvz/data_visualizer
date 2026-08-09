@@ -78,14 +78,12 @@ pub trait VizPanel {
     fn serialize(&self) -> toml::Table;
 }
 
-/// Builds a [`VizPanel`] from its serialized form.
+/// A constructor for a panel type. Receives the panel's config table and the
+/// channel registry, and returns the panel.
 ///
-/// The [`toml::Table`] is the panel's own config; the [`crate::config::ChannelRegistry`]
-/// resolves channel names to ids and metadata.
-///
-/// Return `Err` only for malformed config. A binding failure (unknown channel,
-/// wrong type) should be encoded in the returned panel as an inline error
-/// message, not an `Err`.
+/// Binding failures (unknown channel, wrong sample type) must NOT abort
+/// construction — represent them as an inline error by returning
+/// [`ErrorPanel::new(msg)`](ErrorPanel::new) as the panel. There is no `Err`.
 pub type PanelCtor = Box<
     dyn Fn(
         &toml::Table,
