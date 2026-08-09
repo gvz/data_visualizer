@@ -15,7 +15,7 @@ pub mod types;
 pub mod runner;
 #[cfg(feature = "scripting")]
 pub mod python;
-pub mod panel;
+// pub mod panel; — removed in Task 2 (egui-dependent); restored in Task 15
 
 pub use runner::ScriptState;
 

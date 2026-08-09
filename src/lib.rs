@@ -141,10 +141,8 @@
 //! | [`config::ChannelRegistry`] | `config` | Channel name → id + metadata at startup |
 //! | [`script::ScriptEngine`] | `script` | Runs numba-compiled user scripts as a data source |
 
-pub mod app;
 pub mod channel_tree;
 pub mod config;
-pub mod data_source_window;
 pub mod demo;
 pub mod dynamic_channel;
 pub mod ingest;
@@ -152,5 +150,4 @@ pub mod record;
 pub mod script;
 pub mod store;
 pub mod types;
-pub mod viz;
-pub mod workspace;
+pub mod ui;

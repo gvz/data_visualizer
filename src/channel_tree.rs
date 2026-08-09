@@ -1,7 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
 
-use eframe::egui;
-
 use crate::config::ChannelRegistry;
 
 #[derive(Clone)]
@@ -186,83 +184,7 @@ impl ChannelTree {
         roots
     }
 
-    /// Render one drag-only "/" tree. Every leaf is a selectable drag source and
-    /// shows its live value dimmed on the right. `extra` are discovered MQTT
-    /// topics not yet in the registry; the workspace resolves which drops can
-    /// actually bind.
-    pub fn ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        extra: &BTreeMap<String, String>,
-        value_of: impl Fn(&str) -> Option<String>,
-    ) {
-        let roots = self.assemble(extra, &value_of);
-        let order = flat_leaf_order(&roots);
-        // Drop selections that no longer exist (channels removed / renamed).
-        self.selected.retain(|n| order.iter().any(|o| o == n));
-        // Collect the click so selection is mutated after the immutable render
-        // walk finishes: (leaf name, toggle modifier, range modifier).
-        let mut click: Option<(String, bool, bool)> = None;
-        for node in &roots {
-            self.render_node(ui, node, &order, &mut click);
-        }
-        if let Some((name, toggle, range)) = click {
-            self.apply_click(&name, toggle, range, &order);
-        }
-    }
-
-    fn render_node(
-        &self,
-        ui: &mut egui::Ui,
-        node: &Node,
-        order: &[String],
-        click: &mut Option<(String, bool, bool)>,
-    ) {
-        match node {
-            Node::Group { label, children } => {
-                egui::CollapsingHeader::new(label)
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        for child in children {
-                            self.render_node(ui, child, order, click);
-                        }
-                    });
-            }
-            Node::Leaf { label, full_name, value } => {
-                let is_sel = self.selected.contains(full_name);
-                let payload = self.drag_payload(full_name, order);
-                let id = egui::Id::new(("ch_leaf_drag", full_name.as_str()));
-                let resp = ui
-                    .dnd_drag_source(id, payload, |ui| {
-                        let mut frame = egui::Frame::none()
-                            .inner_margin(egui::Margin::symmetric(2.0, 0.0));
-                        if is_sel {
-                            frame = frame.fill(egui::Color32::from_rgb(45, 70, 120));
-                        }
-                        frame.show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(label);
-                                if let Some(v) = value {
-                                    let display = if v.chars().count() > 10 {
-                                        let s: String = v.chars().take(10).collect();
-                                        format!("{}…", s)
-                                    } else {
-                                        v.clone()
-                                    };
-                                    ui.label(egui::RichText::new(display).small().weak());
-                                }
-                            });
-                        });
-                    })
-                    .response
-                    .interact(egui::Sense::click());
-                if resp.clicked() {
-                    let mods = ui.input(|i| i.modifiers);
-                    *click = Some((full_name.clone(), mods.command, mods.shift));
-                }
-            }
-        }
-    }
+    // ui() and render_node() removed in Task 2 (egui-dependent); restored in Task 6.
 }
 
 #[cfg(test)]
@@ -364,36 +286,8 @@ mod tests {
         assert!(nodes(&ChannelTree::build(&r)).is_empty());
     }
 
-    #[test]
-    fn renders_headless_without_panic() {
-        let mut t = tree4();
-        // Pre-select some leaves so the highlighted-frame path is exercised.
-        let o = order(&t);
-        t.apply_click("a", false, false, &o);
-        t.apply_click("c", true, false, &o);
-        let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                t.ui(ui, &BTreeMap::new(), |_| Some("1".to_string()));
-            });
-        });
-    }
-
-    #[test]
-    fn ui_prunes_stale_selection() {
-        let mut t = tree4();
-        let o = order(&t);
-        t.apply_click("a", false, false, &o);
-        t.selected.insert("ghost".to_string()); // no longer in the tree
-        let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                t.ui(ui, &BTreeMap::new(), |_| None);
-            });
-        });
-        assert!(!t.selected.contains("ghost"));
-        assert!(t.selected.contains("a"));
-    }
+    // renders_headless_without_panic and ui_prunes_stale_selection tests removed
+    // in Task 2 (egui-dependent); restored in Task 6.
 
     #[test]
     fn extra_topics_merge_and_dedup_registry() {

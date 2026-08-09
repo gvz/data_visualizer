@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
 
-use datavis::app::DataVisApp;
 use datavis::config::{ChannelRegistry, LayoutConfig, DEFAULT_CONFIG_TOML};
 // Only the scripting engine spawns a source directly here (via `adopt`); every
 // other source is built inside `SourceManager`. So `DataSource` is only in use
@@ -11,8 +10,7 @@ use datavis::config::{ChannelRegistry, LayoutConfig, DEFAULT_CONFIG_TOML};
 #[cfg(feature = "scripting")]
 use datavis::ingest::DataSource;
 use datavis::store::{ChannelStore, LiveStore};
-use datavis::viz::PanelRegistry;
-use datavis::workspace::Workspace;
+use datavis::ui::DataVisApp;
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -155,14 +153,10 @@ fn main() -> anyhow::Result<()> {
     .map(|c| c.max_bytes())
     .unwrap_or(None);
 
-    let registry = PanelRegistry::with_builtins();
-    let workspace = Workspace::from_config(&layout, &registry, channels.as_ref());
     let dyn_store: Arc<dyn ChannelStore> = store;
     let app = DataVisApp::new(
         dyn_store,
         channels,
-        registry,
-        workspace,
         layout_path,
         manager,
         live_view_ns,
@@ -192,18 +186,17 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    eframe::run_native(
-        "datavis",
-        eframe::NativeOptions { vsync: false, ..Default::default() },
-        Box::new(|cc| {
-            cc.egui_ctx.set_visuals(eframe::egui::Visuals::light());
-            let mut fonts = eframe::egui::FontDefinitions::default();
-            egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
-            cc.egui_ctx.set_fonts(fonts);
-            Ok(Box::new(app))
-        }),
+    let app_cell = std::cell::Cell::new(Some(app));
+    iced::application::timed(
+        move || app_cell.take().expect("app built once"),
+        DataVisApp::update,
+        DataVisApp::subscription,
+        DataVisApp::view,
     )
-    .map_err(|e| anyhow!("eframe: {e}"))
+    .title("datavis")
+    .theme(app_theme)
+    .run()
+    .map_err(|e| anyhow!("iced: {e}"))
 }
 
 /// Load both halves of a config file (channels + layout) from one path.
@@ -265,6 +258,10 @@ fn resolve_missing_config(
         // Cancel or window closed.
         _ => default_config(),
     }
+}
+
+fn app_theme(_app: &DataVisApp) -> iced::Theme {
+    iced::Theme::Light
 }
 
 fn arg_value(args: &[String], flag: &str) -> Option<String> {

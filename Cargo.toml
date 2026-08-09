@@ -6,15 +6,12 @@ description = "Desktop tool for watching streaming telemetry in real time"
 license = "GPL-3.0"
 
 [dependencies]
-eframe = { version = "0.28", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 toml_edit = "0.22"
 anyhow = "1.0"
-egui_plot = "0.28"
 rustfft = "6"
 serde_json = "1"
-egui_tiles = { version = "0.9", features = ["serde"] }
 zmq = "0.10"
 prost-reflect = "0.14"
 protox = "0.7"
@@ -25,7 +22,6 @@ crossbeam-channel = "0.5"
 prost-types = "0.13"
 rumqttc = "0.24"
 boxcar = "0.2.14"
-egui-phosphor = "0.6"
 tungstenite = "0.21"
 pyo3 = { version = "0.22", features = ["auto-initialize"], optional = true }
 numpy = { version = "0.22", optional = true }
