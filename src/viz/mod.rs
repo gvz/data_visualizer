@@ -13,9 +13,12 @@ pub mod canvas_util;
 pub(crate) mod decimate;
 pub mod gauge;
 pub mod log;
+pub mod measure;
 pub mod numeric;
+pub mod placeholder;
 pub mod plot;
 pub mod spectrum;
+pub mod state_graph;
 pub mod status;
 pub mod waveform;
 pub mod xy_scatter;
@@ -141,6 +144,14 @@ impl PanelRegistry {
         reg.register(
             xy_scatter::TYPE_NAME,
             Box::new(|cfg, ch| Box::new(xy_scatter::XyScatter::new(cfg, ch))),
+        );
+        reg.register(
+            state_graph::TYPE_NAME,
+            Box::new(|cfg, ch| Box::new(state_graph::StateGraph::new(cfg, ch))),
+        );
+        reg.register(
+            placeholder::TYPE_NAME,
+            Box::new(|cfg, ch| Box::new(placeholder::PlaceholderPanel::new(cfg, ch))),
         );
         reg
     }

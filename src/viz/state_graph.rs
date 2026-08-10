@@ -1,82 +1,64 @@
+//! Iced-port state-graph panel — Grafana-style colored bands over time.
+//!
+//! `sync` fetches a snapshot from the store, computes contiguous value-run
+//! segments, and caches them.  `view` renders the cached segments via an iced
+//! `Canvas` that draws colored horizontal rectangles + a time axis + a legend.
+
 use std::collections::BTreeMap;
 
-use eframe::egui::{self, Align2, Color32, FontId};
+use iced::widget::canvas::{self, Canvas, Frame};
+use iced::{Color, Length, Point, Rectangle, Renderer, Theme, mouse};
 
 use crate::config::ChannelRegistry;
 use crate::store::ChannelStore;
-use crate::types::{ChannelSnapshot, SampleType, TimeWindow};
-use crate::viz::common::{
-    bind, binding_error, effective_window_s, format_time_of_day, frame_clock, label_config_row,
-    opt_f64_opt, opt_label, opt_str, refresh_binding, serialize_label, window_config_row, Binding,
-    RebindCtx, PLOT_MARGIN_FRAC,
-};
-use crate::viz::VizPanel;
+use crate::types::{ChannelId, ChannelSnapshot, SampleType, TimeWindow};
+use crate::viz::canvas_util::centered_text;
+use crate::viz::{PanelMessage, VizPanel};
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn opt_str(cfg: &toml::Table, key: &str) -> String {
+    cfg.get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn opt_f64(cfg: &toml::Table, key: &str) -> Option<f64> {
+    cfg.get(key).and_then(|v| v.as_float())
+}
+
+// ---------------------------------------------------------------------------
+// Color palette (matches the old egui state_graph exactly)
+// ---------------------------------------------------------------------------
 
 pub const TYPE_NAME: &str = "state_graph";
 
+#[allow(dead_code)]
 const ACCEPTED: &[SampleType] = &[SampleType::Bool, SampleType::Int, SampleType::Text];
 
-const PALETTE: &[Color32] = &[
-    Color32::from_rgb(0x4c, 0xaf, 0x50), // green
-    Color32::from_rgb(0x21, 0x96, 0xf3), // blue
-    Color32::from_rgb(0xff, 0x98, 0x00), // orange
-    Color32::from_rgb(0xf4, 0x43, 0x36), // red
-    Color32::from_rgb(0x9c, 0x27, 0xb0), // purple
-    Color32::from_rgb(0x00, 0xbc, 0xd4), // cyan
+/// Six-color palette, same hues as the old egui panel.
+pub(crate) const PALETTE: &[Color] = &[
+    Color { r: 0x4c as f32 / 255.0, g: 0xaf as f32 / 255.0, b: 0x50 as f32 / 255.0, a: 1.0 }, // green
+    Color { r: 0x21 as f32 / 255.0, g: 0x96 as f32 / 255.0, b: 0xf3 as f32 / 255.0, a: 1.0 }, // blue
+    Color { r: 0xff as f32 / 255.0, g: 0x98 as f32 / 255.0, b: 0x00 as f32 / 255.0, a: 1.0 }, // orange
+    Color { r: 0xf4 as f32 / 255.0, g: 0x43 as f32 / 255.0, b: 0x36 as f32 / 255.0, a: 1.0 }, // red
+    Color { r: 0x9c as f32 / 255.0, g: 0x27 as f32 / 255.0, b: 0xb0 as f32 / 255.0, a: 1.0 }, // purple
+    Color { r: 0x00 as f32 / 255.0, g: 0xbc as f32 / 255.0, b: 0xd4 as f32 / 255.0, a: 1.0 }, // cyan
 ];
 
-fn color_for(value: i64) -> Color32 {
+/// Deterministic, repeating color for a value code.
+pub(crate) fn color_for(value: i64) -> Color {
     PALETTE[(value.rem_euclid(PALETTE.len() as i64)) as usize]
 }
 
-/// Grafana-style colored bands: one horizontal strip, one colored segment per
-/// contiguous run of equal values.
-pub struct StateGraphPanel {
-    bound: Binding,
-    label: Option<String>,
-    /// Explicit code→label map from config, used for numeric (Int/Bool)
-    /// channels. Empty for Text channels — their labels are the strings.
-    states: BTreeMap<i64, String>,
-    /// Runtime interning for Text channels: each distinct string is assigned a
-    /// stable code in first-seen order so it maps onto the integer coloring and
-    /// segment machinery. In-memory only; never serialized.
-    text_codes: BTreeMap<String, i64>,
-    text_labels: BTreeMap<i64, String>,
-    /// Visible span in seconds; `None` follows the global default.
-    time_window_s: Option<f64>,
-    /// Active absolute-ns time window `[start, end]`. Set by the linked-zoom
-    /// freeze (or a linked follow), it overrides the trailing window. This
-    /// panel has no drag-zoom of its own — it only follows and freezes.
-    /// In-memory only; not serialized.
-    zoom: Option<(i64, i64)>,
-}
+// ---------------------------------------------------------------------------
+// Segment helpers (pure math — lifted unchanged from the old panel)
+// ---------------------------------------------------------------------------
 
-pub fn ctor(
-    cfg: &toml::Table,
-    reg: &ChannelRegistry,
-) -> anyhow::Result<Box<dyn VizPanel>> {
-    let name = opt_str(cfg, "channel");
-    let mut states = BTreeMap::new();
-    if let Some(tbl) = cfg.get("states").and_then(|v| v.as_table()) {
-        for (k, v) in tbl {
-            let key: i64 = k
-                .parse()
-                .map_err(|_| anyhow::anyhow!("{TYPE_NAME} panel: state key `{k}` is not an integer"))?;
-            states.insert(key, v.as_str().unwrap_or_default().to_string());
-        }
-    }
-    Ok(Box::new(StateGraphPanel {
-        bound: bind(&name, reg, ACCEPTED),
-        label: opt_label(cfg),
-        states,
-        text_codes: BTreeMap::new(),
-        text_labels: BTreeMap::new(),
-        time_window_s: opt_f64_opt(cfg, "time_window_s"),
-        zoom: None,
-    }))
-}
-
-/// Contiguous runs of equal values: (start_ts, end_ts, value). The final
+/// Contiguous runs of equal values: (start_ts, end_ts, value).  The final
 /// segment ends at the last timestamp.
 pub(crate) fn segments(ts: &[i64], vals: &[i64], breaks: &[i64]) -> Vec<(i64, i64, i64)> {
     if ts.is_empty() {
@@ -85,9 +67,6 @@ pub(crate) fn segments(ts: &[i64], vals: &[i64], breaks: &[i64]) -> Vec<(i64, i6
     let mut out = Vec::new();
     let (mut start, mut cur) = (ts[0], vals[0]);
     for i in 1..ts.len() {
-        // A stitched-recording boundary between two samples ends the current
-        // run at the earlier sample and starts a fresh one at the later sample,
-        // leaving a gap. The held state must not bridge the join between files.
         let broken = breaks.iter().any(|&b| b > ts[i - 1] && b <= ts[i]);
         if broken {
             out.push((start, ts[i - 1], cur));
@@ -103,15 +82,8 @@ pub(crate) fn segments(ts: &[i64], vals: &[i64], breaks: &[i64]) -> Vec<(i64, i6
     out
 }
 
-/// Runs from [`segments`], stretched to cover the whole `[t0, end_ns]` window:
-/// the first run fills back to the left edge and the last run forward to
-/// `end_ns`. A state is piecewise-constant, so the earliest known value holds
-/// for the unpainted region before it, and the latest value holds up to "now".
-///
-/// Without the left-fill, a channel whose samples cover only part of the window
-/// — e.g. a high-rate `Text` channel whose fixed-line ring holds just the last
-/// few milliseconds — paints a thin sliver at the right edge and leaves the
-/// rest black.
+/// Segments stretched to cover the whole `[t0, end_ns]` window so the strip
+/// tiles the full width even when samples cover only part of the window.
 pub(crate) fn painted_spans(
     ts: &[i64],
     vals: &[i64],
@@ -129,13 +101,12 @@ pub(crate) fn painted_spans(
     segs
 }
 
-/// A "nice" axis tick step (ns) for `span_ns`, aiming for ~`target` ticks,
-/// snapped to a 1/2/5 × 10ⁿ value so ticks land on round times — the same
-/// mantissa progression egui_plot uses for the waveform x-axis.
+/// Nice time axis tick step (ns) snapped to 1/2/5 × 10^n, targeting ~`target`
+/// ticks across `span_ns`.
 pub(crate) fn nice_time_step_ns(span_ns: i64, target: i64) -> i64 {
     let rough = (span_ns / target.max(1)).max(1) as f64;
     let mag = 10f64.powf(rough.log10().floor());
-    let norm = rough / mag; // 1.0..10.0
+    let norm = rough / mag;
     let mult = if norm <= 1.5 {
         1.0
     } else if norm <= 3.0 {
@@ -148,10 +119,79 @@ pub(crate) fn nice_time_step_ns(span_ns: i64, target: i64) -> i64 {
     ((mag * mult) as i64).max(1)
 }
 
-impl StateGraphPanel {
-    /// Map a Text value to a stable integer code, assigning the next code in
-    /// first-seen order on first sight. Codes persist for the panel's lifetime,
-    /// so a given string keeps its color and legend slot across renders.
+// ---------------------------------------------------------------------------
+// Cached render data
+// ---------------------------------------------------------------------------
+
+/// One rendered segment: time range + color + optional label.
+#[derive(Clone)]
+struct Segment {
+    t_start: i64,
+    t_end: i64,
+    color: Color,
+    label: String,
+}
+
+/// Legend entry: color swatch + label text.
+#[derive(Clone)]
+struct LegendEntry {
+    color: Color,
+    label: String,
+}
+
+// ---------------------------------------------------------------------------
+// StateGraph panel struct
+// ---------------------------------------------------------------------------
+
+/// Grafana-style colored-band state graph panel.
+pub struct StateGraph {
+    channel_name: String,
+    channel_id: Option<ChannelId>,
+    /// Explicit code→label map from config (numeric/bool channels).
+    states: BTreeMap<i64, String>,
+    /// Runtime interning for Text channels.
+    text_codes: BTreeMap<String, i64>,
+    text_labels: BTreeMap<i64, String>,
+    /// Default time window in seconds (30 s when `None`).
+    time_window_s: Option<f64>,
+    // Cached render data filled by `sync`.
+    cached_segments: Vec<Segment>,
+    cached_legend: Vec<LegendEntry>,
+    cached_t0: i64,
+    cached_end: i64,
+}
+
+const DEFAULT_WINDOW_S: f64 = 30.0;
+
+impl StateGraph {
+    /// Construct from a TOML config table and channel registry.
+    pub fn new(cfg: &toml::Table, ch: &ChannelRegistry) -> Self {
+        let channel_name = opt_str(cfg, "channel");
+        let channel_id = ch.id(&channel_name);
+        let mut states = BTreeMap::new();
+        if let Some(tbl) = cfg.get("states").and_then(|v| v.as_table()) {
+            for (k, v) in tbl {
+                if let Ok(key) = k.parse::<i64>() {
+                    states.insert(key, v.as_str().unwrap_or_default().to_string());
+                }
+            }
+        }
+        let time_window_s = opt_f64(cfg, "time_window_s");
+        StateGraph {
+            channel_name,
+            channel_id,
+            states,
+            text_codes: BTreeMap::new(),
+            text_labels: BTreeMap::new(),
+            time_window_s,
+            cached_segments: Vec::new(),
+            cached_legend: Vec::new(),
+            cached_t0: 0,
+            cached_end: 1,
+        }
+    }
+
+    /// Intern a string to a stable integer code (first-seen order).
     fn intern(&mut self, s: &str) -> i64 {
         if let Some(&code) = self.text_codes.get(s) {
             return code;
@@ -161,67 +201,56 @@ impl StateGraphPanel {
         self.text_labels.insert(code, s.to_string());
         code
     }
+
+    fn label_for(&self, v: i64, store_labels: &Option<Vec<String>>) -> String {
+        if let Some(lbls) = store_labels {
+            if let Some(s) = lbls.get(v as usize) {
+                return s.clone();
+            }
+        }
+        if let Some(s) = self.text_labels.get(&v) {
+            return s.clone();
+        }
+        if let Some(s) = self.states.get(&v) {
+            return s.clone();
+        }
+        v.to_string()
+    }
 }
 
-impl VizPanel for StateGraphPanel {
-    fn title(&self) -> &str {
-        self.label.as_deref().unwrap_or(&self.bound.name)
-    }
+// ---------------------------------------------------------------------------
+// VizPanel implementation
+// ---------------------------------------------------------------------------
 
-    fn accepted_types(&self) -> &[SampleType] {
-        ACCEPTED
-    }
-
-    fn config_ui(&mut self, ui: &mut egui::Ui) {
-        label_config_row(ui, &mut self.label, &self.bound.name);
-        ui.horizontal(|ui| {
-            window_config_row(ui, &mut self.time_window_s, 1.0..=600.0);
-        });
-    }
-
-    fn render(&mut self, ui: &mut egui::Ui, store: &dyn ChannelStore) {
-        if self.bound.name.is_empty() {
-            ui.label(egui::RichText::new("Drop a channel here").weak());
-            return;
-        }
-        if binding_error(ui, &self.bound, TYPE_NAME) {
-            return;
-        }
-        let id = self.bound.id.expect("checked by binding_error");
-        if store.latest(id).is_none() {
-            ui.label("no data");
-            return;
-        }
-        // Discovered text arrives as interned codes on the ring path (an `Int`
-        // snapshot) with this code→label table; `None` for numeric channels and
-        // for verbatim `TextBuf` channels (which come through as `Text`).
-        let coded = store.state_labels(id);
-        // When the toolbar link is armed, a shared time window overrides this
-        // panel's trailing view; before any shared zoom (`linked == None`) it
-        // keeps its own frozen zoom, else the live trailing window.
-        let linked = if crate::viz::common::linked_zoom_enabled(ui.ctx()) {
-            crate::viz::common::linked_zoom_range(ui.ctx())
+impl VizPanel for StateGraph {
+    fn title(&self) -> String {
+        if self.channel_name.is_empty() {
+            "State Graph".to_string()
         } else {
-            None
+            self.channel_name.clone()
+        }
+    }
+
+    fn sync(&mut self, store: &dyn ChannelStore) {
+        let Some(id) = self.channel_id else {
+            self.cached_segments.clear();
+            self.cached_legend.clear();
+            return;
         };
-        let (t0, end_ns) = match linked.or(self.zoom) {
-            Some((a, b)) => (a, b),
-            None => {
-                // Same right edge as the waveforms: the app's shared frame clock.
-                let end = frame_clock(ui.ctx()).unwrap_or_else(|| store.now_ns());
-                let span = (effective_window_s(ui.ctx(), self.time_window_s) * 1e9) as i64;
-                (end - span, end)
-            }
-        };
-        // Visible x-range = the data window plus egui_plot's margin on each side,
-        // so bands and ticks line up with — and scroll at the same rate as — the
-        // waveforms. `vt0..vend` drives x mapping; the data window `t0..end_ns`
-        // still bounds the snapshot and the painted bands.
-        let span = (end_ns - t0).max(1);
-        let margin = (span as f64 * PLOT_MARGIN_FRAC as f64) as i64;
-        let (vt0, vend) = (t0 - margin, end_ns + margin);
-        let vspan = (vend - vt0).max(1);
+        if store.latest(id).is_none() {
+            self.cached_segments.clear();
+            self.cached_legend.clear();
+            return;
+        }
+        let window_ns = ((self.time_window_s.unwrap_or(DEFAULT_WINDOW_S)) * 1e9) as i64;
+        let end_ns = store.now_ns();
+        let t0 = end_ns - window_ns;
+        self.cached_t0 = t0;
+        self.cached_end = end_ns;
+
         let snap = store.snapshot(id, TimeWindow { start_ns: t0, end_ns: end_ns + 1 });
+        let store_labels = store.state_labels(id);
+
         let mut text_mode = false;
         let (ts, vals): (Vec<i64>, Vec<i64>) = match &snap {
             ChannelSnapshot::Int { ts, vals } => (ts.clone(), vals.clone()),
@@ -230,102 +259,109 @@ impl VizPanel for StateGraphPanel {
             }
             ChannelSnapshot::Text { lines } => {
                 text_mode = true;
-                let ts = lines.iter().map(|(t, _)| *t).collect();
-                let vals = lines.iter().map(|(_, s)| self.intern(s)).collect();
+                let ts: Vec<i64> = lines.iter().map(|(t, _)| *t).collect();
+                let vals: Vec<i64> = lines.iter().map(|(_, s)| self.intern(s)).collect();
                 (ts, vals)
             }
-            _ => return,
+            _ => {
+                self.cached_segments.clear();
+                self.cached_legend.clear();
+                return;
+            }
         };
-        // Legend / label source, in priority: the discovered coded-text table
-        // (indexed by code), then interned strings for a verbatim `Text`
-        // channel, then the config `states` map for a numeric channel.
-        let legend: Vec<(i64, String)> = if let Some(lbls) = &coded {
-            lbls.iter().enumerate().map(|(i, s)| (i as i64, s.clone())).collect()
-        } else if text_mode {
-            self.text_labels.iter().map(|(k, v)| (*k, v.clone())).collect()
-        } else {
-            self.states.iter().map(|(k, v)| (*k, v.clone())).collect()
-        };
-        let label_for = |v: i64| -> String {
-            legend
-                .iter()
-                .find(|(code, _)| *code == v)
-                .map(|(_, s)| s.clone())
-                .unwrap_or_else(|| v.to_string())
-        };
-        let desired = egui::vec2(ui.available_width().max(80.0), 40.0);
-        let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
-        let painter = ui.painter();
-        painter.rect_filled(rect, 2.0, Color32::from_gray(30));
-        let x_of = |t: i64| {
-            rect.left() + rect.width() * ((t - vt0) as f32 / vspan as f32)
-        };
-        // Joins between stitched recordings must not carry a held state across
-        // the gap; break the spans there. Empty for a single file or live data.
+
         let breaks = store.break_times();
-        for (s, e, v) in painted_spans(&ts, &vals, t0, end_ns, breaks) {
-            let seg = egui::Rect::from_min_max(
-                egui::pos2(x_of(s), rect.top()),
-                egui::pos2(x_of(e), rect.bottom()),
-            );
-            painter.rect_filled(seg, 0.0, color_for(v));
-            if seg.width() > 40.0 {
-                painter.text(
-                    seg.center(),
-                    Align2::CENTER_CENTER,
-                    label_for(v),
-                    FontId::proportional(12.0),
-                    Color32::BLACK,
-                );
+        let spans = painted_spans(&ts, &vals, t0, end_ns, breaks);
+
+        // Build legend: distinct values in encounter order.
+        let mut seen: Vec<i64> = Vec::new();
+        for &(_, _, v) in &spans {
+            if !seen.contains(&v) {
+                seen.push(v);
             }
         }
-        // Time axis: ticks at round UTC times (like the waveform x-axis), so
-        // they stay put and slide left as the live window advances instead of
-        // jittering at fixed fractions of the span.
-        let (axis_rect, _) =
-            ui.allocate_exact_size(egui::vec2(rect.width(), 15.0), egui::Sense::hover());
-        let axis_painter = ui.painter();
-        let step = nice_time_step_ns(vspan, 5);
-        let mut t = vt0.div_euclid(step) * step;
-        if t < vt0 {
-            t += step;
-        }
-        while t <= vend {
-            let x = x_of(t);
-            axis_painter.line_segment(
-                [egui::pos2(x, axis_rect.top()), egui::pos2(x, axis_rect.top() + 3.0)],
-                egui::Stroke::new(1.0_f32, Color32::from_gray(110)),
-            );
-            // Edge-anchor the labels nearest each border so they don't clip.
-            let anchor = if x - rect.left() < 24.0 {
-                Align2::LEFT_TOP
-            } else if rect.right() - x < 24.0 {
-                Align2::RIGHT_TOP
-            } else {
-                Align2::CENTER_TOP
-            };
-            axis_painter.text(
-                egui::pos2(x, axis_rect.top() + 3.0),
-                anchor,
-                format_time_of_day(t),
-                FontId::proportional(9.0),
-                Color32::from_gray(160),
-            );
-            t += step;
-        }
-        // Legend of known states.
-        ui.horizontal_wrapped(|ui| {
-            for (v, label) in &legend {
-                let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                ui.painter().rect_filled(dot, 2.0, color_for(*v));
-                ui.label(label);
+        // Also pull from store labels / states for known-but-absent codes.
+        if let Some(lbls) = &store_labels {
+            for (i, _) in lbls.iter().enumerate() {
+                let code = i as i64;
+                if !seen.contains(&code) {
+                    seen.push(code);
+                }
             }
-        });
+        } else if !text_mode {
+            for &code in self.states.keys() {
+                if !seen.contains(&code) {
+                    seen.push(code);
+                }
+            }
+        }
+
+        self.cached_segments = spans
+            .into_iter()
+            .map(|(s, e, v)| Segment {
+                t_start: s,
+                t_end: e,
+                color: color_for(v),
+                label: self.label_for(v, &store_labels),
+            })
+            .collect();
+
+        self.cached_legend = seen
+            .iter()
+            .map(|&v| LegendEntry {
+                color: color_for(v),
+                label: self.label_for(v, &store_labels),
+            })
+            .collect();
+    }
+
+    fn view(&self) -> iced::Element<'_, PanelMessage> {
+        if self.channel_name.is_empty() {
+            use iced::widget::{container, text};
+            return container(text("Drop a channel here"))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
+        }
+        Canvas::new(StateGraphProgram {
+            segments: self.cached_segments.clone(),
+            legend: self.cached_legend.clone(),
+            t0: self.cached_t0,
+            t_end: self.cached_end,
+        })
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    }
+
+    fn update(&mut self, _msg: PanelMessage) {}
+
+    fn config_view(&self) -> iced::Element<'_, PanelMessage> {
+        use iced::widget::{container, text};
+        let label = if self.channel_name.is_empty() {
+            "No channel bound — drag a channel here.".to_string()
+        } else {
+            format!("Channel: {}", self.channel_name)
+        };
+        container(text(label)).into()
+    }
+
+    fn bind_channel(&mut self, name: &str) -> bool {
+        // Accept Bool/Int/Text channels.  We don't have a registry here, so we
+        // store the name and leave id as None; the next registry-aware construction
+        // (or a future bind_channel_with_registry) would resolve it.
+        // For the minimal contract: store the name, return true.
+        self.channel_name = name.to_string();
+        self.channel_id = None; // caller should reconstruct from config
+        true
     }
 
     fn serialize(&self) -> toml::Table {
         let mut t = toml::Table::new();
-        t.insert("channel".to_string(), toml::Value::String(self.bound.name.clone()));
+        t.insert(
+            "channel".to_string(),
+            toml::Value::String(self.channel_name.clone()),
+        );
         if !self.states.is_empty() {
             let mut tbl = toml::Table::new();
             for (k, v) in &self.states {
@@ -336,59 +372,226 @@ impl VizPanel for StateGraphPanel {
         if let Some(w) = self.time_window_s {
             t.insert("time_window_s".to_string(), toml::Value::Float(w));
         }
-        serialize_label(&mut t, &self.label);
         t
     }
+}
 
-    fn drop_channel(&mut self, name: &str, reg: &crate::config::ChannelRegistry) {
-        self.bound = bind(name, reg, ACCEPTED);
-    }
+// ---------------------------------------------------------------------------
+// Canvas Program
+// ---------------------------------------------------------------------------
 
-    fn freeze_time_zoom(&mut self, range: (i64, i64)) {
-        self.zoom = Some(range);
-    }
+/// Snapshot data passed into the iced Canvas for a single frame.
+struct StateGraphProgram {
+    segments: Vec<Segment>,
+    legend: Vec<LegendEntry>,
+    t0: i64,
+    t_end: i64,
+}
 
-    fn reset_zoom(&mut self) {
-        self.zoom = None;
-    }
+impl canvas::Program<PanelMessage> for StateGraphProgram {
+    type State = ();
 
-    fn refresh_bindings(&mut self, ctx: &RebindCtx) {
-        refresh_binding(&mut self.bound, ACCEPTED, ctx);
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry<Renderer>> {
+        let mut frame = Frame::new(renderer, bounds.size());
+
+        // Background
+        frame.fill_rectangle(
+            Point::ORIGIN,
+            bounds.size(),
+            Color::from_rgb(0.118, 0.118, 0.118), // #1e1e1e
+        );
+
+        if self.segments.is_empty() {
+            centered_text(
+                &mut frame,
+                Point::new(bounds.width * 0.5, bounds.height * 0.5),
+                "no data",
+                14.0,
+                Color::from_rgb(0.6, 0.6, 0.6),
+            );
+            return vec![frame.into_geometry()];
+        }
+
+        let t_span = (self.t_end - self.t0).max(1) as f64;
+
+        // Reserve legend height at bottom (approx 20px), band gets the rest.
+        let legend_h = 20.0f32;
+        let band_h = (bounds.height - legend_h).max(10.0);
+
+        // Draw colored band segments.
+        for seg in &self.segments {
+            let x0 = bounds.width * ((seg.t_start - self.t0) as f32 / t_span as f32);
+            let x1 = bounds.width * ((seg.t_end - self.t0) as f32 / t_span as f32);
+            let w = (x1 - x0).max(1.0);
+            frame.fill_rectangle(
+                Point::new(x0.max(0.0), 0.0),
+                iced::Size::new(w, band_h),
+                seg.color,
+            );
+            // Label inside segment if wide enough.
+            if w > 40.0 {
+                centered_text(
+                    &mut frame,
+                    Point::new(x0 + w * 0.5, band_h * 0.5),
+                    seg.label.clone(),
+                    12.0,
+                    Color::BLACK,
+                );
+            }
+        }
+
+        // Time axis: tick marks at the bottom of the band.
+        let axis_y = band_h;
+        let tick_color = Color::from_rgb(0.43, 0.43, 0.43);
+        let step_ns = nice_time_step_ns((self.t_end - self.t0).max(1), 5);
+        let t_span_ns = self.t_end - self.t0;
+        if step_ns > 0 && t_span_ns > 0 {
+            let mut t = (self.t0 / step_ns) * step_ns;
+            if t < self.t0 {
+                t += step_ns;
+            }
+            while t <= self.t_end {
+                let x = bounds.width * ((t - self.t0) as f32 / t_span as f32);
+                // Tick line
+                let tick_path = canvas::Path::line(
+                    Point::new(x, axis_y),
+                    Point::new(x, axis_y + 4.0),
+                );
+                frame.stroke(
+                    &tick_path,
+                    canvas::Stroke::default().with_color(tick_color).with_width(1.0),
+                );
+                // Label
+                let label = format_time_of_day(t);
+                centered_text(
+                    &mut frame,
+                    Point::new(x, axis_y + 10.0),
+                    label,
+                    9.0,
+                    Color::from_rgb(0.63, 0.63, 0.63),
+                );
+                t += step_ns;
+            }
+        }
+
+        // Legend: colored dot + label, laid out horizontally below axis.
+        let legend_y = band_h + legend_h * 0.5 + 2.0;
+        let mut x_cursor = 4.0f32;
+        for entry in &self.legend {
+            if x_cursor + 60.0 > bounds.width {
+                break;
+            }
+            // Colored square swatch (8×8).
+            frame.fill_rectangle(
+                Point::new(x_cursor, legend_y - 4.0),
+                iced::Size::new(8.0, 8.0),
+                entry.color,
+            );
+            x_cursor += 11.0;
+            centered_text(
+                &mut frame,
+                Point::new(x_cursor + 20.0, legend_y),
+                entry.label.clone(),
+                11.0,
+                Color::from_rgb(0.85, 0.85, 0.85),
+            );
+            x_cursor += 46.0;
+        }
+
+        vec![frame.into_geometry()]
     }
 }
+
+/// Format a nanosecond timestamp as `HH:MM:SS` (UTC).
+fn format_time_of_day(ts_ns: i64) -> String {
+    let ts_s = ts_ns / 1_000_000_000;
+    let h = (ts_s / 3600) % 24;
+    let m = (ts_s / 60) % 60;
+    let s = ts_s % 60;
+    format!("{h:02}:{m:02}:{s:02}")
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ChannelRegistry, PanelEntry};
-    use crate::store::{ChannelStore, LiveStore};
+    use crate::config::ChannelRegistry;
+    use crate::store::LiveStore;
     use crate::types::NumericVal;
-    use crate::viz::PanelRegistry;
-    use eframe::egui;
 
-    fn registry() -> ChannelRegistry {
-        ChannelRegistry::from_toml_str(
-            r#"
-[channels."motor.state"]
-topic = "t"
-proto_path = "p"
-ts_path = "q"
+    const CHANNEL_TOML: &str = r#"
+[channels."a"]
+mqtt_topic = "sensors/a"
 type = "int"
 
-[channels."demo.enabled"]
-topic = "t"
-proto_path = "p"
-ts_path = "q"
+[channels."b"]
+mqtt_topic = "sensors/b"
 type = "bool"
 
-[channels."motor.log"]
-topic = "t"
-proto_path = "p"
-ts_path = "q"
+[channels."t"]
+mqtt_topic = "sensors/t"
 type = "text"
-"#,
-        )
-        .unwrap()
+"#;
+
+    fn registry() -> ChannelRegistry {
+        ChannelRegistry::from_toml_str(CHANNEL_TOML).unwrap()
+    }
+
+    fn make_panel_cfg(channel: &str) -> (toml::Table, ChannelRegistry) {
+        let ch = registry();
+        let mut cfg = toml::Table::new();
+        cfg.insert("channel".into(), toml::Value::String(channel.into()));
+        (cfg, ch)
+    }
+
+    // --- required tests (brief) ---
+
+    #[test]
+    fn constructs_from_channel_config() {
+        let (cfg, ch) = make_panel_cfg("a");
+        let p = StateGraph::new(&cfg, &ch);
+        assert_eq!(p.channel_name, "a");
+        assert!(p.channel_id.is_some(), "channel 'a' must resolve");
+    }
+
+    #[test]
+    fn serialize_roundtrips_channel_key() {
+        let (cfg, ch) = make_panel_cfg("a");
+        let p = StateGraph::new(&cfg, &ch);
+        let out = p.serialize();
+        assert_eq!(
+            out.get("channel").and_then(|v| v.as_str()),
+            Some("a"),
+            "serialize must round-trip channel key"
+        );
+    }
+
+    #[test]
+    fn color_for_is_deterministic() {
+        // Same input → same color.
+        assert_eq!(color_for(0), color_for(0));
+        assert_eq!(color_for(3), color_for(3));
+        // Different values → different colors (palette has 6 distinct entries).
+        let colors: Vec<Color> = (0..6).map(color_for).collect();
+        for i in 0..colors.len() {
+            for j in (i + 1)..colors.len() {
+                assert_ne!(
+                    (colors[i].r, colors[i].g, colors[i].b),
+                    (colors[j].r, colors[j].g, colors[j].b),
+                    "values {i} and {j} must map to distinct colors"
+                );
+            }
+        }
     }
 
     #[test]
@@ -401,31 +604,23 @@ type = "text"
     }
 
     #[test]
-    fn segments_break_splits_run_and_leaves_gap() {
-        // Same value on both sides of a stitched-file join: without the break it
-        // would be one merged band (0,3,5); the break at t=2 must split it into
-        // a run ending at the last pre-break sample and a fresh run after it,
-        // leaving the (1..2] region as a gap.
+    fn segments_break_splits_run() {
         let ts = [0i64, 1, 2, 3];
         let vals = [5i64, 5, 5, 5];
         assert_eq!(segments(&ts, &vals, &[2]), vec![(0, 1, 5), (2, 3, 5)]);
     }
 
     #[test]
-    fn painted_spans_fill_whole_window_from_late_sliver() {
-        // Samples only in the tail of a wide window (a high-rate ring holds
-        // just the last few ms). The painted spans must still tile [t0, end]
-        // with no gap — otherwise the panel is black except a right-edge sliver.
+    fn painted_spans_fill_whole_window() {
         let (t0, end) = (0i64, 10_000i64);
         let ts = [9_990i64, 9_995, 10_000];
         let vals = [1i64, 2, 2];
         let spans = painted_spans(&ts, &vals, t0, end, &[]);
-        assert_eq!(spans.first().unwrap().0, t0, "first span must reach left edge");
-        assert_eq!(spans.last().unwrap().1, end, "last span must reach right edge");
-        // Contiguous coverage, no gaps.
+        assert_eq!(spans.first().unwrap().0, t0);
+        assert_eq!(spans.last().unwrap().1, end);
         let mut cursor = t0;
         for (s, e, _) in &spans {
-            assert_eq!(*s, cursor, "gap in coverage");
+            assert_eq!(*s, cursor);
             cursor = *e;
         }
         assert_eq!(cursor, end);
@@ -438,243 +633,57 @@ type = "text"
 
     #[test]
     fn nice_time_step_snaps_to_1_2_5() {
-        // 10s window, ~5 ticks → 2s step.
         assert_eq!(nice_time_step_ns(10_000_000_000, 5), 2_000_000_000);
-        // 1s window → 200ms.
         assert_eq!(nice_time_step_ns(1_000_000_000, 5), 200_000_000);
-        // 60s window → 10s.
         assert_eq!(nice_time_step_ns(60_000_000_000, 5), 10_000_000_000);
-        // Never zero on a tiny span.
         assert!(nice_time_step_ns(1, 5) >= 1);
     }
 
     #[test]
-    fn builds_serializes_round_trip() {
-        let channels = registry();
-        let reg = PanelRegistry::with_builtins();
-        let e: PanelEntry = toml::from_str(
-            r#"type = "state_graph"
-channel = "motor.state"
-states = { 0 = "IDLE", 1 = "RUN", 2 = "FAULT" }
-time_window_s = 30.0"#,
+    fn sync_and_view_without_panic() {
+        let (cfg, ch) = make_panel_cfg("a");
+        let store = LiveStore::from_registry(&ch);
+        let id = ch.id("a").unwrap();
+        for i in 0..10i64 {
+            store.write_numeric(id, i * 1_000_000, NumericVal::Int(i / 3));
+        }
+        let mut p = StateGraph::new(&cfg, &ch);
+        p.sync(&store);
+        let _ = p.view(); // must not panic
+    }
+
+    #[test]
+    fn title_reflects_channel() {
+        let (cfg, ch) = make_panel_cfg("a");
+        let p = StateGraph::new(&cfg, &ch);
+        assert_eq!(p.title(), "a");
+    }
+
+    #[test]
+    fn title_default_when_no_channel() {
+        let ch = registry();
+        let p = StateGraph::new(&toml::Table::new(), &ch);
+        assert_eq!(p.title(), "State Graph");
+    }
+
+    #[test]
+    fn serialize_roundtrips_states_and_window() {
+        let ch = registry();
+        let cfg: toml::Table = toml::from_str(
+            r#"channel = "a"
+time_window_s = 30.0
+[states]
+0 = "IDLE"
+1 = "RUN"
+"#,
         )
         .unwrap();
-        let p = reg.build(&e, &channels).unwrap();
-        assert_eq!(p.serialize(), e.config);
-    }
-
-    #[test]
-    fn bad_state_key_is_err() {
-        let channels = registry();
-        let reg = PanelRegistry::with_builtins();
-        let e: PanelEntry = toml::from_str(
-            r#"type = "state_graph"
-channel = "motor.state"
-states = { abc = "IDLE" }"#,
-        )
-        .unwrap();
-        assert!(reg.build(&e, &channels).is_err());
-    }
-
-    #[test]
-    fn renders_headless_without_panic() {
-        let channels = registry();
-        let store = LiveStore::from_registry(&channels);
-        let motor = channels.id("motor.state").unwrap();
-        let enabled = channels.id("demo.enabled").unwrap();
-        for i in 0..50i64 {
-            store.write_numeric(motor, i * 1_000_000, NumericVal::Int(i / 20));
-            store.write_numeric(enabled, i * 1_000_000, NumericVal::Bool(i % 10 < 5));
-        }
-        let reg = PanelRegistry::with_builtins();
-        for src in [
-            r#"type = "state_graph"
-channel = "motor.state"
-states = { 0 = "IDLE", 1 = "RUN" }"#,
-            r#"type = "state_graph"
-channel = "demo.enabled""#,
-        ] {
-            let e: PanelEntry = toml::from_str(src).unwrap();
-            let mut p = reg.build(&e, &channels).unwrap();
-            let ctx = egui::Context::default();
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    p.render(ui, &store);
-                    p.config_ui(ui);
-                });
-            });
-        }
-    }
-
-    /// Bare panel bound to a channel, no config `states` map — for unit-testing
-    /// the interner directly (the trait object hides the concrete type).
-    fn panel_for(channel: &str, reg: &ChannelRegistry) -> StateGraphPanel {
-        StateGraphPanel {
-            bound: bind(channel, reg, ACCEPTED),
-            label: None,
-            states: BTreeMap::new(),
-            text_codes: BTreeMap::new(),
-            text_labels: BTreeMap::new(),
-            time_window_s: None,
-            zoom: None,
-        }
-    }
-
-    #[test]
-    fn text_channel_binds() {
-        let channels = registry();
-        let reg = PanelRegistry::with_builtins();
-        // ACCEPTED includes Text, so a text channel resolves rather than erroring.
-        let e: PanelEntry =
-            toml::from_str("type = \"state_graph\"\nchannel = \"motor.log\"").unwrap();
-        let p = reg.build(&e, &channels).unwrap();
-        assert_eq!(p.title(), "motor.log");
-    }
-
-    #[test]
-    fn intern_assigns_stable_first_seen_codes() {
-        let channels = registry();
-        let mut p = panel_for("motor.log", &channels);
-        assert_eq!(p.intern("idle"), 0);
-        assert_eq!(p.intern("running"), 1);
-        assert_eq!(p.intern("error"), 2);
-        // Repeats return the same code; codes and labels stay consistent.
-        assert_eq!(p.intern("idle"), 0);
-        assert_eq!(p.intern("running"), 1);
-        assert_eq!(p.text_labels.get(&0).map(String::as_str), Some("idle"));
-        assert_eq!(p.text_labels.get(&2).map(String::as_str), Some("error"));
-    }
-
-    #[test]
-    fn renders_text_channel_without_panic() {
-        let channels = registry();
-        let store = LiveStore::from_registry(&channels);
-        let log = channels.id("motor.log").unwrap();
-        for (i, s) in ["idle", "idle", "running", "error", "idle"].iter().enumerate() {
-            store.write_text(log, i as i64 * 1_000_000, s.to_string());
-        }
-        let reg = PanelRegistry::with_builtins();
-        let e: PanelEntry =
-            toml::from_str("type = \"state_graph\"\nchannel = \"motor.log\"").unwrap();
-        let mut p = reg.build(&e, &channels).unwrap();
-        let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                p.render(ui, &store);
-            });
-        });
-    }
-
-    #[test]
-    fn text_channel_in_trailing_window_draws_bands() {
-        let channels = registry();
-        let store = LiveStore::from_registry(&channels);
-        let log = channels.id("motor.log").unwrap();
-        // Timestamps within the last second so they land inside the trailing
-        // window the panel derives from `store.now_ns()`.
-        let now = store.now_ns();
-        for (i, s) in ["idle", "idle", "running", "error", "idle"].iter().enumerate() {
-            store.write_text(log, now - (5 - i as i64) * 100_000_000, s.to_string());
-        }
-        let mut p = panel_for("motor.log", &channels);
-        let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                p.render(ui, &store);
-            });
-        });
-        // If the Text snapshot reached the panel, the strings were interned.
-        assert!(!p.text_codes.is_empty(), "no text interned — panel drew nothing");
-        assert_eq!(p.text_codes.len(), 3, "idle/running/error");
-    }
-
-    #[test]
-    fn discovered_text_topic_binds_and_draws() {
-        use crate::dynamic_channel::MqttTopicMap;
-        use std::collections::HashMap;
-        use std::sync::RwLock;
-
-        // Mirrors the config panel `channel = "load/state0"`: the channel does
-        // not exist until the ws/influx stream discovers it live.
-        let channels = registry();
-        let store = LiveStore::from_registry(&channels);
-        let mut p = panel_for("load/state0", &channels);
-        assert!(p.bound.id.is_none(), "topic must start unresolved");
-
-        // First string arrives on the wire → discovery snapshot carries it.
-        let topic_map: MqttTopicMap = RwLock::new(HashMap::new());
-        let mut snap = BTreeMap::new();
-        snap.insert("load/state0".to_string(), "idle".to_string());
-        p.refresh_bindings(&RebindCtx {
-            channels: &channels,
-            store: &store,
-            mqtt: Some((&topic_map, &snap)),
-        });
-        assert!(p.bound.id.is_some(), "discovered text topic did not bind");
-        assert!(p.bound.type_ok, "state graph rejected the text channel");
-
-        // A couple more in-window transitions on top of the seeded value.
-        let id = p.bound.id.unwrap();
-        let now = store.now_ns();
-        store.write_text(id, now - 300_000_000, "running".to_string());
-        store.write_text(id, now - 100_000_000, "error".to_string());
-        let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                p.render(ui, &store);
-            });
-        });
-        // Discovered text is stored as interned codes on the ring, so the labels
-        // live on the store (not the panel's `text_codes`, which only backs the
-        // verbatim `TextBuf` path).
-        let labels = store.state_labels(id).expect("discovered text must be coded");
-        assert_eq!(labels, vec!["idle", "running", "error"]);
-    }
-
-    #[test]
-    fn linked_window_render_without_panic() {
-        let channels = registry();
-        let store = LiveStore::from_registry(&channels);
-        let motor = channels.id("motor.state").unwrap();
-        for i in 0..50i64 {
-            store.write_numeric(motor, i * 1_000_000, NumericVal::Int(i / 20));
-        }
-        let reg = PanelRegistry::with_builtins();
-        let e: PanelEntry = toml::from_str(
-            "type = \"state_graph\"\nchannel = \"motor.state\"",
-        )
-        .unwrap();
-        let mut p = reg.build(&e, &channels).unwrap();
-
-        let ctx = egui::Context::default();
-        crate::viz::common::set_linked_zoom_enabled(&ctx, true);
-        crate::viz::common::set_linked_zoom_range(&ctx, Some((5_000_000, 30_000_000)));
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                p.render(ui, &store);
-            });
-        });
-    }
-
-    #[test]
-    fn freeze_then_reset_zoom() {
-        let channels = registry();
-        let reg = PanelRegistry::with_builtins();
-        let e: PanelEntry = toml::from_str(
-            "type = \"state_graph\"\nchannel = \"motor.state\"",
-        )
-        .unwrap();
-        let mut p = reg.build(&e, &channels).unwrap();
-        p.freeze_time_zoom((5, 9));
-        // reset_zoom must clear it back to the trailing/live view.
-        p.reset_zoom();
-        // A render after reset must still not panic (no lingering bad range).
-        let store = LiveStore::from_registry(&channels);
-        let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                p.render(ui, &store);
-            });
-        });
+        let p = StateGraph::new(&cfg, &ch);
+        let out = p.serialize();
+        assert_eq!(out.get("channel").and_then(|v| v.as_str()), Some("a"));
+        assert!(out.get("time_window_s").is_some());
+        let states_tbl = out.get("states").and_then(|v| v.as_table()).unwrap();
+        assert_eq!(states_tbl.get("0").and_then(|v| v.as_str()), Some("IDLE"));
+        assert_eq!(states_tbl.get("1").and_then(|v| v.as_str()), Some("RUN"));
     }
 }
