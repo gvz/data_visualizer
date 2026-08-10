@@ -12,8 +12,10 @@
 pub mod canvas_util;
 pub(crate) mod decimate;
 pub mod gauge;
+pub mod log;
 pub mod numeric;
 pub mod plot;
+pub mod status;
 pub mod waveform;
 
 use std::collections::HashMap;
@@ -121,6 +123,14 @@ impl PanelRegistry {
         reg.register(
             gauge::TYPE_NAME,
             Box::new(|cfg, ch| Box::new(gauge::Gauge::new(cfg, ch))),
+        );
+        reg.register(
+            status::TYPE_NAME,
+            Box::new(|cfg, ch| Box::new(status::Status::new(cfg, ch))),
+        );
+        reg.register(
+            log::TYPE_NAME,
+            Box::new(|cfg, ch| Box::new(log::Log::new(cfg, ch))),
         );
         reg
     }
