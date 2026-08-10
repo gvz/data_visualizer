@@ -8,6 +8,29 @@ enum Node {
     Leaf  { label: String, full_name: String, value: Option<String> },
 }
 
+// ---------------------------------------------------------------------------
+// Public render model — iced-free; consumed by src/ui/sidebar.rs
+// ---------------------------------------------------------------------------
+
+/// A render-ready node for the sidebar view. Built by [`ChannelTree::render_nodes`].
+/// Groups nest arbitrarily; leaves carry selection state so the view can
+/// highlight them without touching the private `selected` set.
+#[derive(Clone, Debug)]
+pub enum RenderNode {
+    Group {
+        label: String,
+        children: Vec<RenderNode>,
+    },
+    Leaf {
+        /// Display label (last path segment).
+        label: String,
+        /// Full channel name (used as drag payload and selection key).
+        full_name: String,
+        /// True when this leaf is in the current selection set.
+        selected: bool,
+    },
+}
+
 /// Channel name tree, split on '/' separators.
 ///
 /// "sensor/imu/accel_x" → Group("sensor") → Group("imu") → Leaf("accel_x")
@@ -182,6 +205,38 @@ impl ChannelTree {
             insert_path(&mut roots, &parts, topic, Some(value.clone()));
         }
         roots
+    }
+
+    /// Build the public render tree (used by `src/ui/sidebar.rs`).
+    ///
+    /// Values are omitted; selected state is baked in so the view does not need
+    /// access to the private `selected` field. Extra MQTT topics are not included
+    /// here — the sidebar shows only registry channels.
+    pub fn render_nodes(&self) -> Vec<RenderNode> {
+        // Reuse the private assembly with a no-op value_of closure so we don't
+        // need live store access in the sidebar view.
+        let nodes = self.assemble(&BTreeMap::new(), &|_| None);
+        fn convert(nodes: Vec<Node>, selected: &HashSet<String>) -> Vec<RenderNode> {
+            nodes
+                .into_iter()
+                .map(|n| match n {
+                    Node::Group { label, children } => RenderNode::Group {
+                        label,
+                        children: convert(children, selected),
+                    },
+                    Node::Leaf { label, full_name, .. } => {
+                        let sel = selected.contains(&full_name);
+                        RenderNode::Leaf { label, full_name, selected: sel }
+                    }
+                })
+                .collect()
+        }
+        convert(nodes, &self.selected)
+    }
+
+    /// Returns `true` if `full_name` is in the current selection.
+    pub fn is_selected(&self, full_name: &str) -> bool {
+        self.selected.contains(full_name)
     }
 
     // ui() and render_node() removed in Task 2 (egui-dependent); restored in Task 6.

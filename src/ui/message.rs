@@ -50,4 +50,7 @@ pub enum Message {
     ClosePane(PaneId),
     /// Forward a pane_grid resize event to the workspace (Task 5).
     PaneResized(iced::widget::pane_grid::ResizeEvent),
+    /// User pressed a channel leaf in the sidebar — stores the dragged name in
+    /// app state. Drop-onto-pane binding is wired in Task 12.
+    DragChannel(String),
 }

@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use iced::widget::{column, container, row, text};
 use iced::{Element, Length, Task};
 
+use super::sidebar;
+
 use crate::channel_tree::ChannelTree;
 use crate::config::{ChannelRegistry, LayoutConfig, PanelEntry};
 use crate::record::playback::PlaybackStore;
@@ -83,6 +85,8 @@ pub struct DataVisApp {
     pub(crate) script_disabled: Arc<Mutex<Option<String>>>,
     pub(crate) record_max_bytes: Option<u64>,
     pub(crate) data_source_window_open: bool,
+    /// Channel currently being dragged from the sidebar (Task 12 wires drop).
+    pub(crate) dragging: Option<String>,
 }
 
 impl DataVisApp {
@@ -140,6 +144,7 @@ impl DataVisApp {
             script_disabled,
             record_max_bytes,
             data_source_window_open: false,
+            dragging: None,
         }
     }
 
@@ -262,6 +267,11 @@ impl DataVisApp {
                 self.workspace.on_resize(event);
                 Task::none()
             }
+            Message::DragChannel(name) => {
+                // Record the channel being dragged; drop-onto-pane binding is Task 12.
+                self.dragging = Some(name);
+                Task::none()
+            }
         }
     }
 
@@ -271,17 +281,8 @@ impl DataVisApp {
         // Menu + toolbar row.
         let top_bar = self.menu_toolbar_row();
 
-        // Sidebar placeholder (shown when sidebar_visible).
-        let sidebar = container(text("Sidebar"))
-            .width(Length::Fixed(220.0))
-            .height(Length::Fill)
-            .style(|theme: &iced::Theme| {
-                let palette = theme.extended_palette();
-                container::Style {
-                    background: Some(palette.background.weak.color.into()),
-                    ..container::Style::default()
-                }
-            });
+        // Sidebar — real channel tree view (Task 6).
+        let sidebar = sidebar::view(&self.channel_tree);
 
         // Workspace — pane grid with the active screen's panels.
         let workspace = self.workspace.view(true);
