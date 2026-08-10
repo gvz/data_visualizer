@@ -5,7 +5,7 @@
 
 use crate::config::ChannelRegistry;
 use crate::store::ChannelStore;
-use crate::types::{ChannelId, Sample, SampleType};
+use crate::types::{ChannelId, Sample};
 use crate::viz::{PanelMessage, VizPanel};
 
 // ---------------------------------------------------------------------------
@@ -26,8 +26,6 @@ fn sample_as_f64(s: &Sample) -> Option<f64> {
 }
 
 pub const TYPE_NAME: &str = "numeric";
-
-const ACCEPTED: &[SampleType] = &[SampleType::Float, SampleType::Int, SampleType::Bool];
 
 // ---------------------------------------------------------------------------
 // Struct

@@ -10,6 +10,7 @@ use iced::{Color, Length, Point, Radians, Rectangle, Renderer, Theme, mouse};
 use crate::config::ChannelRegistry;
 use crate::store::ChannelStore;
 use crate::types::{ChannelId, Sample, SampleType};
+use crate::viz::canvas_util::centered_text;
 use crate::viz::{PanelMessage, VizPanel};
 
 // ---------------------------------------------------------------------------
@@ -91,16 +92,6 @@ impl Gauge {
             value: None,
         }
     }
-
-    /// Map a value in [min, max] to [0.0, 1.0], clamped.
-    fn fraction(&self, v: f64) -> f32 {
-        ((v - self.min) / (self.max - self.min)).clamp(0.0, 1.0) as f32
-    }
-
-    /// Angle (in radians, iced convention) for a given fraction in [0,1].
-    fn angle_for_fraction(frac: f32) -> f32 {
-        START_ANGLE + frac * SWEEP
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -117,8 +108,16 @@ struct GaugeProgram {
 }
 
 impl GaugeProgram {
+    /// Map a value in [min, max] to [0.0, 1.0], clamped. Single source of
+    /// truth for the gauge's value→fraction math (the draw path uses this).
     fn fraction(&self, v: f64) -> f32 {
         ((v - self.min) / (self.max - self.min)).clamp(0.0, 1.0) as f32
+    }
+
+    /// Angle (in radians, iced convention) for a given fraction in [0,1].
+    /// Single source of truth for the gauge's fraction→angle math.
+    fn angle_for_fraction(&self, frac: f32) -> f32 {
+        START_ANGLE + frac * SWEEP
     }
 }
 
@@ -161,7 +160,7 @@ impl canvas::Program<PanelMessage> for GaugeProgram {
         if let Some(v) = self.value {
             let frac = self.fraction(v);
             if frac > 0.001 {
-                let value_end = START_ANGLE + frac * SWEEP;
+                let value_end = self.angle_for_fraction(frac);
                 let value_arc = Path::new(|b| {
                     b.arc(canvas::path::Arc {
                         center,
@@ -182,7 +181,7 @@ impl canvas::Program<PanelMessage> for GaugeProgram {
         // --- Needle ---
         {
             let frac = self.value.map(|v| self.fraction(v)).unwrap_or(0.0);
-            let angle = START_ANGLE + frac * SWEEP;
+            let angle = self.angle_for_fraction(frac);
             let (sin_a, cos_a) = angle.sin_cos();
             let needle_len = radius * 0.85;
             let tip = Point::new(cx + cos_a * needle_len, cy + sin_a * needle_len);
@@ -206,55 +205,38 @@ impl canvas::Program<PanelMessage> for GaugeProgram {
 
         // --- Min / max labels ---
         {
-            use iced::alignment;
             let label_offset = radius * 1.1;
+            let label_color = Color::from_rgb(0.7, 0.7, 0.7);
+            let label_size = radius * 0.22;
+
             let (sin_start, cos_start) = START_ANGLE.sin_cos();
             let min_pos = Point::new(
                 cx + cos_start * label_offset,
                 cy + sin_start * label_offset,
             );
-            frame.fill_text(canvas::Text {
-                content: format!("{:.1}", self.min),
-                position: min_pos,
-                color: Color::from_rgb(0.7, 0.7, 0.7),
-                size: (radius * 0.22).into(),
-                align_x: iced::Alignment::Center.into(),
-                align_y: alignment::Vertical::Center,
-                ..canvas::Text::default()
-            });
+            centered_text(&mut frame, min_pos, format!("{:.1}", self.min), label_size, label_color);
 
             let (sin_end, cos_end) = END_ANGLE.sin_cos();
             let max_pos = Point::new(
                 cx + cos_end * label_offset,
                 cy + sin_end * label_offset,
             );
-            frame.fill_text(canvas::Text {
-                content: format!("{:.1}", self.max),
-                position: max_pos,
-                color: Color::from_rgb(0.7, 0.7, 0.7),
-                size: (radius * 0.22).into(),
-                align_x: iced::Alignment::Center.into(),
-                align_y: alignment::Vertical::Center,
-                ..canvas::Text::default()
-            });
+            centered_text(&mut frame, max_pos, format!("{:.1}", self.max), label_size, label_color);
         }
 
         // --- Value readout in centre ---
         {
-            use iced::alignment;
             let text = self
                 .value
                 .map(|v| format!("{v:.2}"))
                 .unwrap_or_else(|| "\u{2014}".to_string());
-            frame.fill_text(canvas::Text {
-                content: text,
-                position: Point::new(cx, cy - radius * 0.35),
-                color: Color::WHITE,
-                size: (radius * 0.28).into(),
-                align_x: iced::Alignment::Center.into(),
-                align_y: alignment::Vertical::Center,
-                ..canvas::Text::default()
-            });
+            centered_text(
+                &mut frame,
+                Point::new(cx, cy - radius * 0.35),
+                text,
+                radius * 0.28,
+                Color::WHITE,
+            );
         }
 
         vec![frame.into_geometry()]
@@ -384,19 +366,28 @@ unit = ""
     }
 
     // --- geometry helpers ---
+    //
+    // These exercise `GaugeProgram`'s helpers directly — the same code the
+    // `draw` path calls — so a change to the math can't silently diverge from
+    // what is rendered.
+
+    fn program(min: f64, max: f64) -> GaugeProgram {
+        GaugeProgram { value: None, min, max }
+    }
 
     #[test]
     fn fraction_clamps() {
-        let g = make_panel(); // min=0, max=100
-        assert!((g.fraction(50.0) - 0.5).abs() < 1e-6);
-        assert_eq!(g.fraction(-1.0), 0.0);
-        assert_eq!(g.fraction(101.0), 1.0);
+        let p = program(0.0, 100.0);
+        assert!((p.fraction(50.0) - 0.5).abs() < 1e-6);
+        assert_eq!(p.fraction(-1.0), 0.0);
+        assert_eq!(p.fraction(101.0), 1.0);
     }
 
     #[test]
     fn angle_for_fraction_bounds() {
-        let start = Gauge::angle_for_fraction(0.0);
-        let end = Gauge::angle_for_fraction(1.0);
+        let p = program(0.0, 100.0);
+        let start = p.angle_for_fraction(0.0);
+        let end = p.angle_for_fraction(1.0);
         assert!((start - START_ANGLE).abs() < 1e-6);
         assert!((end - END_ANGLE).abs() < 1e-6);
     }
