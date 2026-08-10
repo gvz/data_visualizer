@@ -1,257 +1,403 @@
-use eframe::egui::{self, Color32, FontId};
+//! Iced-port gauge panel — arc + needle drawn on an iced `Canvas`.
+//!
+//! The gauge shows the latest scalar value within a [min, max] range as a
+//! sweep of an arc (like a classic analog dial).  The canvas `Program`
+//! pattern established here is the template for Tasks 9 and 11.
+
+use iced::widget::canvas::{self, Canvas, Frame, Path, Stroke};
+use iced::{Color, Length, Point, Radians, Rectangle, Renderer, Theme, mouse};
 
 use crate::config::ChannelRegistry;
 use crate::store::ChannelStore;
-use crate::types::SampleType;
-use crate::viz::common::{
-    bind, binding_error, is_light, label_config_row, opt_f64, opt_label, opt_str, outlined_text,
-    refresh_binding, sample_as_f64, serialize_label, Binding, ColorThresholds, RebindCtx,
-};
-use crate::viz::VizPanel;
+use crate::types::{ChannelId, Sample, SampleType};
+use crate::viz::{PanelMessage, VizPanel};
+
+// ---------------------------------------------------------------------------
+// Helpers (inlined — common.rs depends on egui which is not in this crate)
+// ---------------------------------------------------------------------------
+
+fn opt_str(cfg: &toml::Table, key: &str) -> String {
+    cfg.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
+}
+
+fn opt_f64(cfg: &toml::Table, key: &str, default: f64) -> f64 {
+    match cfg.get(key) {
+        Some(toml::Value::Float(f)) => *f,
+        Some(toml::Value::Integer(i)) => *i as f64,
+        _ => default,
+    }
+}
+
+fn sample_as_f64(s: &Sample) -> Option<f64> {
+    match s {
+        Sample::Float(v) => Some(*v),
+        Sample::Int(v) => Some(*v as f64),
+        Sample::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+        Sample::Text(_) => None,
+    }
+}
 
 pub const TYPE_NAME: &str = "gauge";
 
 const ACCEPTED: &[SampleType] = &[SampleType::Float, SampleType::Int];
 
-/// Horizontal bar gauge showing the latest value within [min, max].
-pub struct GaugePanel {
-    bound: Binding,
-    label: Option<String>,
+// ---------------------------------------------------------------------------
+// Gauge arc geometry constants
+//
+// The gauge arc spans from START_ANGLE to END_ANGLE (clockwise, in radians,
+// measured from the positive x-axis as per iced's convention).
+// We want a roughly 240-degree sweep: from 7 o'clock to 5 o'clock.
+//   7 o'clock ≈ 210° from x-axis = 210° clockwise = 210 * π/180
+//   5 o'clock ≈ 330° from x-axis = 330 * π/180
+// But iced measures clockwise from east (x+), so:
+//   start = 210°, end = 330° (330-210 = 120° gap at the bottom — perfect).
+// ---------------------------------------------------------------------------
+
+const START_ANGLE: f32 = std::f32::consts::PI * 7.0 / 6.0; // 210°
+const END_ANGLE: f32 = std::f32::consts::PI * 11.0 / 6.0; // 330°
+// Total sweep of the arc (240°)
+const SWEEP: f32 = END_ANGLE - START_ANGLE; // 2π * 2/3
+
+// ---------------------------------------------------------------------------
+// Gauge struct
+// ---------------------------------------------------------------------------
+
+/// Arc-style gauge panel.
+pub struct Gauge {
+    channel_name: String,
+    channel_id: Option<ChannelId>,
     min: f64,
     max: f64,
-    /// Color cutoffs applied to the bar fill.
-    colors: ColorThresholds,
+    /// Latest cached scalar, updated each `sync` call.
+    value: Option<f64>,
 }
 
-pub fn ctor(
-    cfg: &toml::Table,
-    reg: &ChannelRegistry,
-) -> anyhow::Result<Box<dyn VizPanel>> {
-    let name = opt_str(cfg, "channel");
-    let min = opt_f64(cfg, "min", 0.0);
-    let max = opt_f64(cfg, "max", 100.0);
-    if max <= min {
-        anyhow::bail!("{TYPE_NAME} panel: max ({max}) must be greater than min ({min})");
-    }
-    Ok(Box::new(GaugePanel {
-        bound: bind(&name, reg, ACCEPTED),
-        label: opt_label(cfg),
-        min,
-        max,
-        colors: ColorThresholds::from_config(cfg),
-    }))
-}
-
-pub(crate) fn fraction(v: f64, min: f64, max: f64) -> f32 {
-    (((v - min) / (max - min)).clamp(0.0, 1.0)) as f32
-}
-
-impl VizPanel for GaugePanel {
-    fn title(&self) -> &str {
-        self.label.as_deref().unwrap_or(&self.bound.name)
-    }
-
-    fn accepted_types(&self) -> &[SampleType] {
-        ACCEPTED
-    }
-
-    fn config_ui(&mut self, ui: &mut egui::Ui) {
-        label_config_row(ui, &mut self.label, &self.bound.name);
-        ui.horizontal(|ui| {
-            ui.label("min:");
-            ui.add(egui::DragValue::new(&mut self.min).speed(0.1));
-            ui.label("max:");
-            ui.add(egui::DragValue::new(&mut self.max).speed(0.1));
-            if self.max <= self.min {
-                self.max = self.min + 1.0;
-            }
+impl Gauge {
+    /// Construct from a TOML config table and a channel registry.
+    pub fn new(cfg: &toml::Table, ch: &ChannelRegistry) -> Self {
+        let channel_name = opt_str(cfg, "channel");
+        let channel_id = ch.id(&channel_name).filter(|&id| {
+            ACCEPTED.contains(&ch.meta(id).sample_type)
         });
-        ui.separator();
-        self.colors.config_ui(ui);
+        let min = opt_f64(cfg, "min", 0.0);
+        let max = opt_f64(cfg, "max", 100.0);
+        // Clamp to avoid degenerate gauges (max == min would cause NaN).
+        let max = if max <= min { min + 1.0 } else { max };
+        Gauge {
+            channel_name,
+            channel_id,
+            min,
+            max,
+            value: None,
+        }
     }
 
-    fn render(&mut self, ui: &mut egui::Ui, store: &dyn ChannelStore) {
-        if self.bound.name.is_empty() {
-            ui.label(egui::RichText::new("Drop a channel here").weak());
-            return;
-        }
-        if binding_error(ui, &self.bound, TYPE_NAME) {
-            return;
-        }
-        let id = self.bound.id.expect("checked by binding_error");
-        // In sync mode read the value at the shared zoom window's end.
-        let at = crate::viz::common::linked_window(ui.ctx())
-            .map(|(_, end)| end)
-            .unwrap_or_else(|| store.now_ns());
-        let value = store.latest_at(id, at).and_then(|(_, s)| sample_as_f64(&s));
-        let desired = egui::vec2(ui.available_width().max(80.0), 32.0);
-        let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
-        let painter = ui.painter();
-        painter.rect_filled(rect, 4.0, Color32::from_gray(40));
-        // Bar color follows the thresholds; below all of them it falls back to
-        // the base color, then the channel's binding color.
-        let bar_color = value
-            .and_then(|v| self.colors.color_for(v))
-            .unwrap_or_else(|| crate::viz::common::binding_color(&self.bound));
-        let text = match value {
-            Some(v) => {
-                let mut fill = rect;
-                fill.set_width(rect.width() * fraction(v, self.min, self.max));
-                painter.rect_filled(fill, 4.0, bar_color);
-                format!("{v:.3} {}", self.bound.unit)
-            }
-            None => "—".to_string(),
-        };
-        // Keep the readout legible over any fill: pick black on light bars,
-        // white on dark ones, and outline with the opposite so the part of the
-        // text over the unfilled track stays readable too.
-        let (fg, outline) = if is_light(bar_color) {
-            (Color32::BLACK, Color32::WHITE)
-        } else {
-            (Color32::WHITE, Color32::BLACK)
-        };
-        outlined_text(
-            painter,
-            rect.center(),
-            &text,
-            FontId::proportional(16.0),
-            fg,
-            outline,
-        );
-        ui.horizontal(|ui| {
-            ui.label(format!("{:.1}", self.min));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(format!("{:.1}", self.max));
+    /// Map a value in [min, max] to [0.0, 1.0], clamped.
+    fn fraction(&self, v: f64) -> f32 {
+        ((v - self.min) / (self.max - self.min)).clamp(0.0, 1.0) as f32
+    }
+
+    /// Angle (in radians, iced convention) for a given fraction in [0,1].
+    fn angle_for_fraction(frac: f32) -> f32 {
+        START_ANGLE + frac * SWEEP
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Canvas Program
+// ---------------------------------------------------------------------------
+
+/// Snapshot passed into the `Canvas` during `view()`.  Carries the data the
+/// `Program::draw` call needs — value and range — without holding a reference
+/// to `Gauge` itself (enabling `'static` lifetimes as iced requires).
+struct GaugeProgram {
+    value: Option<f64>,
+    min: f64,
+    max: f64,
+}
+
+impl GaugeProgram {
+    fn fraction(&self, v: f64) -> f32 {
+        ((v - self.min) / (self.max - self.min)).clamp(0.0, 1.0) as f32
+    }
+}
+
+impl canvas::Program<PanelMessage> for GaugeProgram {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry<Renderer>> {
+        let mut frame = Frame::new(renderer, bounds.size());
+
+        // Geometry: center slightly above middle, radius fits the frame.
+        let cx = bounds.width * 0.5;
+        let cy = bounds.height * 0.55;
+        let center = Point::new(cx, cy);
+        let radius = (bounds.width.min(bounds.height) * 0.4).max(10.0);
+
+        // --- Background arc (full sweep, dark grey) ---
+        let bg_arc = Path::new(|b| {
+            b.arc(canvas::path::Arc {
+                center,
+                radius,
+                start_angle: Radians(START_ANGLE),
+                end_angle: Radians(END_ANGLE),
             });
         });
+        frame.stroke(
+            &bg_arc,
+            Stroke::default()
+                .with_color(Color::from_rgb(0.25, 0.25, 0.25))
+                .with_width(radius * 0.18),
+        );
+
+        // --- Value arc (filled portion, teal) ---
+        if let Some(v) = self.value {
+            let frac = self.fraction(v);
+            if frac > 0.001 {
+                let value_end = START_ANGLE + frac * SWEEP;
+                let value_arc = Path::new(|b| {
+                    b.arc(canvas::path::Arc {
+                        center,
+                        radius,
+                        start_angle: Radians(START_ANGLE),
+                        end_angle: Radians(value_end),
+                    });
+                });
+                frame.stroke(
+                    &value_arc,
+                    Stroke::default()
+                        .with_color(Color::from_rgb(0.18, 0.65, 0.73))
+                        .with_width(radius * 0.18),
+                );
+            }
+        }
+
+        // --- Needle ---
+        {
+            let frac = self.value.map(|v| self.fraction(v)).unwrap_or(0.0);
+            let angle = START_ANGLE + frac * SWEEP;
+            let (sin_a, cos_a) = angle.sin_cos();
+            let needle_len = radius * 0.85;
+            let tip = Point::new(cx + cos_a * needle_len, cy + sin_a * needle_len);
+            let needle = Path::new(|b| {
+                b.move_to(center);
+                b.line_to(tip);
+            });
+            frame.stroke(
+                &needle,
+                Stroke::default()
+                    .with_color(Color::WHITE)
+                    .with_width(2.0),
+            );
+        }
+
+        // --- Center dot ---
+        {
+            let dot = Path::circle(center, radius * 0.06);
+            frame.fill(&dot, Color::from_rgb(0.8, 0.8, 0.8));
+        }
+
+        // --- Min / max labels ---
+        {
+            use iced::alignment;
+            let label_offset = radius * 1.1;
+            let (sin_start, cos_start) = START_ANGLE.sin_cos();
+            let min_pos = Point::new(
+                cx + cos_start * label_offset,
+                cy + sin_start * label_offset,
+            );
+            frame.fill_text(canvas::Text {
+                content: format!("{:.1}", self.min),
+                position: min_pos,
+                color: Color::from_rgb(0.7, 0.7, 0.7),
+                size: (radius * 0.22).into(),
+                align_x: iced::Alignment::Center.into(),
+                align_y: alignment::Vertical::Center,
+                ..canvas::Text::default()
+            });
+
+            let (sin_end, cos_end) = END_ANGLE.sin_cos();
+            let max_pos = Point::new(
+                cx + cos_end * label_offset,
+                cy + sin_end * label_offset,
+            );
+            frame.fill_text(canvas::Text {
+                content: format!("{:.1}", self.max),
+                position: max_pos,
+                color: Color::from_rgb(0.7, 0.7, 0.7),
+                size: (radius * 0.22).into(),
+                align_x: iced::Alignment::Center.into(),
+                align_y: alignment::Vertical::Center,
+                ..canvas::Text::default()
+            });
+        }
+
+        // --- Value readout in centre ---
+        {
+            use iced::alignment;
+            let text = self
+                .value
+                .map(|v| format!("{v:.2}"))
+                .unwrap_or_else(|| "\u{2014}".to_string());
+            frame.fill_text(canvas::Text {
+                content: text,
+                position: Point::new(cx, cy - radius * 0.35),
+                color: Color::WHITE,
+                size: (radius * 0.28).into(),
+                align_x: iced::Alignment::Center.into(),
+                align_y: alignment::Vertical::Center,
+                ..canvas::Text::default()
+            });
+        }
+
+        vec![frame.into_geometry()]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VizPanel implementation
+// ---------------------------------------------------------------------------
+
+impl VizPanel for Gauge {
+    fn title(&self) -> String {
+        if self.channel_name.is_empty() {
+            "Gauge".to_string()
+        } else {
+            self.channel_name.clone()
+        }
+    }
+
+    fn sync(&mut self, store: &dyn ChannelStore) {
+        let Some(id) = self.channel_id else {
+            self.value = None;
+            return;
+        };
+        self.value = store
+            .latest(id)
+            .and_then(|(_, s)| sample_as_f64(&s));
+    }
+
+    fn view(&self) -> iced::Element<'_, PanelMessage> {
+        Canvas::new(GaugeProgram {
+            value: self.value,
+            min: self.min,
+            max: self.max,
+        })
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    }
+
+    fn update(&mut self, _msg: PanelMessage) {
+        // No interactive messages for this panel.
+    }
+
+    fn config_view(&self) -> iced::Element<'_, PanelMessage> {
+        use iced::widget::{container, text};
+        let label = if self.channel_name.is_empty() {
+            "No channel bound — drag a channel here.".to_string()
+        } else {
+            format!(
+                "Channel: {}  |  Range: [{:.1}, {:.1}]",
+                self.channel_name, self.min, self.max
+            )
+        };
+        container(text(label)).into()
+    }
+
+    fn bind_channel(&mut self, name: &str) -> bool {
+        self.channel_name = name.to_string();
+        // No registry access here; id stays None until next construction.
+        true
     }
 
     fn serialize(&self) -> toml::Table {
         let mut t = toml::Table::new();
-        t.insert("channel".to_string(), toml::Value::String(self.bound.name.clone()));
+        t.insert(
+            "channel".to_string(),
+            toml::Value::String(self.channel_name.clone()),
+        );
         t.insert("min".to_string(), toml::Value::Float(self.min));
         t.insert("max".to_string(), toml::Value::Float(self.max));
-        serialize_label(&mut t, &self.label);
-        self.colors.write_config(&mut t);
         t
     }
-
-    fn drop_channel(&mut self, name: &str, reg: &crate::config::ChannelRegistry) {
-        self.bound = bind(name, reg, ACCEPTED);
-    }
-
-    fn refresh_bindings(&mut self, ctx: &RebindCtx) {
-        refresh_binding(&mut self.bound, ACCEPTED, ctx);
-    }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ChannelRegistry, PanelEntry};
-    use crate::store::{ChannelStore, LiveStore};
-    use crate::types::NumericVal;
-    use crate::viz::PanelRegistry;
-    use eframe::egui;
+
+    const CHANNEL_TOML: &str = r#"
+[channels."a"]
+mqtt_topic = "sensors/a"
+type = "float"
+unit = ""
+"#;
 
     fn registry() -> ChannelRegistry {
-        ChannelRegistry::from_toml_str(
-            r#"
-[channels."demo.sine"]
-topic = "t"
-proto_path = "p"
-ts_path = "q"
-type = "float"
-unit = "V"
-"#,
-        )
-        .unwrap()
+        ChannelRegistry::from_toml_str(CHANNEL_TOML).unwrap()
     }
+
+    fn make_panel() -> Gauge {
+        let ch = registry();
+        let mut cfg = toml::Table::new();
+        cfg.insert("channel".into(), toml::Value::String("a".into()));
+        Gauge::new(&cfg, &ch)
+    }
+
+    // --- required tests from the brief ---
+
+    #[test]
+    fn title_reflects_channel() {
+        let p = make_panel();
+        assert_eq!(p.title(), "a");
+    }
+
+    #[test]
+    fn serialize_roundtrips_channel_key() {
+        let p = make_panel();
+        let out = p.serialize();
+        assert_eq!(
+            out.get("channel").and_then(|v| v.as_str()),
+            Some("a"),
+            "serialize must persist the channel name"
+        );
+    }
+
+    #[test]
+    fn serialize_includes_min_max() {
+        let p = make_panel();
+        let out = p.serialize();
+        assert!(out.get("min").is_some(), "serialize must include min");
+        assert!(out.get("max").is_some(), "serialize must include max");
+    }
+
+    // --- geometry helpers ---
 
     #[test]
     fn fraction_clamps() {
-        assert_eq!(fraction(5.0, 0.0, 10.0), 0.5);
-        assert_eq!(fraction(-1.0, 0.0, 10.0), 0.0);
-        assert_eq!(fraction(11.0, 0.0, 10.0), 1.0);
-        assert_eq!(fraction(0.0, -10.0, 10.0), 0.5);
+        let g = make_panel(); // min=0, max=100
+        assert!((g.fraction(50.0) - 0.5).abs() < 1e-6);
+        assert_eq!(g.fraction(-1.0), 0.0);
+        assert_eq!(g.fraction(101.0), 1.0);
     }
 
     #[test]
-    fn light_bars_get_dark_text() {
-        assert!(is_light(Color32::YELLOW));
-        assert!(is_light(Color32::WHITE));
-        assert!(!is_light(Color32::from_rgb(0xd6, 0x27, 0x28))); // palette red
-        assert!(!is_light(Color32::BLACK));
-    }
-
-    #[test]
-    fn thresholds_round_trip_through_config() {
-        let channels = registry();
-        let reg = PanelRegistry::with_builtins();
-        let e: PanelEntry = toml::from_str(
-            r##"type = "gauge"
-channel = "demo.sine"
-min = 0.0
-max = 100.0
-
-[[thresholds]]
-value = 90.0
-color = "#ff0000""##,
-        )
-        .unwrap();
-        let out = reg.build(&e, &channels).unwrap().serialize();
-        let arr = out.get("thresholds").and_then(|v| v.as_array()).unwrap();
-        assert_eq!(arr[0].as_table().unwrap().get("color").and_then(|v| v.as_str()), Some("#ff0000"));
-    }
-
-    #[test]
-    fn builds_serializes_round_trip() {
-        let channels = registry();
-        let reg = PanelRegistry::with_builtins();
-        let e: PanelEntry = toml::from_str(
-            r#"type = "gauge"
-channel = "demo.sine"
-min = -10.0
-max = 10.0"#,
-        )
-        .unwrap();
-        let p = reg.build(&e, &channels).unwrap();
-        assert_eq!(p.serialize(), e.config);
-    }
-
-    #[test]
-    fn invalid_range_is_err() {
-        let channels = registry();
-        let reg = PanelRegistry::with_builtins();
-        let e: PanelEntry = toml::from_str(
-            r#"type = "gauge"
-channel = "demo.sine"
-min = 5.0
-max = 5.0"#,
-        )
-        .unwrap();
-        assert!(reg.build(&e, &channels).is_err());
-    }
-
-    #[test]
-    fn renders_headless_without_panic() {
-        let channels = registry();
-        let store = LiveStore::from_registry(&channels);
-        let id = channels.id("demo.sine").unwrap();
-        store.write_numeric(id, 1, NumericVal::Float(3.0));
-        let reg = PanelRegistry::with_builtins();
-        let e: PanelEntry = toml::from_str(
-            r#"type = "gauge"
-channel = "demo.sine""#,
-        )
-        .unwrap();
-        let mut p = reg.build(&e, &channels).unwrap();
-        let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                p.render(ui, &store);
-                p.config_ui(ui);
-            });
-        });
+    fn angle_for_fraction_bounds() {
+        let start = Gauge::angle_for_fraction(0.0);
+        let end = Gauge::angle_for_fraction(1.0);
+        assert!((start - START_ANGLE).abs() < 1e-6);
+        assert!((end - END_ANGLE).abs() < 1e-6);
     }
 }

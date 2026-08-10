@@ -11,6 +11,8 @@
 
 pub mod canvas_util;
 pub(crate) mod decimate;
+pub mod gauge;
+pub mod numeric;
 pub mod plot;
 pub mod waveform;
 
@@ -111,6 +113,14 @@ impl PanelRegistry {
         reg.register(
             waveform::TYPE_NAME,
             Box::new(|cfg, ch| Box::new(waveform::Waveform::new(cfg, ch))),
+        );
+        reg.register(
+            numeric::TYPE_NAME,
+            Box::new(|cfg, ch| Box::new(numeric::Numeric::new(cfg, ch))),
+        );
+        reg.register(
+            gauge::TYPE_NAME,
+            Box::new(|cfg, ch| Box::new(gauge::Gauge::new(cfg, ch))),
         );
         reg
     }
