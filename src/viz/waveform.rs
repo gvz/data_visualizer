@@ -111,11 +111,19 @@ impl Waveform {
         }
 
         // PlotWidgetBuilder::build fails with SeriesError::Empty when no series
-        // were added. Fall back to PlotWidget::new() for the zero-channel case.
+        // were added. Fall back to an empty PlotWidget for the zero-channel
+        // case, and for any unexpected build error — construction must never
+        // panic (a failed build would otherwise crash the whole app).
         let mut widget = if channels.is_empty() {
             PlotWidget::new()
         } else {
-            builder.build().expect("PlotWidgetBuilder::build failed — unexpected error")
+            match builder.build() {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("waveform: PlotWidgetBuilder::build failed ({e:?}); using empty plot");
+                    PlotWidget::new()
+                }
+            }
         };
         widget.autoscale_on_updates(true);
 
@@ -158,6 +166,12 @@ impl VizPanel for Waveform {
         // t0 anchors X coordinates so (ts - t0) / 1e9 stays in a small range
         // and double-precision f64 doesn't lose sub-second detail.
         let t0 = start_ns;
+
+        // Fixed rolling X window: points are shifted to x = (ts - t0)/1e9, so
+        // the visible window is always [0, window_s]. Pinning the X limits
+        // keeps the time axis stable instead of letting autoscale zoom it to
+        // the data extent. Y is still autoscaled via autoscale_on_updates.
+        self.widget.set_x_lim(0.0, self.window_s);
 
         for slot in &self.channels {
             let id = match slot.id {

@@ -10,7 +10,7 @@
 //! stateful: `sync` calls `update_series`; `view` calls `widget.view()`.
 
 pub mod canvas_util;
-pub mod decimate;
+pub(crate) mod decimate;
 pub mod plot;
 pub mod waveform;
 
