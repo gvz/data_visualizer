@@ -337,8 +337,15 @@ impl Workspace {
     // -----------------------------------------------------------------------
 
     /// Serialise the current workspace state into a [`LayoutConfig`].
-    pub fn to_config(&self) -> LayoutConfig {
-        let mut cfg = LayoutConfig::default();
+    ///
+    /// `base` is the caller's current config; every non-screen field
+    /// (e.g. `default_window_s`, and any future top-level layout fields) is
+    /// preserved verbatim.  Only the per-screen `layout`/`panels` are replaced
+    /// with the workspace's canonical [`LayoutNode`] trees, and the screen set
+    /// is rebuilt to match the live workspace.
+    pub fn to_config(&self, base: &LayoutConfig) -> LayoutConfig {
+        let mut cfg = base.clone();
+        cfg.screens.clear();
         for (name, screen) in &self.screens {
             let panels: Vec<PanelEntry> = screen
                 .layout
@@ -537,5 +544,54 @@ type = "gauge"
         ws.add_screen(Some("second".into()), &reg, &ch);
         assert!(ws.screens.contains_key("second"));
         assert_eq!(ws.active, "second");
+    }
+
+    #[test]
+    fn to_config_preserves_base_and_roundtrips() {
+        // A base config with a non-default top-level field plus two screens.
+        let toml_src = r#"
+default_window_s = 42.0
+
+[screens.main.layout]
+axis = "h"
+ratio = 0.5
+
+[screens.main.layout.a]
+type = "numeric"
+
+[screens.main.layout.b]
+type = "gauge"
+
+[screens.aux.layout]
+type = "log"
+"#;
+        let base = LayoutConfig::from_toml_str(toml_src).unwrap();
+        assert_eq!(base.default_window_s, 42.0);
+        let (reg, ch) = test_reg_ch();
+
+        let ws = Workspace::from_config(&base, &reg, &ch);
+        let out = ws.to_config(&base);
+
+        // Non-screen top-level fields are preserved verbatim.
+        assert_eq!(out.default_window_s, 42.0, "default_window_s must survive to_config");
+
+        // Screen set matches the workspace.
+        assert_eq!(out.screens.len(), 2);
+        assert!(out.screens.contains_key("main"));
+        assert!(out.screens.contains_key("aux"));
+
+        // Round-trip: rebuild a workspace from the emitted config and compare
+        // screen count and the panel_type leaves per screen.
+        let ws2 = Workspace::from_config(&out, &reg, &ch);
+        assert_eq!(ws.screens.len(), ws2.screens.len(), "screen count reproduced");
+
+        for (name, screen) in &ws.screens {
+            let screen2 = ws2.screens.get(name).expect("same screen present");
+            let types1: Vec<&str> =
+                screen.layout.leaves().iter().map(|e| e.panel_type.as_str()).collect();
+            let types2: Vec<&str> =
+                screen2.layout.leaves().iter().map(|e| e.panel_type.as_str()).collect();
+            assert_eq!(types1, types2, "leaf panel_types reproduced for screen {name}");
+        }
     }
 }
