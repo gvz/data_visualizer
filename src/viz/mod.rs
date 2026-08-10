@@ -15,8 +15,10 @@ pub mod gauge;
 pub mod log;
 pub mod numeric;
 pub mod plot;
+pub mod spectrum;
 pub mod status;
 pub mod waveform;
+pub mod xy_scatter;
 
 use std::collections::HashMap;
 
@@ -131,6 +133,14 @@ impl PanelRegistry {
         reg.register(
             log::TYPE_NAME,
             Box::new(|cfg, ch| Box::new(log::Log::new(cfg, ch))),
+        );
+        reg.register(
+            spectrum::TYPE_NAME,
+            Box::new(|cfg, ch| Box::new(spectrum::Spectrum::new(cfg, ch))),
+        );
+        reg.register(
+            xy_scatter::TYPE_NAME,
+            Box::new(|cfg, ch| Box::new(xy_scatter::XyScatter::new(cfg, ch))),
         );
         reg
     }
