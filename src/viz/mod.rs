@@ -10,7 +10,9 @@
 //! stateful: `sync` calls `update_series`; `view` calls `widget.view()`.
 
 pub mod canvas_util;
+pub mod decimate;
 pub mod plot;
+pub mod waveform;
 
 use std::collections::HashMap;
 
@@ -105,7 +107,12 @@ impl PanelRegistry {
     ///
     /// Currently empty — concrete panels are registered in their own tasks.
     pub fn with_builtins() -> Self {
-        Self { ctors: HashMap::new() }
+        let mut reg = Self { ctors: HashMap::new() };
+        reg.register(
+            waveform::TYPE_NAME,
+            Box::new(|cfg, ch| Box::new(waveform::Waveform::new(cfg, ch))),
+        );
+        reg
     }
 
     /// Register `ctor` under the `layout.toml` `type` string `name`,
@@ -211,8 +218,12 @@ mod tests {
     fn type_names_returns_sorted_list() {
         let reg = PanelRegistry::with_builtins();
         let names = reg.type_names();
-        // with_builtins starts empty; this just verifies the method works
-        assert_eq!(names, Vec::<&str>::new());
+        // with_builtins now registers the waveform panel
+        assert!(names.contains(&"waveform"), "waveform must be registered");
+        // the list must be sorted
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "type_names must be sorted");
     }
 
     #[test]
