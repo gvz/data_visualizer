@@ -272,6 +272,24 @@ impl DataVisApp {
                 self.dragging = Some(name);
                 Task::none()
             }
+            Message::DropOnPane(pane) => {
+                // Take the dragged channel name (clears dragging regardless).
+                if let Some(name) = self.dragging.take() {
+                    // Compute the full multi-select payload (selected set if the
+                    // dragged leaf is in the selection, else just that leaf).
+                    let order = sidebar::leaf_labels(&self.channel_tree);
+                    let payload = self.channel_tree.drag_payload(&name, &order);
+                    for chan in &payload {
+                        self.workspace.bind_channel_to_pane(
+                            pane,
+                            chan,
+                            &self.registry,
+                            &self.channels,
+                        );
+                    }
+                }
+                Task::none()
+            }
         }
     }
 

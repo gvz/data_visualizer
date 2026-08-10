@@ -228,7 +228,7 @@ impl Screen {
 
     /// Render the pane_grid for this screen.
     fn view(&self) -> Element<'_, Message> {
-        use iced::widget::{button, pane_grid, text};
+        use iced::widget::{button, mouse_area, pane_grid, text};
 
         let grid_widget = pane_grid::PaneGrid::new(&self.grid, |_pane, &id, _is_maximized| {
             let title: String = self
@@ -246,13 +246,20 @@ impl Screen {
                 .controls(close_btn)
                 .padding(4);
 
-            let body: Element<'_, Message> = if let Some(panel) = self.panels.get(&id) {
+            let panel_body: Element<'_, Message> = if let Some(panel) = self.panels.get(&id) {
                 panel
                     .view()
                     .map(move |m| Message::Panel(PaneId(id), m))
             } else {
                 text("(empty)").into()
             };
+
+            // Wrap the panel body in a mouse_area so releasing the mouse over
+            // this pane fires DropOnPane — this is the drop target for drag-to-bind.
+            let body: Element<'_, Message> =
+                mouse_area(panel_body)
+                    .on_release(Message::DropOnPane(PaneId(id)))
+                    .into();
 
             pane_grid::Content::new(body).title_bar(title_bar)
         })
@@ -483,6 +490,56 @@ impl Workspace {
     pub fn screen_names(&self) -> impl Iterator<Item = &str> {
         self.screens.keys().map(String::as_str)
     }
+
+    /// Bind a channel to the panel in `pane`. Returns `true` if the panel
+    /// accepted the binding.
+    ///
+    /// Uses `bind_channel` to update the panel's config, then rebuilds the
+    /// panel via the registry so the new channel's `ChannelId` resolves.
+    pub fn bind_channel_to_pane(
+        &mut self,
+        pane: PaneId,
+        name: &str,
+        reg: &PanelRegistry,
+        ch: &ChannelRegistry,
+    ) -> bool {
+        let Some(screen) = self.screens.get_mut(&self.active) else {
+            return false;
+        };
+
+        // Find the panel with this PaneId.
+        let raw_id = pane.0;
+        let Some(panel) = screen.panels.get_mut(&raw_id) else {
+            return false;
+        };
+
+        if !panel.bind_channel(name) {
+            return false;
+        }
+
+        // Serialize current (updated) config, then rebuild with registry so
+        // the new channel's ChannelId resolves.
+        let panel_type = screen
+            .panel_types
+            .get(&raw_id)
+            .cloned()
+            .unwrap_or_else(|| "error".to_string());
+        let config = panel.serialize();
+        let entry = crate::config::PanelEntry { panel_type, config };
+        let rebuilt = reg.build(&entry, ch);
+        screen.panels.insert(raw_id, rebuilt);
+        true
+    }
+
+    /// Return the `PaneId` of the first panel in the active screen.
+    ///
+    /// Primarily for unit tests that need to address a pane without going
+    /// through the full iced pane_grid state.
+    pub fn first_pane_id(&self) -> Option<PaneId> {
+        let screen = self.screens.get(&self.active)?;
+        // pane_map maps pane_grid::Pane -> u32 id; any key gives us a valid pane.
+        screen.pane_map.values().next().map(|&id| PaneId(id))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -544,6 +601,56 @@ type = "gauge"
         ws.add_screen(Some("second".into()), &reg, &ch);
         assert!(ws.screens.contains_key("second"));
         assert_eq!(ws.active, "second");
+    }
+
+    /// Two-channel registry used by drag-to-bind tests.
+    const SAMPLE_TWO_CHANNELS: &str = r#"
+[channels."a"]
+topic = "t"
+proto_path = "M.v"
+ts_path    = "M.t"
+type       = "float"
+
+[channels."b"]
+topic = "t"
+proto_path = "M.v"
+ts_path    = "M.t"
+type       = "float"
+"#;
+
+    #[test]
+    fn dropping_channel_on_pane_binds_it() {
+        let ch = ChannelRegistry::from_toml_str(SAMPLE_TWO_CHANNELS).unwrap();
+        let reg = PanelRegistry::with_builtins();
+
+        // Build a workspace with one waveform pane pre-bound to channel "a".
+        let toml_src = r#"
+[screens.main.layout]
+type = "waveform"
+channels = ["a"]
+"#;
+        let cfg = crate::config::LayoutConfig::from_toml_str(toml_src).unwrap();
+        let mut ws = Workspace::from_config(&cfg, &reg, &ch);
+
+        let pane_id = ws.first_pane_id().expect("workspace must have a pane");
+
+        // Binding "b" should succeed.
+        let accepted = ws.bind_channel_to_pane(pane_id, "b", &reg, &ch);
+        assert!(accepted, "waveform panel should accept a new channel");
+
+        // After rebuild the serialized channels list must contain both "a" and "b".
+        let screen = ws.screens.get(&ws.active).unwrap();
+        let panel = screen.panels.get(&pane_id.0).unwrap();
+        let serialized = panel.serialize();
+        let chans = serialized
+            .get("channels")
+            .and_then(|v| v.as_array())
+            .expect("serialize() must include a 'channels' array");
+        let names: Vec<&str> = chans.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            names.contains(&"a") && names.contains(&"b"),
+            "expected both 'a' and 'b' in channels, got: {names:?}"
+        );
     }
 
     #[test]

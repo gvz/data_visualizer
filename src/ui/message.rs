@@ -53,4 +53,6 @@ pub enum Message {
     /// User pressed a channel leaf in the sidebar — stores the dragged name in
     /// app state. Drop-onto-pane binding is wired in Task 12.
     DragChannel(String),
+    /// Mouse released over a pane — bind the dragged channel (if any) to that pane.
+    DropOnPane(PaneId),
 }
