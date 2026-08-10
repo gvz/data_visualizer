@@ -55,4 +55,8 @@ pub enum Message {
     DragChannel(String),
     /// Mouse released over a pane — bind the dragged channel (if any) to that pane.
     DropOnPane(PaneId),
+    /// Seek the replay playhead to the given nanosecond timestamp (Task 13).
+    Seek(i64),
+    /// Close the replay and return to live mode (Task 13).
+    CloseReplay,
 }

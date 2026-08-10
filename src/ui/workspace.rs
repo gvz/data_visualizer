@@ -540,6 +540,28 @@ impl Workspace {
         // pane_map maps pane_grid::Pane -> u32 id; any key gives us a valid pane.
         screen.pane_map.values().next().map(|&id| PaneId(id))
     }
+
+    /// Re-resolve panel channel bindings after a replay store is swapped in.
+    ///
+    /// Rebuilds every panel in every screen from its serialised config so that
+    /// channel IDs resolve against the (now-populated) registry.  This is the
+    /// iced equivalent of the old egui `workspace.refresh_bindings(…)` call.
+    pub fn refresh_bindings(&mut self, reg: &PanelRegistry, ch: &ChannelRegistry) {
+        for screen in self.screens.values_mut() {
+            let ids: Vec<u32> = screen.panels.keys().copied().collect();
+            for id in ids {
+                let panel_type = screen
+                    .panel_types
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| "error".to_string());
+                let config = screen.panels[&id].serialize();
+                let entry = crate::config::PanelEntry { panel_type, config };
+                let rebuilt = reg.build(&entry, ch);
+                screen.panels.insert(id, rebuilt);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
