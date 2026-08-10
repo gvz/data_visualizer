@@ -4,6 +4,8 @@ use std::path::Path;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
+use super::workspace_layout::LayoutNode;
+
 /// Layout half of config.toml — screens with panel lists. Panel-specific
 /// settings stay an opaque toml::Table here; the viz PanelRegistry interprets
 /// them. Channels live in the same file but are parsed by ChannelRegistry;
@@ -36,6 +38,13 @@ pub struct ScreenConfig {
     /// serialize before arrays-of-tables.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tiles_json: Option<String>,
+    /// New iced pane_grid layout tree (Task 5+).
+    /// When present this takes priority over `tiles_json` and the flat
+    /// `panels` list for layout; on legacy configs it is absent.
+    /// MUST be declared before `panels`: TOML requires scalar values / inline
+    /// tables to precede arrays-of-tables in the same section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<LayoutNode>,
     #[serde(default)]
     pub panels: Vec<PanelEntry>,
 }

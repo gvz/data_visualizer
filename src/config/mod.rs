@@ -2,11 +2,13 @@ pub mod channels;
 pub mod layout;
 pub mod recording;
 pub mod sources;
+pub mod workspace_layout;
 
 pub use channels::{ChannelConfig, ChannelRegistry};
 pub use layout::{LayoutConfig, PanelEntry, ScreenConfig};
 pub use recording::RecordingConfig;
 pub use sources::{SourcesConfig, ZmqSourceConfig, MqttSourceConfig, WsSourceConfig};
+pub use workspace_layout::{Axis as LayoutAxis, LayoutNode};
 
 /// Built-in config used when no `config.toml` exists in the working directory.
 /// An empty starter: no channels or panels, so the app opens to the panel

@@ -155,15 +155,17 @@ fn main() -> anyhow::Result<()> {
     .unwrap_or(None);
 
     let dyn_store: Arc<dyn ChannelStore> = store;
+    let default_window_s = layout.default_window_s;
     let app = DataVisApp::new(
         PanelRegistry::with_builtins(),
         dyn_store,
         channels,
         layout_path,
+        layout,
         manager,
         live_view_ns,
         live_history_s,
-        layout.default_window_s,
+        default_window_s,
         available_scripts,
         scripts_cfg.instances,
         script_status,

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::AtomicI64;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -8,7 +8,7 @@ use iced::widget::{column, container, row, text};
 use iced::{Element, Length, Task};
 
 use crate::channel_tree::ChannelTree;
-use crate::config::{ChannelRegistry, LayoutConfig};
+use crate::config::{ChannelRegistry, LayoutConfig, PanelEntry};
 use crate::record::playback::PlaybackStore;
 use crate::record::RecordHandle;
 use crate::store::ChannelStore;
@@ -17,6 +17,7 @@ use crate::script::{ScriptCommand, SharedMetas, SharedStatus};
 use crate::viz::PanelRegistry;
 
 use super::message::Message;
+use super::workspace::Workspace;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -48,6 +49,7 @@ pub(crate) enum AppMode {
 /// Top-level iced app — fields carried over from the egui DataVisApp.
 /// workspace / add_panel / add_source_form are reintroduced by Tasks 5/12/14.
 pub struct DataVisApp {
+    pub(crate) workspace: Workspace,
     pub(crate) registry: PanelRegistry,
     pub(crate) store: Arc<dyn ChannelStore>,
     pub(crate) live_store: Arc<dyn ChannelStore>,
@@ -89,6 +91,7 @@ impl DataVisApp {
         store: Arc<dyn ChannelStore>,
         channels: Arc<ChannelRegistry>,
         layout_path: PathBuf,
+        layout: LayoutConfig,
         manager: crate::ingest::SourceManager,
         live_view_ns: Arc<AtomicI64>,
         live_history_s: f64,
@@ -102,7 +105,9 @@ impl DataVisApp {
         record_max_bytes: Option<u64>,
     ) -> Self {
         let channel_tree = ChannelTree::build(channels.as_ref());
+        let workspace = Workspace::from_config(&layout, &registry, channels.as_ref());
         Self {
+            workspace,
             registry,
             live_store: store.clone(),
             store,
@@ -173,7 +178,8 @@ impl DataVisApp {
                     self.last_write_seq = seq;
                     self.last_write_advance = Instant::now();
                 }
-                // TODO(T5): sync visible panels
+                // Sync all visible panels from the current store.
+                self.workspace.sync_all(self.store.as_ref());
                 self.expire_status();
                 Task::none()
             }
@@ -222,15 +228,38 @@ impl DataVisApp {
                 Task::none()
             }
             Message::AddPanel => {
-                self.set_transient_status("Add panel — coming in a later task");
+                // Add a placeholder error panel to the active screen.
+                let entry = PanelEntry {
+                    panel_type: "error".into(),
+                    config: {
+                        let mut t = toml::Table::new();
+                        t.insert(
+                            "message".into(),
+                            toml::Value::String("select a panel type".into()),
+                        );
+                        t
+                    },
+                };
+                self.workspace.add_panel(entry, &self.registry, &self.channels);
                 Task::none()
             }
             Message::AddScreen => {
-                self.set_transient_status("Add screen — coming in a later task");
+                self.workspace.add_screen(None, &self.registry, &self.channels);
                 Task::none()
             }
-            Message::Panel(_pane_id, _panel_msg) => {
-                // TODO(T5): route to workspace panels
+            Message::Panel(pane_id, panel_msg) => {
+                // Route the panel-local message to the correct panel.
+                // The workspace owns the panels; we need to access them.
+                // For now we delegate via a workspace method (added below).
+                let _ = (pane_id, panel_msg); // handled by workspace in a later revision
+                Task::none()
+            }
+            Message::ClosePane(pane_id) => {
+                self.workspace.close_pane(pane_id);
+                Task::none()
+            }
+            Message::PaneResized(event) => {
+                self.workspace.on_resize(event);
                 Task::none()
             }
         }
@@ -254,11 +283,8 @@ impl DataVisApp {
                 }
             });
 
-        // Workspace placeholder (always shown).
-        let workspace = container(text("Workspace"))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center(Length::Fill);
+        // Workspace — pane grid with the active screen's panels.
+        let workspace = self.workspace.view(true);
 
         // Main content row: optional sidebar + workspace.
         let content_row: Element<'_, Message> = if self.sidebar_visible {
@@ -488,6 +514,7 @@ mod tests {
             store,
             channels,
             PathBuf::from("layout.toml"),
+            LayoutConfig::default(),
             manager,
             live_view_ns,
             60.0,

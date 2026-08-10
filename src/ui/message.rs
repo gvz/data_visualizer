@@ -46,4 +46,8 @@ pub enum Message {
     AddScreen,
     /// Route a panel-local message to the identified pane (Task 5).
     Panel(PaneId, PanelMessage),
+    /// Close the pane identified by [`PaneId`] (Task 5).
+    ClosePane(PaneId),
+    /// Forward a pane_grid resize event to the workspace (Task 5).
+    PaneResized(iced::widget::pane_grid::ResizeEvent),
 }
