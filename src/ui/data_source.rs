@@ -1,5 +1,4 @@
-//! Data-source modal: form logic lifted from `data_source_window.rs` (egui
-//! widgets replaced with iced). Provides [`AddSourceForm`], the `view`
+//! Data-source modal. Provides [`AddSourceForm`], the `view`
 //! function that renders the modal body, and the `rows` helper used by tests.
 
 use std::path::Path;

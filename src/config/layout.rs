@@ -32,8 +32,8 @@ impl Default for LayoutConfig {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ScreenConfig {
-    /// egui_tiles tree layout (JSON-encoded), written by the workspace module.
-    /// Absent on hand-written configs — a default grid is built instead.
+    /// Legacy tile-tree layout (JSON-encoded) from the pre-iced era.
+    /// Absent on new configs; ignored when `layout` is present.
     /// MUST be declared before `panels`: TOML requires scalar values to
     /// serialize before arrays-of-tables.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -12,7 +12,7 @@ use crate::types::{ChannelId, ChannelSnapshot, TimeWindow};
 use crate::viz::{PanelMessage, VizPanel};
 
 // ---------------------------------------------------------------------------
-// Helpers (inlined — common.rs depends on egui which is not available here)
+// Helpers (inlined per-panel)
 // ---------------------------------------------------------------------------
 
 fn opt_str_array(cfg: &toml::Table, key: &str) -> Vec<String> {

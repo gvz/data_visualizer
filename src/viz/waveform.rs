@@ -16,7 +16,7 @@ use crate::viz::{PanelMessage, VizPanel};
 
 pub const TYPE_NAME: &str = "waveform";
 
-/// Accepted sample types — same as the old egui panel.
+/// Accepted sample types for waveform panels.
 const ACCEPTED: &[SampleType] = &[SampleType::Float, SampleType::Int, SampleType::Bool];
 
 /// Max decimation buckets per sync — ~2 points per bucket is what the old

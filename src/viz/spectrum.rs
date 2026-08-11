@@ -26,7 +26,7 @@ const DEFAULT_FFT_SIZE: usize = 1024;
 const DEFAULT_HISTORY_S: f64 = 10.0;
 
 // ---------------------------------------------------------------------------
-// Pure FFT computation — lifted unchanged from the old egui panel.
+// Pure FFT computation.
 // ---------------------------------------------------------------------------
 
 /// Periodic Hann window, peak 1.0 at n/2.
@@ -295,7 +295,7 @@ history_s = 2.0
     }
 
     // -----------------------------------------------------------------------
-    // FFT unit tests (ported unchanged from the old egui panel)
+    // FFT unit tests
     // -----------------------------------------------------------------------
 
     #[test]

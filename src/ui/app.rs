@@ -53,8 +53,7 @@ pub(crate) enum AppMode {
     Replay(ReplayState),
 }
 
-/// Top-level iced app — fields carried over from the egui DataVisApp.
-/// workspace / add_panel / add_source_form are reintroduced by Tasks 5/12/14.
+/// Top-level iced application state.
 pub struct DataVisApp {
     pub(crate) workspace: Workspace,
     pub(crate) registry: PanelRegistry,

@@ -5,7 +5,7 @@ channels over a few different transports, decodes them (Protobuf schemas can be
 picked up on the fly), and draws them in a workspace of panels you arrange
 yourself. You can record a session and scrub back through it later.
 
-Written in Rust on top of [egui](https://github.com/emilk/egui).
+Written in Rust on top of [iced](https://github.com/iced-rs/iced).
 
 ## Documentation
 
@@ -43,7 +43,7 @@ above it.
 - `viz/` — the `VizPanel` trait and every panel, looked up through a registry
 - `record/` — MCAP writer, playback, and MQTT schema capture
 - `config/` — channel and layout files
-- `workspace.rs` / `app.rs` — the tiled UI and the eframe app that hosts it
+- `ui/` — the tiled workspace and iced application shell
 
 ## Running it
 

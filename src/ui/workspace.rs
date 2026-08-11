@@ -294,8 +294,8 @@ impl Workspace {
     /// For each screen in `cfg`:
     /// - If [`ScreenConfig::layout`] is present and parses as a [`LayoutNode`],
     ///   that tree is used.
-    /// - If the layout field is absent or contains a legacy egui_tiles JSON
-    ///   blob (or any other unparseable content), a default linear layout is
+    /// - If the layout field is absent or contains a legacy JSON blob
+    ///   (or any other unparseable content), a default linear layout is
     ///   built from the screen's panel list.
     pub fn from_config(
         cfg: &LayoutConfig,
@@ -327,10 +327,10 @@ impl Workspace {
             return layout_node.clone();
         }
 
-        // tiles_json present → legacy egui_tiles blob; build default grid.
+        // tiles_json present → legacy JSON blob; build default grid.
         if screen_cfg.tiles_json.is_some() {
             eprintln!(
-                "workspace: ignoring legacy egui_tiles blob; \
+                "workspace: ignoring legacy tiles_json blob; \
                  building default grid from panel list"
             );
         }
@@ -545,7 +545,7 @@ impl Workspace {
     ///
     /// Rebuilds every panel in every screen from its serialised config so that
     /// channel IDs resolve against the (now-populated) registry.  This is the
-    /// iced equivalent of the old egui `workspace.refresh_bindings(…)` call.
+    /// Re-resolves channel IDs against the newly-populated registry.
     pub fn refresh_bindings(&mut self, reg: &PanelRegistry, ch: &ChannelRegistry) {
         for screen in self.screens.values_mut() {
             let ids: Vec<u32> = screen.panels.keys().copied().collect();
@@ -583,7 +583,7 @@ mod tests {
 
     #[test]
     fn legacy_or_garbage_workspace_builds_default_grid() {
-        // Simulate an old egui_tiles config with a JSON blob in tiles_json.
+        // Simulate a legacy config with a JSON blob in tiles_json.
         let toml_src = r#"
 [screens.main]
 tiles_json = '{"LinearDir":"Horizontal","children":[{"Leaf":{"id":1}},{"Leaf":{"id":2}}]}'

@@ -9,7 +9,7 @@ use crate::types::{ChannelId, Sample};
 use crate::viz::{PanelMessage, VizPanel};
 
 // ---------------------------------------------------------------------------
-// Helpers (inlined — common.rs depends on egui which is not in this crate)
+// Helpers (inlined per-panel)
 // ---------------------------------------------------------------------------
 
 fn opt_str(cfg: &toml::Table, key: &str) -> String {

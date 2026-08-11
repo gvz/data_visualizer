@@ -1,7 +1,7 @@
 //! Iced-port XY-scatter panel — two channels plotted against each other.
 //!
 //! `x_channel` and `y_channel` are aligned by sample index from the newest
-//! sample backwards (same uniform-rate assumption as the old egui panel).
+//! sample backwards (uniform-rate assumption).
 //! Points are rendered as circles via `Series::circles`. Both axes autoscale
 //! via `autoscale_on_updates(true)`; no fixed axis limits are set.
 

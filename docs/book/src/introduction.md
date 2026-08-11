@@ -6,7 +6,7 @@ can be picked up on the fly — and draws them in a workspace of panels you
 arrange yourself. You can record a session and scrub back through it later
 through the very same panels.
 
-It is written in Rust on top of [egui](https://github.com/emilk/egui).
+It is written in Rust on top of [iced](https://github.com/iced-rs/iced).
 
 ## What it does
 

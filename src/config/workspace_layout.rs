@@ -1,4 +1,4 @@
-//! New serde layout schema for the iced workspace, replacing the old egui_tiles
+//! Serde layout schema for the iced workspace, superseding the legacy
 //! JSON blob stored in [`super::ScreenConfig::tiles_json`].
 //!
 //! The canonical layout is a recursive [`LayoutNode`] tree.  At save time the

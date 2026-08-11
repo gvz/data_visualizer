@@ -5,8 +5,7 @@
 //! by `DataVisApp`.
 //!
 //! The scripting ENGINE (`mod.rs`, `runner.rs`, `python.rs`, `config.rs`) is
-//! reused unchanged. Only the egui drawing from the old panel is replaced here
-//! with iced widgets.
+//! reused unchanged. The UI is built with iced widgets.
 //!
 //! The panel is feature-agnostic: when `disabled` is `Some(reason)` (which
 //! main.rs sets when the `scripting` feature is off), the panel shows a
@@ -25,7 +24,7 @@ use crate::types::SampleType;
 
 use crate::ui::message::Message;
 
-// ── Pure helpers (lifted verbatim from the old egui panel) ───────────────────
+// ── Pure helpers ─────────────────────────────────────────────────────────────
 
 /// Case-insensitive subsequence match; ranks tighter match spans first. Empty
 /// query returns every candidate in original order.
@@ -161,11 +160,9 @@ impl StagedInstance {
 
 /// Transient editor state held in `DataVisApp` for the Scripts modal.
 ///
-/// Simplification vs old egui panel: the old panel had a `HashMap<id,
-/// StagedInstance>` for every committed instance plus a separate "new" form.
-/// Here we hold a single `staged` for the currently selected/new instance.
+/// Holds a single `staged` for the currently selected/new instance.
 /// This reduces UI complexity at the cost of not preserving unsaved edits for
-/// multiple instances simultaneously — acceptable for the iced port.
+/// multiple instances simultaneously.
 #[derive(Default)]
 pub struct ScriptEditState {
     /// The instance currently being edited (None = "add new" form).
@@ -354,9 +351,8 @@ pub fn view<'a>(
     }
 
     // Apply / Clear buttons. Gate Apply behind a non-empty id AND script so a
-    // blank instance can never be upserted and sent to the engine (mirrors the
-    // old egui panel's `can_add` gate). When disabled we render the button
-    // without `on_press`, which iced draws as inert.
+    // blank instance can never be upserted and sent to the engine. When
+    // disabled we render the button without `on_press`, which iced draws as inert.
     let can_apply = !state.staged.id.is_empty() && !state.staged.script.is_empty();
     let apply_btn = if can_apply {
         button(text("Apply")).on_press(Message::ScriptApply)
@@ -412,7 +408,7 @@ mod tests {
     use std::collections::HashMap;
     use super::*;
 
-    // ── Pure helper tests (ported verbatim from old egui panel) ──────────
+    // ── Pure helper tests ────────────────────────────────────────────────
 
     fn mk_status(st: ScriptState) -> ScriptStatus {
         ScriptStatus { name: "x".into(), state: st }

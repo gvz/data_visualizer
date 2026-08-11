@@ -1,7 +1,7 @@
 //! # datavis
 //!
-//! A real-time channel data visualizer built with eframe/egui. Channels
-//! carry timestamped scalar or text samples from one or more live sources;
+//! A real-time channel data visualizer built with iced. Channels carry
+//! timestamped scalar or text samples from one or more live sources;
 //! panels render those samples in various ways inside a tiled workspace.
 //!
 //! This document covers the main extension points: adding a new
@@ -22,7 +22,7 @@
 //!    - [`title`] — label shown in the pane header.
 //!    - [`accepted_types`] — which [`types::SampleType`]s the panel accepts
 //!      (gates drag-and-drop).
-//!    - [`config_ui`] — egui controls rendered in the settings popup.
+//!    - [`config_ui`] — iced controls rendered in the settings popup.
 //!    - [`render`] — draw the panel; read samples via [`store::ChannelStore`].
 //!    - [`serialize`] / constructor — round-trip panel state through
 //!      `toml::Table` for layout persistence. Binding errors (unknown channel,

@@ -14,7 +14,7 @@ use crate::viz::canvas_util::centered_text;
 use crate::viz::{PanelMessage, VizPanel};
 
 // ---------------------------------------------------------------------------
-// Helpers (inlined — common.rs depends on egui which is not in this crate)
+// Helpers (inlined per-panel)
 // ---------------------------------------------------------------------------
 
 fn opt_str(cfg: &toml::Table, key: &str) -> String {

@@ -31,7 +31,7 @@ fn opt_f64(cfg: &toml::Table, key: &str) -> Option<f64> {
 }
 
 // ---------------------------------------------------------------------------
-// Color palette (matches the old egui state_graph exactly)
+// Color palette (matches the original state_graph color scheme)
 // ---------------------------------------------------------------------------
 
 pub const TYPE_NAME: &str = "state_graph";
@@ -39,7 +39,7 @@ pub const TYPE_NAME: &str = "state_graph";
 #[allow(dead_code)]
 const ACCEPTED: &[SampleType] = &[SampleType::Bool, SampleType::Int, SampleType::Text];
 
-/// Six-color palette, same hues as the old egui panel.
+/// Six-color palette used across state-graph panels.
 pub(crate) const PALETTE: &[Color] = &[
     Color { r: 0x4c as f32 / 255.0, g: 0xaf as f32 / 255.0, b: 0x50 as f32 / 255.0, a: 1.0 }, // green
     Color { r: 0x21 as f32 / 255.0, g: 0x96 as f32 / 255.0, b: 0xf3 as f32 / 255.0, a: 1.0 }, // blue

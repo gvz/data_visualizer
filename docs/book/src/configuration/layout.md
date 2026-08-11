@@ -28,10 +28,9 @@ channel = "load/state0"
 
 ### `tiles_json`
 
-The tile geometry — how the window is split into a tree of horizontal and
-vertical containers — is serialised as a JSON string in `tiles_json`. This is
-produced by the tiling engine (`egui_tiles`); treat it as opaque and let the GUI
-manage it.
+Legacy field from the pre-iced era. When present it is silently ignored in
+favour of the `layout` field written by the current tiling engine. Leave any
+existing value in place; the app will overwrite it with `layout` on next save.
 
 ### `[[screens.<name>.panels]]`
 

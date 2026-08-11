@@ -27,7 +27,7 @@ real one.
 | `record/` | MCAP writer, playback store, lazy loader, MQTT schema capture |
 | `config/` | Channel registry, layout, defaults, and section parsers |
 | `script/` | The Python/numba engine, bindings, and script panel |
-| `workspace.rs` / `app.rs` | The tiled UI and the eframe app that hosts it |
+| `ui/` | The tiled workspace and iced application shell |
 
 ## Sources
 

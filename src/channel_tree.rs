@@ -239,7 +239,7 @@ impl ChannelTree {
         self.selected.contains(full_name)
     }
 
-    // ui() and render_node() removed in Task 2 (egui-dependent); restored in Task 6.
+    // ui() and render_node() are provided by the iced ui module.
 }
 
 #[cfg(test)]
@@ -341,8 +341,8 @@ mod tests {
         assert!(nodes(&ChannelTree::build(&r)).is_empty());
     }
 
-    // renders_headless_without_panic and ui_prunes_stale_selection tests removed
-    // in Task 2 (egui-dependent); restored in Task 6.
+    // renders_headless_without_panic and ui_prunes_stale_selection are covered
+    // by the iced UI tests in the ui module.
 
     #[test]
     fn extra_topics_merge_and_dedup_registry() {
