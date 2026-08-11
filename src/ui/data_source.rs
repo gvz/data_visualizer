@@ -146,24 +146,6 @@ fn conn_color(state: u8) -> Color {
     }
 }
 
-fn kind_label(k: SourceKind) -> &'static str {
-    match k {
-        SourceKind::Zmq => "ZMQ",
-        SourceKind::Mqtt => "MQTT",
-        SourceKind::WebSocket => "WebSocket",
-        SourceKind::Bridge => "Bridge",
-        SourceKind::Internal => "Internal",
-    }
-}
-
-// ── SourceKind pick_list support ──────────────────────────────────────────────
-
-impl std::fmt::Display for SourceKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(kind_label(*self))
-    }
-}
-
 // ── View ──────────────────────────────────────────────────────────────────────
 
 /// Render the data-source modal body (active sources + add-source form).

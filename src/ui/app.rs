@@ -87,7 +87,6 @@ pub struct DataVisApp {
     pub(crate) script_commands: crossbeam_channel::Sender<ScriptCommand>,
     pub(crate) script_disabled: Arc<Mutex<Option<String>>>,
     pub(crate) record_max_bytes: Option<u64>,
-    pub(crate) data_source_window_open: bool,
     /// Channel currently being dragged from the sidebar (Task 12 wires drop).
     pub(crate) dragging: Option<String>,
     /// Add-source form state (Task 14).
@@ -154,7 +153,6 @@ impl DataVisApp {
             script_commands,
             script_disabled,
             record_max_bytes,
-            data_source_window_open: false,
             dragging: None,
             add_source_form: crate::ui::data_source::AddSourceForm::default(),
             active_dialog: None,
@@ -324,12 +322,10 @@ impl DataVisApp {
             // Task 14: data-source modal
             // ---------------------------------------------------------------
             Message::OpenDataSource => {
-                self.data_source_window_open = true;
                 self.active_dialog = Some(ActiveDialog::DataSource);
                 Task::none()
             }
             Message::CloseDataSource => {
-                self.data_source_window_open = false;
                 self.active_dialog = None;
                 Task::none()
             }
@@ -592,10 +588,11 @@ impl DataVisApp {
         let btn_load_from = button(text("Load layout from…"))
             .on_press(Message::LoadLayoutFrom);
 
-        // Data source toggle.
-        let ds_label = if self.data_source_window_open { "Close Data Source" } else { "Data Source" };
+        // Data source toggle — driven solely by active_dialog.
+        let ds_open = matches!(self.active_dialog, Some(ActiveDialog::DataSource));
+        let ds_label = if ds_open { "Close Data Source" } else { "Data Source" };
         let btn_data_source = button(text(ds_label))
-            .on_press(if self.data_source_window_open {
+            .on_press(if ds_open {
                 Message::CloseDataSource
             } else {
                 Message::OpenDataSource
@@ -966,15 +963,24 @@ mod tests {
     }
 
     #[test]
-    fn open_close_data_source_flips_bool() {
+    fn open_close_data_source_toggles_active_dialog() {
+        use super::super::message::ActiveDialog;
         let mut app = make_test_app();
 
-        assert!(!app.data_source_window_open, "window starts closed");
+        assert!(app.active_dialog.is_none(), "dialog starts closed");
         let now = Instant::now();
-        app.update(Message::OpenDataSource, now);
-        assert!(app.data_source_window_open, "window opens");
-        app.update(Message::CloseDataSource, now);
-        assert!(!app.data_source_window_open, "window closes");
+        let _ = app.update(Message::OpenDataSource, now);
+        assert!(
+            matches!(app.active_dialog, Some(ActiveDialog::DataSource)),
+            "data source dialog opens"
+        );
+        let _ = app.update(Message::CloseDataSource, now);
+        assert!(app.active_dialog.is_none(), "dialog closes");
+        // Backdrop dismissal via CloseModal must also clear the dialog so the
+        // toolbar button label stays consistent.
+        let _ = app.update(Message::OpenDataSource, now);
+        let _ = app.update(Message::CloseModal, now);
+        assert!(app.active_dialog.is_none(), "CloseModal clears the dialog");
     }
 
     // -----------------------------------------------------------------------

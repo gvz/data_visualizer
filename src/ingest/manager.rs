@@ -26,6 +26,20 @@ pub enum SourceKind {
     Internal,
 }
 
+impl std::fmt::Display for SourceKind {
+    /// Short human-readable label; used by the GUI's kind picker.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            SourceKind::Zmq => "ZMQ",
+            SourceKind::Mqtt => "MQTT",
+            SourceKind::WebSocket => "WebSocket",
+            SourceKind::Bridge => "Bridge",
+            SourceKind::Internal => "Internal",
+        };
+        f.write_str(s)
+    }
+}
+
 /// Full specification for one data source, used both to spawn it and (for
 /// persistent sources) to reconstruct a `SourcesConfig` on save.
 #[derive(Clone, Debug, PartialEq)]
