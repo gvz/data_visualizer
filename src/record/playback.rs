@@ -162,6 +162,98 @@ impl PlaybackStore {
         Self::load_many(std::slice::from_ref(&path), registry)
     }
 
+    /// Test-only fixture: build a real `Arc<PlaybackStore>` backed by a minimal
+    /// single-channel (`accel.x`) MCAP written to a tempfile, plus the matching
+    /// registry. Exposed (not inside the test submodule) so other crates' unit
+    /// tests — notably the UI store-swap test — can obtain a genuine playback
+    /// store without a pub `::new`. Returns `(store, registry, tempdir)`; keep
+    /// the `TempDir` alive for the lifetime of the store (mmap-backed).
+    #[cfg(test)]
+    pub fn new_test_fixture(
+        samples: &[(i64, f32)],
+    ) -> (Arc<Self>, ChannelRegistry, tempfile::TempDir) {
+        use prost_reflect::prost::Message as _;
+        use prost_reflect::{DynamicMessage, Value};
+        use std::borrow::Cow;
+        use std::collections::BTreeMap;
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Write a proto describing an AccelBatch of {t_ns, x} samples.
+        let proto_path = dir.path().join("test.proto");
+        let mut f = std::fs::File::create(&proto_path).unwrap();
+        write!(
+            f,
+            r#"
+syntax = "proto3";
+message AccelBatch {{
+  repeated Sample samples = 1;
+  message Sample {{ int64 t_ns = 1; float x = 2; }}
+}}
+"#
+        )
+        .unwrap();
+        let schema = crate::ingest::loader::ProtoSchema::from_path(&proto_path).unwrap();
+        let registry = ChannelRegistry::from_toml_str(
+            r#"
+[channels."accel.x"]
+topic = "accel"
+proto_path = "AccelBatch.samples.x"
+ts_path = "AccelBatch.samples.t_ns"
+type = "float"
+"#,
+        )
+        .unwrap();
+
+        // Encode each sample as a one-element batch and write it into an MCAP.
+        let pool = schema.pool_for_test();
+        let batch_desc = pool.get_message_by_name("AccelBatch").unwrap();
+        let sample_desc = pool.get_message_by_name("AccelBatch.Sample").unwrap();
+        let t_field = sample_desc.get_field_by_name("t_ns").unwrap();
+        let x_field = sample_desc.get_field_by_name("x").unwrap();
+        let samples_field = batch_desc.get_field_by_name("samples").unwrap();
+
+        let channel = Arc::new(mcap::Channel {
+            topic: "accel".to_string(),
+            schema: Some(Arc::new(mcap::Schema {
+                name: "protobuf".to_string(),
+                encoding: "protobuf".to_string(),
+                data: Cow::Owned(schema.schema_bytes().to_vec()),
+            })),
+            message_encoding: "protobuf".to_string(),
+            metadata: BTreeMap::new(),
+        });
+
+        let mcap_path = dir.path().join("fixture.mcap");
+        let file = std::io::BufWriter::new(std::fs::File::create(&mcap_path).unwrap());
+        let mut writer = mcap::Writer::new(file).unwrap();
+        for (t_ns, x) in samples {
+            let list = vec![{
+                let mut s = DynamicMessage::new(sample_desc.clone());
+                s.set_field(&t_field, Value::I64(*t_ns));
+                s.set_field(&x_field, Value::F32(*x));
+                Value::Message(s)
+            }];
+            let mut batch = DynamicMessage::new(batch_desc.clone());
+            batch.set_field(&samples_field, Value::List(list));
+            let data = batch.encode_to_vec();
+            writer
+                .write(&mcap::Message {
+                    channel: channel.clone(),
+                    sequence: 0,
+                    log_time: *t_ns as u64,
+                    publish_time: *t_ns as u64,
+                    data: Cow::Owned(data),
+                })
+                .unwrap();
+        }
+        writer.finish().unwrap();
+
+        let store = Self::load(&mcap_path, &registry).unwrap();
+        (store, registry, dir)
+    }
+
     /// Load one or more MCAP recordings into a single playback store. Channels
     /// are keyed by name via the shared registry, so same-named channels across
     /// files merge into one. Timestamps are preserved exactly as recorded; the

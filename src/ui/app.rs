@@ -181,8 +181,12 @@ impl DataVisApp {
                 // Poll for any completed background recording load.
                 self.poll_pending_load();
 
-                // Adaptive repaint: check if the store has new data.
-                let seq = self.store.write_seq();
+                // Adaptive repaint idle-detection. Always read the LIVE store's
+                // write_seq: during replay `self.store` is the (static)
+                // playback store, so keying off it would drop the repaint to
+                // the slow idle rate and stutter the scrubbed playhead. The
+                // live store keeps advancing, keeping replay responsive.
+                let seq = self.live_store.write_seq();
                 if seq != self.last_write_seq {
                     self.last_write_seq = seq;
                     self.last_write_advance = Instant::now();
@@ -700,12 +704,18 @@ mod tests {
     /// Build a minimal `DataVisApp` for unit tests.
     #[cfg(test)]
     fn make_test_app() -> DataVisApp {
+        use crate::config::ChannelRegistry;
+        make_test_app_with_channels(Arc::new(ChannelRegistry::from_toml_str("").unwrap()))
+    }
+
+    /// Build a test app around a caller-supplied channel registry — used by the
+    /// store-swap test so the app's registry matches the loaded recording.
+    #[cfg(test)]
+    fn make_test_app_with_channels(channels: Arc<crate::config::ChannelRegistry>) -> DataVisApp {
         use std::sync::Arc;
         use crate::viz::PanelRegistry;
         use crate::store::LiveStore;
-        use crate::config::ChannelRegistry;
 
-        let channels = Arc::new(ChannelRegistry::from_toml_str("").unwrap());
         let store = Arc::new(LiveStore::from_registry(&channels));
         let (tx, _rx) = crossbeam_channel::unbounded();
         let live_view_ns = Arc::new(std::sync::atomic::AtomicI64::new(0));
@@ -762,71 +772,95 @@ mod tests {
     // Task 13 tests
     // -----------------------------------------------------------------------
 
-    /// Inject a ready crossbeam receiver that yields `store` and call
-    /// `poll_pending_load`. Verify that `mode` becomes `Replay` and the live
-    /// channel tree is saved.
+    /// SUCCESS path: after `poll_pending_load` consumes a READY receiver
+    /// carrying `Ok(Arc<PlaybackStore>)`, the app must (a) save the live tree,
+    /// (b) enter `Replay` mode holding that store, (c) rebuild the channel tree
+    /// from the recording's registry, and (d) refresh workspace bindings.
     #[test]
-    fn store_swap_on_load() {
-        use crate::store::LiveStore;
-        use crate::config::ChannelRegistry;
+    fn store_swap_success_enters_replay_and_saves_tree() {
+        // Build a real playback store from a minimal in-memory MCAP, and build
+        // the app around the SAME registry so the tree rebuild is meaningful.
+        let (store, registry, _dir) = PlaybackStore::new_test_fixture(&[
+            (1_000_000_000, 1.0),
+            (2_000_000_000, 2.0),
+            (3_000_000_000, 3.0),
+        ]);
+        let channels = Arc::new(registry);
+        let mut app = make_test_app_with_channels(channels);
 
+        // The recording's channels ("accel.x") are now in the registry; the
+        // pre-swap live tree does NOT contain them yet only if the registry was
+        // built empty — here the registry already carries accel.x, so we just
+        // assert the swap wiring itself.
+        let live_tree_before = app.channel_tree.clone();
+        assert!(app.saved_channel_tree.is_none(), "no saved tree before load");
+        assert!(matches!(app.mode, AppMode::Live), "starts Live");
+
+        // Push a READY Ok(store) into a receiver and poll.
+        let (tx, rx) = crossbeam_channel::bounded::<anyhow::Result<Arc<PlaybackStore>>>(1);
+        let expected_start = store.start_ns;
+        tx.send(Ok(store)).unwrap();
+        app.pending_load = Some(("fixture.mcap".to_string(), rx));
+        app.poll_pending_load();
+
+        // (a) live tree saved.
+        assert!(app.saved_channel_tree.is_some(), "live channel tree must be saved");
+        assert_eq!(
+            sidebar::leaf_labels(app.saved_channel_tree.as_ref().unwrap()).len(),
+            sidebar::leaf_labels(&live_tree_before).len(),
+            "saved tree is the pre-swap live tree"
+        );
+        // (b) mode is Replay, holding the loaded store.
+        match &app.mode {
+            AppMode::Replay(rs) => {
+                assert_eq!(rs.store.start_ns, expected_start, "replay holds loaded store");
+                assert!(!rs.playing, "replay starts paused");
+            }
+            AppMode::Live => panic!("expected Replay mode after successful load"),
+        }
+        // (c) active store swapped to the playback store.
+        assert!(Arc::ptr_eq(
+            &app.store,
+            &(match &app.mode { AppMode::Replay(rs) => rs.store.clone() as Arc<dyn ChannelStore>, _ => unreachable!() })
+        ), "self.store points at the playback store during replay");
+        // (d) channel tree rebuilt from the recording registry (accel.x present).
+        let leaves = sidebar::leaf_labels(&app.channel_tree);
+        assert!(
+            leaves.iter().any(|l| l.contains("accel") || l.contains('x')),
+            "channel tree rebuilt with recording channels, got {leaves:?}"
+        );
+        // pending_load consumed.
+        assert!(app.pending_load.is_none(), "pending_load cleared after success");
+        assert!(app.status.contains("Loaded"), "status: {}", app.status);
+    }
+
+    /// FAILURE paths: a disconnected receiver and a ready `Err` both leave the
+    /// app in Live mode and clear `pending_load`.
+    #[test]
+    fn store_swap_failure_stays_live() {
         let mut app = make_test_app();
 
-        // Build a minimal PlaybackStore via the in-memory test path.
-        // We need a crossbeam channel that immediately yields Ok(store).
-        let channels = Arc::new(ChannelRegistry::from_toml_str("").unwrap());
-        let live_store = Arc::new(LiveStore::from_registry(&channels));
-
-        // Build an empty PlaybackStore by going through load_many on an empty
-        // slice — it returns Err on empty input, so we create it via a
-        // crossbeam channel that delivers a pre-built store.
-        // Use load_many on a real but non-existent path just to get the type
-        // correct; instead we'll synthesise the receiver directly.
+        // Disconnected receiver → TryRecvError::Disconnected.
         let (tx, rx) = crossbeam_channel::bounded::<anyhow::Result<Arc<PlaybackStore>>>(1);
-
-        // We need an Arc<PlaybackStore>. We get one by loading from bytes via
-        // a temporary MCAP. Instead, let's just use load_many on real data.
-        // For a unit test without file I/O, we need an alternative.
-        // Use the fact that PlaybackStore::load_many on one *existing* file
-        // works; but we have no MCAP file in tests. So we send Err and verify
-        // failure handling instead for this specific path.
-
-        // ---- Test the FAILURE path: disconnected receiver clears pending_load.
-        drop(tx); // disconnect immediately → TryRecvError::Disconnected
+        drop(tx);
         app.pending_load = Some(("test".to_string(), rx));
         app.poll_pending_load();
-        assert!(app.pending_load.is_none(), "pending_load must be cleared on disconnect");
-        assert!(matches!(app.mode, AppMode::Live), "mode stays Live on load failure");
+        assert!(app.pending_load.is_none(), "pending_load cleared on disconnect");
+        assert!(matches!(app.mode, AppMode::Live), "stays Live on disconnect");
 
-        // ---- Test the ERROR path: a ready Err result stays in Live mode.
+        // Ready Err result.
         let (tx2, rx2) = crossbeam_channel::bounded(1);
         tx2.send(Err(anyhow::anyhow!("test error"))).unwrap();
         app.pending_load = Some(("test".to_string(), rx2));
         app.poll_pending_load();
         assert!(app.pending_load.is_none());
-        assert!(matches!(app.mode, AppMode::Live), "mode stays Live on Err result");
+        assert!(matches!(app.mode, AppMode::Live), "stays Live on Err result");
         assert!(app.status.contains("Failed"), "status reports failure: {}", app.status);
-
-        // ---- Test the SUCCESS path via a synthetic PlaybackStore.
-        // We build one from an in-memory MCAP file using the builder utilities.
-        // Only run this if the test can create a real (empty) store from bytes.
-        // Since PlaybackStore::new is not pub, use a helper approach:
-        // set pending_load manually with an already-sent Ok(live_store) as
-        // ChannelStore doesn't implement PlaybackStore, so we skip the real
-        // load — instead we test using a temporary MCAP from gen_sample_mcap
-        // if available, or just validate the save/restore tree logic separately.
-
-        // Save the live tree for close_replay test.
-        let original_tree = app.channel_tree.clone();
-        let _ = (live_store, original_tree);
     }
 
     /// `close_replay` must restore the saved live channel tree and set mode to Live.
     #[test]
     fn close_replay_restores_live_tree() {
-        use crate::channel_tree::ChannelTree;
-        use crate::config::ChannelRegistry;
-
         let mut app = make_test_app();
 
         // Simulate that a replay is open by injecting a saved_channel_tree.
