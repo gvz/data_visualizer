@@ -1,3 +1,4 @@
+use crate::ingest::SourceKind;
 use crate::viz::PanelMessage;
 
 /// A unique identifier for a panel pane in the workspace grid.
@@ -7,6 +8,27 @@ use crate::viz::PanelMessage;
 /// is wired up in Task 5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PaneId(pub u32);
+
+/// Discriminates which text field in the add-source form changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceField {
+    Endpoint,
+    Schema,
+    Broker,
+    ClientId,
+    Listen,
+    BridgeName,
+    Command,
+    Args,
+}
+
+/// Which dialog overlay is currently open (Task 14).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActiveDialog {
+    DataSource,
+    AddScreen,
+    AddPanel,
+}
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -40,9 +62,9 @@ pub enum Message {
     StopRecord,
     /// Open an MCAP recording file for replay (Task 6).
     OpenRecording,
-    /// Add a new panel to the workspace (Task 5).
+    /// Open the Add Panel dialog (Task 14 replaces the old stub).
     AddPanel,
-    /// Add a new screen/tab to the workspace (Task 5).
+    /// Open the Add Screen dialog (Task 14 replaces the old stub).
     AddScreen,
     /// Route a panel-local message to the identified pane (Task 5).
     Panel(PaneId, PanelMessage),
@@ -59,4 +81,30 @@ pub enum Message {
     Seek(i64),
     /// Close the replay and return to live mode (Task 13).
     CloseReplay,
+
+    // -----------------------------------------------------------------------
+    // Task 14: data-source modal + add-panel/add-screen dialogs
+    // -----------------------------------------------------------------------
+    /// User selected a source kind in the add-source form.
+    SourceKindSelected(SourceKind),
+    /// User typed in one of the add-source form text fields.
+    SourceField(SourceField, String),
+    /// User clicked Browse for the ZMQ schema file.
+    BrowseSchema,
+    /// User clicked Browse for the bridge command.
+    BrowseCommand,
+    /// User clicked Start in the add-source form — validate, spawn, and persist.
+    StartSource,
+    /// User clicked Stop next to a running source row.
+    StopSource(u64),
+    /// Dismiss the currently open modal dialog (backdrop click).
+    CloseModal,
+    /// Confirm adding a new screen with the given name.
+    ConfirmAddScreen,
+    /// Text changed in the add-screen name input.
+    AddScreenNameChanged(String),
+    /// User selected a panel type in the add-panel dialog.
+    AddPanelTypeSelected(String),
+    /// Confirm adding a panel of the currently selected type.
+    ConfirmAddPanel,
 }

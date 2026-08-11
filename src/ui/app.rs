@@ -19,7 +19,9 @@ use crate::script::config::ScriptInstance;
 use crate::script::{ScriptCommand, SharedMetas, SharedStatus};
 use crate::viz::PanelRegistry;
 
-use super::message::Message;
+use super::data_source as data_source_ui;
+use super::message::{ActiveDialog, Message, SourceField};
+use super::modal;
 use super::workspace::Workspace;
 
 // ---------------------------------------------------------------------------
@@ -88,6 +90,14 @@ pub struct DataVisApp {
     pub(crate) data_source_window_open: bool,
     /// Channel currently being dragged from the sidebar (Task 12 wires drop).
     pub(crate) dragging: Option<String>,
+    /// Add-source form state (Task 14).
+    pub(crate) add_source_form: crate::ui::data_source::AddSourceForm,
+    /// Which dialog overlay is open, if any (Task 14).
+    pub(crate) active_dialog: Option<super::message::ActiveDialog>,
+    /// Name being typed in the Add Screen dialog.
+    pub(crate) add_screen_name: String,
+    /// Panel type selected in the Add Panel dialog.
+    pub(crate) add_panel_type: Option<String>,
 }
 
 impl DataVisApp {
@@ -146,6 +156,10 @@ impl DataVisApp {
             record_max_bytes,
             data_source_window_open: false,
             dragging: None,
+            add_source_form: crate::ui::data_source::AddSourceForm::default(),
+            active_dialog: None,
+            add_screen_name: String::new(),
+            add_panel_type: None,
         }
     }
 
@@ -207,14 +221,6 @@ impl DataVisApp {
                 self.sidebar_visible = !self.sidebar_visible;
                 Task::none()
             }
-            Message::OpenDataSource => {
-                self.data_source_window_open = true;
-                Task::none()
-            }
-            Message::CloseDataSource => {
-                self.data_source_window_open = false;
-                Task::none()
-            }
 
             // ---------------------------------------------------------------
             // Recording / layout — wired in Task 13.
@@ -261,23 +267,18 @@ impl DataVisApp {
             }
 
             Message::AddPanel => {
-                // Add a placeholder error panel to the active screen.
-                let entry = PanelEntry {
-                    panel_type: "error".into(),
-                    config: {
-                        let mut t = toml::Table::new();
-                        t.insert(
-                            "message".into(),
-                            toml::Value::String("select a panel type".into()),
-                        );
-                        t
-                    },
-                };
-                self.workspace.add_panel(entry, &self.registry, &self.channels);
+                // Open the Add Panel dialog.
+                self.active_dialog = Some(ActiveDialog::AddPanel);
+                if self.add_panel_type.is_none() {
+                    self.add_panel_type =
+                        self.registry.type_names().first().map(|s| s.to_string());
+                }
                 Task::none()
             }
             Message::AddScreen => {
-                self.workspace.add_screen(None, &self.registry, &self.channels);
+                // Open the Add Screen dialog.
+                self.active_dialog = Some(ActiveDialog::AddScreen);
+                self.add_screen_name = String::new();
                 Task::none()
             }
             Message::Panel(pane_id, panel_msg) => {
@@ -318,6 +319,130 @@ impl DataVisApp {
                 }
                 Task::none()
             }
+
+            // ---------------------------------------------------------------
+            // Task 14: data-source modal
+            // ---------------------------------------------------------------
+            Message::OpenDataSource => {
+                self.data_source_window_open = true;
+                self.active_dialog = Some(ActiveDialog::DataSource);
+                Task::none()
+            }
+            Message::CloseDataSource => {
+                self.data_source_window_open = false;
+                self.active_dialog = None;
+                Task::none()
+            }
+            Message::CloseModal => {
+                self.active_dialog = None;
+                Task::none()
+            }
+
+            Message::SourceKindSelected(kind) => {
+                self.add_source_form.kind = kind;
+                Task::none()
+            }
+            Message::SourceField(field, value) => {
+                match field {
+                    SourceField::Endpoint => self.add_source_form.endpoint = value,
+                    SourceField::Schema => self.add_source_form.schema = value,
+                    SourceField::Broker => self.add_source_form.broker = value,
+                    SourceField::ClientId => self.add_source_form.client_id = value,
+                    SourceField::Listen => self.add_source_form.listen = value,
+                    SourceField::BridgeName => self.add_source_form.name = value,
+                    SourceField::Command => self.add_source_form.command = value,
+                    SourceField::Args => self.add_source_form.args = value,
+                }
+                Task::none()
+            }
+            Message::BrowseSchema => {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("Proto schema", &["proto"])
+                    .pick_file()
+                {
+                    self.add_source_form.schema = p.display().to_string();
+                }
+                Task::none()
+            }
+            Message::BrowseCommand => {
+                if let Some(p) = rfd::FileDialog::new().pick_file() {
+                    self.add_source_form.command = p.display().to_string();
+                }
+                Task::none()
+            }
+            Message::StartSource => {
+                match self.add_source_form.to_spec() {
+                    Ok(spec) => match self.manager.add(&spec, true) {
+                        Ok(_) => {
+                            match data_source_ui::persist(&self.layout_path, &self.manager) {
+                                Ok(()) => {
+                                    self.add_source_form.last_error = None;
+                                    self.add_source_form.clear();
+                                }
+                                Err(e) => {
+                                    self.add_source_form.last_error =
+                                        Some(format!("persist error: {e}"));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            self.add_source_form.last_error = Some(e.to_string());
+                        }
+                    },
+                    Err(msg) => {
+                        self.add_source_form.last_error = Some(msg);
+                    }
+                }
+                Task::none()
+            }
+            Message::StopSource(id) => {
+                self.manager.remove(id);
+                match data_source_ui::persist(&self.layout_path, &self.manager) {
+                    Ok(()) => self.add_source_form.last_error = None,
+                    Err(e) => {
+                        self.add_source_form.last_error =
+                            Some(format!("persist error: {e}"));
+                    }
+                }
+                Task::none()
+            }
+
+            // ---------------------------------------------------------------
+            // Task 14: add-screen dialog
+            // ---------------------------------------------------------------
+            Message::AddScreenNameChanged(name) => {
+                self.add_screen_name = name;
+                Task::none()
+            }
+            Message::ConfirmAddScreen => {
+                let name = if self.add_screen_name.trim().is_empty() {
+                    None
+                } else {
+                    Some(self.add_screen_name.trim().to_string())
+                };
+                self.workspace.add_screen(name, &self.registry, &self.channels);
+                self.active_dialog = None;
+                Task::none()
+            }
+
+            // ---------------------------------------------------------------
+            // Task 14: add-panel dialog
+            // ---------------------------------------------------------------
+            Message::AddPanelTypeSelected(type_name) => {
+                self.add_panel_type = Some(type_name);
+                Task::none()
+            }
+            Message::ConfirmAddPanel => {
+                if let Some(type_name) = self.add_panel_type.clone() {
+                    let entry = PanelEntry {
+                        panel_type: type_name,
+                        config: toml::Table::new(),
+                    };
+                    self.workspace.add_panel(entry, &self.registry, &self.channels);
+                }
+                self.active_dialog = None;
+                Task::none()
+            }
         }
     }
 
@@ -346,7 +471,7 @@ impl DataVisApp {
             .padding(4);
 
         // Full layout.
-        if is_replaying {
+        let base: Element<'_, Message> = if is_replaying {
             let (range, pos) = self.replay_time_info();
             let tl = timeline::view(range, pos);
             column![top_bar, content_row, tl, status_bar]
@@ -358,11 +483,95 @@ impl DataVisApp {
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
+        };
+
+        // Wrap in modal overlay if any dialog is open.
+        match &self.active_dialog {
+            Some(ActiveDialog::DataSource) => {
+                let card =
+                    data_source_ui::view(&self.add_source_form, &self.manager);
+                modal::modal(base, card, Message::CloseModal)
+            }
+            Some(ActiveDialog::AddScreen) => {
+                let card = self.add_screen_dialog();
+                modal::modal(base, card, Message::CloseModal)
+            }
+            Some(ActiveDialog::AddPanel) => {
+                let card = self.add_panel_dialog();
+                modal::modal(base, card, Message::CloseModal)
+            }
+            None => base,
         }
     }
 
     pub fn subscription(&self) -> iced::Subscription<Message> {
         iced::time::every(self.desired_interval()).map(|_| Message::Tick)
+    }
+
+    // -----------------------------------------------------------------------
+    // Dialog helpers (Task 14)
+    // -----------------------------------------------------------------------
+
+    fn add_screen_dialog(&self) -> Element<'_, Message> {
+        use iced::widget::{column, container, row, text, text_input};
+        let input = text_input("Screen name…", &self.add_screen_name)
+            .on_input(Message::AddScreenNameChanged);
+        let confirm = button(text("Add")).on_press(Message::ConfirmAddScreen);
+        let cancel = button(text("Cancel")).on_press(Message::CloseModal);
+        let card = column![
+            text("Add Screen").size(18),
+            row![text("Name:"), input].spacing(8),
+            row![confirm, cancel].spacing(8),
+        ]
+        .spacing(12)
+        .padding(20)
+        .width(Length::Fixed(360.0));
+        container(card)
+            .style(|theme: &iced::Theme| {
+                let palette = theme.extended_palette();
+                container::Style {
+                    background: Some(palette.background.base.color.into()),
+                    border: iced::Border {
+                        color: palette.background.strong.color,
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    },
+                    ..container::Style::default()
+                }
+            })
+            .into()
+    }
+
+    fn add_panel_dialog(&self) -> Element<'_, Message> {
+        use iced::widget::{column, container, pick_list, row, text};
+        let type_names: Vec<String> =
+            self.registry.type_names().into_iter().map(|s| s.to_string()).collect();
+        let selected = self.add_panel_type.clone();
+        let picker = pick_list(type_names, selected, Message::AddPanelTypeSelected);
+        let confirm = button(text("Add")).on_press(Message::ConfirmAddPanel);
+        let cancel = button(text("Cancel")).on_press(Message::CloseModal);
+        let card = column![
+            text("Add Panel").size(18),
+            row![text("Type:"), picker].spacing(8),
+            row![confirm, cancel].spacing(8),
+        ]
+        .spacing(12)
+        .padding(20)
+        .width(Length::Fixed(360.0));
+        container(card)
+            .style(|theme: &iced::Theme| {
+                let palette = theme.extended_palette();
+                container::Style {
+                    background: Some(palette.background.base.color.into()),
+                    border: iced::Border {
+                        color: palette.background.strong.color,
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    },
+                    ..container::Style::default()
+                }
+            })
+            .into()
     }
 
     // -----------------------------------------------------------------------
