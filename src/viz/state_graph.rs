@@ -29,6 +29,27 @@ fn color_for(value: i64, dark: bool) -> Color32 {
     p[(value.rem_euclid(p.len() as i64)) as usize]
 }
 
+/// Effective color for a state: an explicit override if set, else the
+/// theme-aware palette default.
+fn effective_color(overrides: &BTreeMap<i64, Color32>, value: i64, dark: bool) -> Color32 {
+    overrides.get(&value).copied().unwrap_or_else(|| color_for(value, dark))
+}
+
+fn color_to_hex(c: Color32) -> String {
+    format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b())
+}
+
+fn hex_to_color(s: &str) -> Option<Color32> {
+    let h = s.trim().strip_prefix('#').unwrap_or(s);
+    if h.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&h[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&h[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&h[4..6], 16).ok()?;
+    Some(Color32::from_rgb(r, g, b))
+}
+
 /// Grafana-style colored bands: one horizontal strip, one colored segment per
 /// contiguous run of equal values.
 pub struct StateGraphPanel {
@@ -49,6 +70,9 @@ pub struct StateGraphPanel {
     /// panel has no drag-zoom of its own — it only follows and freezes.
     /// In-memory only; not serialized.
     zoom: Option<(i64, i64)>,
+    /// Per-state color overrides set by clicking a legend swatch. Values not
+    /// present fall back to the active Catppuccin accent palette. Persisted.
+    state_colors: BTreeMap<i64, Color32>,
 }
 
 pub fn ctor(
@@ -65,6 +89,14 @@ pub fn ctor(
             states.insert(key, v.as_str().unwrap_or_default().to_string());
         }
     }
+    let mut state_colors = BTreeMap::new();
+    if let Some(tbl) = cfg.get("colors").and_then(|v| v.as_table()) {
+        for (k, v) in tbl {
+            if let (Ok(key), Some(color)) = (k.parse::<i64>(), v.as_str().and_then(hex_to_color)) {
+                state_colors.insert(key, color);
+            }
+        }
+    }
     Ok(Box::new(StateGraphPanel {
         bound: bind(&name, reg, ACCEPTED),
         label: opt_label(cfg),
@@ -73,6 +105,7 @@ pub fn ctor(
         text_labels: BTreeMap::new(),
         time_window_s: opt_f64_opt(cfg, "time_window_s"),
         zoom: None,
+        state_colors,
     }))
 }
 
@@ -270,7 +303,7 @@ impl VizPanel for StateGraphPanel {
                 egui::pos2(x_of(s), rect.top()),
                 egui::pos2(x_of(e), rect.bottom()),
             );
-            painter.rect_filled(seg, 0.0, color_for(v, dark));
+            painter.rect_filled(seg, 0.0, effective_color(&self.state_colors, v, dark));
             if seg.width() > 40.0 {
                 painter.text(
                     seg.center(),
@@ -315,14 +348,28 @@ impl VizPanel for StateGraphPanel {
             );
             t += step;
         }
-        // Legend of known states.
+        // Legend of known states. Each swatch is a color-picker button: click
+        // it to override that state's color (persisted); changes are collected
+        // and applied after the closure to avoid borrowing self mutably here.
+        let mut color_changes: Vec<(i64, Color32)> = Vec::new();
         ui.horizontal_wrapped(|ui| {
             for (v, label) in &legend {
-                let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                ui.painter().rect_filled(dot, 2.0, color_for(*v, dark));
+                let mut c = effective_color(&self.state_colors, *v, dark);
+                let resp = egui::color_picker::color_edit_button_srgba(
+                    ui,
+                    &mut c,
+                    egui::color_picker::Alpha::Opaque,
+                )
+                .on_hover_text("Click to change this state's color");
+                if resp.changed() {
+                    color_changes.push((*v, c));
+                }
                 ui.label(label);
             }
         });
+        for (v, c) in color_changes {
+            self.state_colors.insert(v, c);
+        }
     }
 
     fn serialize(&self) -> toml::Table {
@@ -337,6 +384,13 @@ impl VizPanel for StateGraphPanel {
         }
         if let Some(w) = self.time_window_s {
             t.insert("time_window_s".to_string(), toml::Value::Float(w));
+        }
+        if !self.state_colors.is_empty() {
+            let mut tbl = toml::Table::new();
+            for (k, c) in &self.state_colors {
+                tbl.insert(k.to_string(), toml::Value::String(color_to_hex(*c)));
+            }
+            t.insert("colors".to_string(), toml::Value::Table(tbl));
         }
         serialize_label(&mut t, &self.label);
         t
@@ -519,7 +573,41 @@ channel = "demo.enabled""#,
             text_labels: BTreeMap::new(),
             time_window_s: None,
             zoom: None,
+            state_colors: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn hex_color_round_trips() {
+        let c = Color32::from_rgb(0x1e, 0x9c, 0xf3);
+        assert_eq!(hex_to_color(&color_to_hex(c)), Some(c));
+        assert_eq!(hex_to_color("#zzzzzz"), None);
+        assert_eq!(hex_to_color("fff"), None);
+    }
+
+    #[test]
+    fn effective_color_prefers_override() {
+        let mut overrides = BTreeMap::new();
+        let custom = Color32::from_rgb(1, 2, 3);
+        overrides.insert(2, custom);
+        assert_eq!(effective_color(&overrides, 2, true), custom);
+        // Unset state falls back to the palette default (not the override).
+        assert_eq!(effective_color(&overrides, 5, true), color_for(5, true));
+    }
+
+    #[test]
+    fn state_colors_survive_serialize_round_trip() {
+        let reg = ChannelRegistry::from_toml_str("").unwrap();
+        let mut cfg = toml::Table::new();
+        cfg.insert("channel".to_string(), toml::Value::String(String::new()));
+        let mut colors = toml::Table::new();
+        colors.insert("3".to_string(), toml::Value::String("#ff8800".to_string()));
+        cfg.insert("colors".to_string(), toml::Value::Table(colors));
+
+        let panel = ctor(&cfg, &reg).unwrap();
+        let out = panel.serialize();
+        let back = out.get("colors").and_then(|v| v.as_table()).unwrap();
+        assert_eq!(back.get("3").and_then(|v| v.as_str()), Some("#ff8800"));
     }
 
     #[test]
