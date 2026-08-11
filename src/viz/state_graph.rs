@@ -355,12 +355,8 @@ impl VizPanel for StateGraphPanel {
         ui.horizontal_wrapped(|ui| {
             for (v, label) in &legend {
                 let mut c = effective_color(&self.state_colors, *v, dark);
-                let resp = egui::color_picker::color_edit_button_srgba(
-                    ui,
-                    &mut c,
-                    egui::color_picker::Alpha::Opaque,
-                )
-                .on_hover_text("Click to change this state's color");
+                let resp = crate::viz::common::theme_color_button(ui, &mut c)
+                    .on_hover_text("Click to change this state's color");
                 if resp.changed() {
                     color_changes.push((*v, c));
                 }

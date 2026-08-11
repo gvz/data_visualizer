@@ -8,6 +8,80 @@ use crate::dynamic_channel::{resolve_or_register_drop, MqttTopicMap};
 use crate::store::ChannelStore;
 use crate::types::{ChannelId, ChannelSnapshot, Sample, SampleType};
 
+/// The 14 Catppuccin accent colors of the active flavor — Mocha in dark mode,
+/// Latte in light — as `(name, color)` pairs for quick-select swatches.
+fn catppuccin_accents(dark: bool) -> [(&'static str, Color32); 14] {
+    let t = if dark { catppuccin_egui::MOCHA } else { catppuccin_egui::LATTE };
+    [
+        ("Rosewater", t.rosewater),
+        ("Flamingo", t.flamingo),
+        ("Pink", t.pink),
+        ("Mauve", t.mauve),
+        ("Red", t.red),
+        ("Maroon", t.maroon),
+        ("Peach", t.peach),
+        ("Yellow", t.yellow),
+        ("Green", t.green),
+        ("Teal", t.teal),
+        ("Sky", t.sky),
+        ("Sapphire", t.sapphire),
+        ("Blue", t.blue),
+        ("Lavender", t.lavender),
+    ]
+}
+
+/// A color chooser: a swatch button that opens a popup with a row of Catppuccin
+/// quick-select swatches (themed to the active light/dark flavor) above the
+/// standard egui color picker. Use everywhere a color is edited so the palette
+/// is consistently one click away and tracks the app theme.
+///
+/// Returns a [`egui::Response`] whose `changed()` is true when the color moved.
+pub fn theme_color_button(ui: &mut egui::Ui, color: &mut Color32) -> egui::Response {
+    use egui::containers::popup::{popup_below_widget, PopupCloseBehavior};
+
+    let dark = ui.visuals().dark_mode;
+    let size = egui::vec2(ui.spacing().interact_size.y * 1.6, ui.spacing().interact_size.y);
+    let (rect, mut resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        ui.painter().rect_filled(rect, 2.0, *color);
+        ui.painter().rect_stroke(rect, 2.0, ui.visuals().widgets.inactive.fg_stroke);
+    }
+
+    let popup_id = resp.id.with("catppuccin_color_popup");
+    if resp.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(popup_id));
+    }
+
+    let mut changed = false;
+    popup_below_widget(ui, popup_id, &resp, PopupCloseBehavior::CloseOnClickOutside, |ui| {
+        ui.set_min_width(240.0);
+        ui.label(if dark { "Catppuccin Mocha" } else { "Catppuccin Latte" });
+        ui.horizontal_wrapped(|ui| {
+            for (name, c) in catppuccin_accents(dark) {
+                let (r, sw) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
+                ui.painter().rect_filled(r, 2.0, c);
+                if *color == c {
+                    ui.painter()
+                        .rect_stroke(r, 2.0, egui::Stroke::new(1.5, ui.visuals().text_color()));
+                }
+                if sw.on_hover_text(name).clicked() {
+                    *color = c;
+                    changed = true;
+                }
+            }
+        });
+        ui.separator();
+        if egui::color_picker::color_picker_color32(ui, color, egui::color_picker::Alpha::Opaque) {
+            changed = true;
+        }
+    });
+
+    if changed {
+        resp.mark_changed();
+    }
+    resp
+}
+
 /// A panel's link to one channel: resolved id + validity + display metadata.
 pub struct Binding {
     pub name: String,
@@ -236,7 +310,7 @@ impl ColorThresholds {
         for (i, th) in self.thresholds.iter_mut().enumerate() {
             ui.horizontal(|ui| {
                 ui.add(egui::DragValue::new(&mut th.value).speed(0.1));
-                ui.color_edit_button_srgba(&mut th.color);
+                theme_color_button(ui, &mut th.color);
                 if ui.button("\u{2715}").clicked() {
                     remove = Some(i);
                 }
@@ -254,7 +328,7 @@ impl ColorThresholds {
                 self.base_color = enabled.then_some(Color32::GRAY);
             }
             if let Some(c) = &mut self.base_color {
-                ui.color_edit_button_srgba(c);
+                theme_color_button(ui, c);
             }
         });
     }

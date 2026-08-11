@@ -122,7 +122,7 @@ impl StateMap {
                 {
                     e.label = if label.trim().is_empty() { None } else { Some(label) };
                 }
-                ui.color_edit_button_srgba(&mut e.color);
+                crate::viz::common::theme_color_button(ui, &mut e.color);
                 if ui.button("\u{2715}").clicked() {
                     remove = Some(i);
                 }
