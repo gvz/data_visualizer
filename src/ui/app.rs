@@ -19,6 +19,8 @@ use crate::script::config::ScriptInstance;
 use crate::script::{ScriptCommand, SharedMetas, SharedStatus};
 use crate::viz::PanelRegistry;
 
+use crate::script::panel::{ScriptEditState, staged_from_instance};
+
 use super::data_source as data_source_ui;
 use super::message::{ActiveDialog, Message, SourceField};
 use super::modal;
@@ -97,6 +99,8 @@ pub struct DataVisApp {
     pub(crate) add_screen_name: String,
     /// Panel type selected in the Add Panel dialog.
     pub(crate) add_panel_type: Option<String>,
+    /// Task 15: transient editor state for the Scripts dialog.
+    pub(crate) script_edit: ScriptEditState,
 }
 
 impl DataVisApp {
@@ -158,6 +162,7 @@ impl DataVisApp {
             active_dialog: None,
             add_screen_name: String::new(),
             add_panel_type: None,
+            script_edit: ScriptEditState::default(),
         }
     }
 
@@ -439,6 +444,93 @@ impl DataVisApp {
                 self.active_dialog = None;
                 Task::none()
             }
+
+            // ---------------------------------------------------------------
+            // Task 15: scripting control panel
+            // ---------------------------------------------------------------
+            Message::OpenScripts => {
+                self.active_dialog = Some(ActiveDialog::Scripts);
+                Task::none()
+            }
+            Message::ScriptSelect(id) => {
+                // Load the clicked instance into the staged editor.
+                if let Some(inst) = self.script_instances.iter().find(|i| i.id == id) {
+                    let meta_guard = self.script_metas.lock().unwrap();
+                    let meta = meta_guard.get(&inst.script);
+                    let staged = staged_from_instance(inst, meta);
+                    drop(meta_guard);
+                    self.script_edit.selected_id = Some(id);
+                    self.script_edit.staged = staged;
+                    self.script_edit.last_error = None;
+                }
+                Task::none()
+            }
+            Message::ScriptRemove(id) => {
+                self.script_instances.retain(|i| i.id != id);
+                let _ = self.script_commands.send(crate::script::ScriptCommand::Remove(id.clone()));
+                // If we were editing this instance, clear the form.
+                if self.script_edit.selected_id.as_deref() == Some(&id) {
+                    self.script_edit = ScriptEditState::default();
+                }
+                Task::none()
+            }
+            Message::ScriptApply => {
+                let inst = self.script_edit.staged.to_instance();
+                // Upsert into local list.
+                match self.script_instances.iter_mut().find(|i| i.id == inst.id) {
+                    Some(slot) => *slot = inst.clone(),
+                    None => self.script_instances.push(inst.clone()),
+                }
+                // Send command to engine.
+                let _ = self.script_commands.send(crate::script::ScriptCommand::Upsert(inst.clone()));
+                self.script_edit.selected_id = Some(inst.id.clone());
+                self.script_edit.last_error = None;
+                Task::none()
+            }
+            Message::ScriptClearForm => {
+                self.script_edit = ScriptEditState::default();
+                Task::none()
+            }
+            Message::ScriptIdChanged(val) => {
+                self.script_edit.staged.id = val;
+                Task::none()
+            }
+            Message::ScriptScriptChanged(val) => {
+                // When the script changes, resize inputs and prefill outputs.
+                let meta_guard = self.script_metas.lock().unwrap();
+                let meta = meta_guard.get(&val);
+                if let Some(m) = meta {
+                    let id = &self.script_edit.staged.id;
+                    self.script_edit.staged.outputs =
+                        crate::script::panel::default_outputs_pub(id, m);
+                    self.script_edit.staged.inputs.resize(m.inputs.len(), String::new());
+                }
+                drop(meta_guard);
+                self.script_edit.staged.script = val;
+                Task::none()
+            }
+            Message::ScriptInputChanged(slot, val) => {
+                if let Some(s) = self.script_edit.staged.inputs.get_mut(slot) {
+                    *s = val;
+                }
+                Task::none()
+            }
+            Message::ScriptOutputNameChanged(slot, val) => {
+                if let Some(o) = self.script_edit.staged.outputs.get_mut(slot) {
+                    o.name = val;
+                }
+                Task::none()
+            }
+            Message::ScriptOutputTypeChanged(slot, val) => {
+                if let Some(o) = self.script_edit.staged.outputs.get_mut(slot) {
+                    o.ty = val;
+                }
+                Task::none()
+            }
+            Message::ScriptToggleEnabled => {
+                self.script_edit.staged.enabled = !self.script_edit.staged.enabled;
+                Task::none()
+            }
         }
     }
 
@@ -494,6 +586,17 @@ impl DataVisApp {
             }
             Some(ActiveDialog::AddPanel) => {
                 let card = self.add_panel_dialog();
+                modal::modal(base, card, Message::CloseModal)
+            }
+            Some(ActiveDialog::Scripts) => {
+                // Task 15: scripting control panel modal.
+                let card = crate::script::panel::view(
+                    &self.script_instances,
+                    &self.script_status,
+                    &self.script_metas,
+                    &self.script_disabled,
+                    &self.script_edit,
+                );
                 modal::modal(base, card, Message::CloseModal)
             }
             None => base,
@@ -609,6 +712,15 @@ impl DataVisApp {
         let btn_add_screen = button(text("+ Screen"))
             .on_press(Message::AddScreen);
 
+        // Scripts modal button (Task 15).
+        let scripts_open = matches!(self.active_dialog, Some(ActiveDialog::Scripts));
+        let scripts_label = if scripts_open { "Close Scripts" } else { "Scripts" };
+        let btn_scripts = button(text(scripts_label)).on_press(if scripts_open {
+            Message::CloseModal
+        } else {
+            Message::OpenScripts
+        });
+
         // Recording controls.
         let btn_record: Element<'_, Message> = if self.record_handle.is_some() {
             button(text("Stop Recording"))
@@ -642,6 +754,7 @@ impl DataVisApp {
             btn_sidebar,
             btn_add_panel,
             btn_add_screen,
+            btn_scripts,
             btn_record,
             btn_open_rec,
         ]

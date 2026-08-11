@@ -22,12 +22,14 @@ pub enum SourceField {
     Args,
 }
 
-/// Which dialog overlay is currently open (Task 14).
+/// Which dialog overlay is currently open (Task 14 / 15).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActiveDialog {
     DataSource,
     AddScreen,
     AddPanel,
+    /// Task 15: scripting control panel.
+    Scripts,
 }
 
 #[derive(Debug, Clone)]
@@ -107,4 +109,30 @@ pub enum Message {
     AddPanelTypeSelected(String),
     /// Confirm adding a panel of the currently selected type.
     ConfirmAddPanel,
+
+    // -----------------------------------------------------------------------
+    // Task 15: scripting control panel
+    // -----------------------------------------------------------------------
+    /// Open the Scripts modal.
+    OpenScripts,
+    /// User clicked "edit" on an existing script instance.
+    ScriptSelect(String),
+    /// User clicked "remove" on an existing script instance — sends Remove command.
+    ScriptRemove(String),
+    /// Apply the staged instance (Upsert command).
+    ScriptApply,
+    /// Clear the editor form back to "add new" mode.
+    ScriptClearForm,
+    /// Instance ID changed (add-new form only).
+    ScriptIdChanged(String),
+    /// Script name selected in the picker.
+    ScriptScriptChanged(String),
+    /// An input slot's text changed (slot index, new value).
+    ScriptInputChanged(usize, String),
+    /// An output slot's name changed (slot index, new value).
+    ScriptOutputNameChanged(usize, String),
+    /// An output slot's type changed (slot index, new value).
+    ScriptOutputTypeChanged(usize, String),
+    /// Toggle the staged instance's enabled flag.
+    ScriptToggleEnabled,
 }

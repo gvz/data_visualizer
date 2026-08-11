@@ -1,55 +1,31 @@
-use std::collections::HashMap;
+//! Iced scripting control panel.
+//!
+//! Provides [`view`] — a pure function that builds the modal body for the
+//! Scripts dialog — and [`ScriptEditState`], the transient editor state held
+//! by `DataVisApp`.
+//!
+//! The scripting ENGINE (`mod.rs`, `runner.rs`, `python.rs`, `config.rs`) is
+//! reused unchanged. Only the egui drawing from the old panel is replaced here
+//! with iced widgets.
+//!
+//! The panel is feature-agnostic: when `disabled` is `Some(reason)` (which
+//! main.rs sets when the `scripting` feature is off), the panel shows a
+//! prominent notice and nothing else.
 
-use eframe::egui;
+use std::sync::{Arc, Mutex};
+
+use iced::widget::{button, column, container, pick_list, row, scrollable, text, text_input};
+use iced::{Element, Length};
 
 use crate::script::config::{OutputBinding, ScriptInstance};
 use crate::script::runner::ScriptState;
 use crate::script::types::ScriptMeta;
-use crate::script::{ScriptStatus, SharedStatus};
+use crate::script::{ScriptStatus, SharedMetas, SharedStatus};
 use crate::types::SampleType;
 
-/// A committed panel action for the app to forward to the engine / config.
-#[derive(Debug, Clone, PartialEq)]
-pub enum PanelCommand {
-    Upsert(ScriptInstance),
-    Remove(String),
-}
+use crate::ui::message::Message;
 
-/// A row being edited in the panel before Apply commits it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct StagedInstance {
-    pub id: String,
-    pub script: String,
-    pub inputs: Vec<String>,
-    pub outputs: Vec<OutputBinding>,
-    pub enabled: bool,
-}
-
-impl StagedInstance {
-    pub fn to_instance(&self) -> ScriptInstance {
-        ScriptInstance {
-            id: self.id.clone(),
-            script: self.script.clone(),
-            inputs: Some(self.inputs.clone()),
-            outputs: Some(self.outputs.clone()),
-            enabled: self.enabled,
-        }
-    }
-}
-
-/// Panel-persistent editor state: one staged row per instance id, plus the
-/// add-instance form.
-#[derive(Default)]
-pub struct ScriptPanelState {
-    pub staged: HashMap<String, StagedInstance>,
-    pub new_id: String,
-    pub new_script: String,
-    /// Whether the floating settings/editor window is open.
-    pub settings_open: bool,
-    /// When `Some(id)`, the settings window edits only that instance; when
-    /// `None`, it shows every instance plus the add-instance form.
-    pub editing: Option<String>,
-}
+// ── Pure helpers (lifted verbatim from the old egui panel) ───────────────────
 
 /// Case-insensitive subsequence match; ranks tighter match spans first. Empty
 /// query returns every candidate in original order.
@@ -108,6 +84,10 @@ fn type_str(st: SampleType) -> &'static str {
 /// The default output bindings for an instance: the channel name defaults to
 /// `scripts/<id>` (`scripts/<id>_N` when the script declares more than one
 /// output), with types/units taken from the script. Editable afterwards.
+pub fn default_outputs_pub(id: &str, meta: &ScriptMeta) -> Vec<OutputBinding> {
+    default_outputs(id, meta)
+}
+
 fn default_outputs(id: &str, meta: &ScriptMeta) -> Vec<OutputBinding> {
     let n = meta.outputs.len();
     meta.outputs
@@ -125,7 +105,7 @@ fn default_outputs(id: &str, meta: &ScriptMeta) -> Vec<OutputBinding> {
 /// omit `inputs`/`outputs` in config rely on the script's declared defaults —
 /// materialize those from the peeked `meta` (when known) so they are visible
 /// and editable rather than showing as empty.
-fn staged_from_instance(inst: &ScriptInstance, meta: Option<&ScriptMeta>) -> StagedInstance {
+pub fn staged_from_instance(inst: &ScriptInstance, meta: Option<&ScriptMeta>) -> StagedInstance {
     let inputs = inst
         .inputs
         .clone()
@@ -143,386 +123,297 @@ fn staged_from_instance(inst: &ScriptInstance, meta: Option<&ScriptMeta>) -> Sta
     }
 }
 
-/// Ids to render, in order: committed instances first (config order), then any
-/// staged-only rows — instances the user "Add"ed but hasn't applied yet. Those
-/// have no committed counterpart, so without this they would never be drawn and
-/// their Apply button (the only way to commit them) would be unreachable.
-fn render_order(
-    instance_ids: &[String],
-    staged: &HashMap<String, StagedInstance>,
-) -> Vec<String> {
-    let mut ids = instance_ids.to_vec();
-    let mut extra: Vec<String> =
-        staged.keys().filter(|k| !instance_ids.contains(k)).cloned().collect();
-    extra.sort();
-    ids.extend(extra);
-    ids
+// ── Editor state ─────────────────────────────────────────────────────────────
+
+/// A row being edited in the panel before Apply commits it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StagedInstance {
+    pub id: String,
+    pub script: String,
+    pub inputs: Vec<String>,
+    pub outputs: Vec<OutputBinding>,
+    pub enabled: bool,
 }
 
-/// Compact sidebar list: instance names + status plus a button that opens the
-/// settings window. All editing lives in that window (see
-/// [`draw_script_settings`]) so the sidebar stays small.
-pub fn draw_script_panel(
-    ui: &mut egui::Ui,
-    state: &mut ScriptPanelState,
-    instances: &[ScriptInstance],
-    status: &SharedStatus,
-    disabled: &Option<String>,
-) {
-    ui.horizontal(|ui| {
-        ui.heading("Scripts");
-        // Opens the window on the add-instance form.
-        if ui.small_button("＋ add").clicked() {
-            state.editing = None;
-            state.settings_open = true;
+impl Default for StagedInstance {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            script: String::new(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            enabled: true,
         }
-    });
-
-    if let Some(reason) = disabled {
-        ui.colored_label(egui::Color32::from_rgb(0xB0, 0x60, 0x00), reason);
-        return;
-    }
-
-    if instances.is_empty() {
-        ui.small("no instances — click ＋ add to create one");
-        return;
-    }
-
-    let states = status.lock().unwrap().clone();
-    for inst in instances {
-        ui.horizontal(|ui| {
-            // Per-instance gear: opens the window focused on just this instance.
-            if ui.small_button("⚙").on_hover_text("settings").clicked() {
-                state.editing = Some(inst.id.clone());
-                state.settings_open = true;
-            }
-            ui.label(egui::RichText::new(&inst.id).strong());
-            match states.iter().find(|s| s.name == inst.id) {
-                Some(s) => {
-                    ui.small(status_line(s));
-                }
-                None => {
-                    ui.small(if inst.enabled { "  ○ …" } else { "  ⏻ off" });
-                }
-            }
-        });
     }
 }
 
-/// Floating settings window holding the full instance editor (script, inputs,
-/// outputs, enable, add, save). Returns any committed commands. Shown only
-/// while `state.settings_open`.
-pub fn draw_script_settings(
-    ctx: &egui::Context,
-    state: &mut ScriptPanelState,
-    instances: &[ScriptInstance],
-    metas: &HashMap<String, ScriptMeta>,
-    channel_names: &[String],
-    status: &SharedStatus,
-    disabled: &Option<String>,
-) -> Vec<PanelCommand> {
-    let mut cmds = Vec::new();
-    if !state.settings_open {
-        return cmds;
-    }
-    let mut open = state.settings_open;
-    let focus = state.editing.clone();
-    let title = match &focus {
-        Some(id) => format!("Script settings — {id}"),
-        None => "Script settings".to_string(),
-    };
-    egui::Window::new(title)
-        // Stable id so the window keeps its position when the title changes
-        // between the all-instances and single-instance views.
-        .id(egui::Id::new("script_settings_window"))
-        .open(&mut open)
-        .resizable(true)
-        .default_width(460.0)
-        .show(ctx, |ui| {
-            if let Some(reason) = disabled {
-                ui.colored_label(egui::Color32::from_rgb(0xB0, 0x60, 0x00), reason);
-                return;
-            }
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                draw_editor(
-                    ui,
-                    state,
-                    instances,
-                    metas,
-                    channel_names,
-                    status,
-                    focus.as_deref(),
-                    &mut cmds,
-                );
-            });
-        });
-    state.settings_open = open;
-    cmds
-}
-
-/// The instance editor body, rendered inside the settings window. When
-/// `focus` is `Some(id)`, only that instance is shown (no add-instance form).
-fn draw_editor(
-    ui: &mut egui::Ui,
-    state: &mut ScriptPanelState,
-    instances: &[ScriptInstance],
-    metas: &HashMap<String, ScriptMeta>,
-    channel_names: &[String],
-    status: &SharedStatus,
-    focus: Option<&str>,
-    cmds: &mut Vec<PanelCommand>,
-) {
-    let states = status.lock().unwrap().clone();
-
-    // Ensure every committed instance has a staged row, materializing default
-    // inputs/outputs from the script meta so they are visible/editable.
-    for inst in instances {
-        let meta = metas.get(&inst.script);
-        let row = state
-            .staged
-            .entry(inst.id.clone())
-            .or_insert_with(|| staged_from_instance(inst, meta));
-        // The engine peeks metas asynchronously; if it arrived after this row
-        // was first seeded, backfill the defaults the instance relies on.
-        if let Some(meta) = meta {
-            if inst.outputs.is_none() && row.outputs.is_empty() {
-                row.outputs = default_outputs(&inst.id, meta);
-            }
-            if inst.inputs.is_none() && row.inputs.iter().all(|s| s.is_empty()) {
-                row.inputs = meta.inputs.clone();
-            }
-        }
-    }
-
-    // Render committed instances (config order) followed by any staged-only
-    // rows the user just added but hasn't applied yet.
-    let instance_ids: Vec<String> = instances.iter().map(|i| i.id.clone()).collect();
-    let render_ids = render_order(&instance_ids, &state.staged);
-
-    // When focused on one instance, show only it (and note if it's gone).
-    if let Some(f) = focus {
-        if !render_ids.iter().any(|id| id == f) {
-            ui.label("this instance no longer exists");
-        }
-    }
-
-    // Render only the focused instance; the add view (focus = None) shows just
-    // the add-instance form below, not the instance list.
-    for id in &render_ids {
-        if focus != Some(id.as_str()) {
-            continue;
-        }
-        let Some(row) = state.staged.get_mut(id) else { continue };
-
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(&row.id).strong());
-            // Enable/disable takes effect immediately, no Apply needed: a
-            // disable stops the runner (its output channel stops updating); an
-            // enable rebuilds it.
-            if ui.checkbox(&mut row.enabled, "enabled").changed() {
-                cmds.push(PanelCommand::Upsert(row.to_instance()));
-            }
-        });
-
-        // Script selector
-        ui.horizontal(|ui| {
-            ui.label("script:");
-            let script_current = row.script.clone();
-            let mut script_keys: Vec<String> = metas.keys().cloned().collect();
-            script_keys.sort();
-            egui::ComboBox::from_id_source(format!("{id}#script"))
-                .selected_text(&script_current)
-                .show_ui(ui, |ui| {
-                    for key in &script_keys {
-                        if ui.selectable_label(&row.script == key, key).clicked() {
-                            row.script = key.clone();
-                            // Prefill outputs (named after the id) when the
-                            // script changes, and resize inputs to its arity.
-                            if let Some(meta) = metas.get(key) {
-                                row.outputs = default_outputs(id, meta);
-                                row.inputs.resize(meta.inputs.len(), String::new());
-                            }
-                        }
-                    }
-                });
-        });
-
-        // Determine input slot count from meta, fall back to current staged len.
-        let slot_count = metas
-            .get(&row.script)
-            .map(|m| m.inputs.len())
-            .unwrap_or(row.inputs.len());
-        row.inputs.resize(slot_count, String::new());
-
-        // Collect slot-level info before splitting borrows. Label each slot
-        // generically ("input channel", numbered when the script takes more
-        // than one) rather than with the script's declared default channel
-        // name, which read like a value.
-        let slot_labels: Vec<String> = (0..slot_count)
-            .map(|s| {
-                if slot_count == 1 {
-                    "input channel".to_string()
-                } else {
-                    format!("input channel {s}")
-                }
-            })
-            .collect();
-        let slot_keys: Vec<String> = (0..slot_count).map(|s| format!("{id}#{s}")).collect();
-
-        for (slot, (k, label)) in slot_keys.iter().zip(slot_labels.iter()).enumerate() {
-            ui.push_id(k, |ui| {
-                // Type directly into the input field (a ComboBox popup can't hold
-                // a text field — it dismisses itself as you type).
-                ui.horizontal(|ui| {
-                    ui.label(format!("{label}:"));
-                    let row = state.staged.get_mut(id).unwrap();
-                    ui.add(
-                        egui::TextEdit::singleline(&mut row.inputs[slot])
-                            .hint_text("type to search channels")
-                            .desired_width(180.0),
-                    );
-                    if !input_is_valid(&row.inputs[slot], channel_names) {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(0xB0, 0x60, 0x00),
-                            "unknown channel",
-                        );
-                    }
-                });
-
-                // Fuzzy suggestions whenever the field holds a partial/unknown
-                // entry. NOT gated on focus: egui surrenders the text field's
-                // focus on the same frame a suggestion is clicked, so a focus
-                // gate would hide the list before the click could register.
-                let row = state.staged.get_mut(id).unwrap();
-                if !row.inputs[slot].is_empty() && !input_is_valid(&row.inputs[slot], channel_names)
-                {
-                    for name in fuzzy_rank(&row.inputs[slot], channel_names).into_iter().take(8) {
-                        if ui.selectable_label(false, name).clicked() {
-                            row.inputs[slot] = name.clone();
-                        }
-                    }
-                }
-            });
-        }
-
-        // Output rows
-        let row = state.staged.get_mut(id).unwrap();
-        for (oi, out) in row.outputs.iter_mut().enumerate() {
-            ui.horizontal(|ui| {
-                ui.label(format!("out[{oi}] name:"));
-                ui.text_edit_singleline(&mut out.name);
-                ui.label("type:");
-                egui::ComboBox::from_id_source(format!("{id}#out#{oi}#type"))
-                    .selected_text(&out.ty)
-                    .show_ui(ui, |ui| {
-                        for ty in &["float", "int", "bool"] {
-                            if ui.selectable_label(&out.ty == *ty, *ty).clicked() {
-                                out.ty = ty.to_string();
-                            }
-                        }
-                    });
-                ui.label("unit:");
-                ui.text_edit_singleline(&mut out.unit);
-            });
-        }
-
-        // Apply / Remove buttons
-        let row = state.staged.get(id).unwrap();
-        let all_inputs_valid =
-            row.inputs.iter().all(|name| input_is_valid(name, channel_names));
-        // Allow Apply even when there are no input slots (scripts with 0 inputs).
-        let apply_enabled = all_inputs_valid || slot_count == 0;
-
-        ui.horizontal(|ui| {
-            if ui.add_enabled(apply_enabled, egui::Button::new("Apply")).clicked() {
-                let inst = state.staged.get(id).unwrap().to_instance();
-                cmds.push(PanelCommand::Upsert(inst));
-            }
-            if ui.button("Remove").clicked() {
-                cmds.push(PanelCommand::Remove(id.clone()));
-                state.staged.remove(id);
-            }
-        });
-
-        // Status line
-        if let Some(s) = states.iter().find(|s| s.name == *id) {
-            ui.small(status_line(s));
-        }
-    }
-
-    // The add-instance form only appears in the all-instances view.
-    if focus.is_none() {
-        ui.separator();
-        ui.label("Add instance:");
-        ui.horizontal(|ui| {
-            ui.label("id:");
-            ui.text_edit_singleline(&mut state.new_id);
-            ui.label("script:");
-            let mut script_keys: Vec<String> = metas.keys().cloned().collect();
-            script_keys.sort();
-            egui::ComboBox::from_id_source("new_instance#script")
-                .selected_text(if state.new_script.is_empty() {
-                    "<select>".to_string()
-                } else {
-                    state.new_script.clone()
-                })
-                .show_ui(ui, |ui| {
-                    for key in &script_keys {
-                        if ui.selectable_label(&state.new_script == key, key).clicked() {
-                            state.new_script = key.clone();
-                        }
-                    }
-                });
-        });
-
-        let can_add = !state.new_id.is_empty()
-            && !state.new_script.is_empty()
-            && !instance_ids.contains(&state.new_id);
-
-        if ui.add_enabled(can_add, egui::Button::new("Add")).clicked() {
-            let outputs = metas
-                .get(&state.new_script)
-                .map(|m| default_outputs(&state.new_id, m))
-                .unwrap_or_default();
-            let input_count =
-                metas.get(&state.new_script).map(|m| m.inputs.len()).unwrap_or(0);
-            let staged = StagedInstance {
-                id: state.new_id.clone(),
-                script: state.new_script.clone(),
-                inputs: vec![String::new(); input_count],
-                outputs,
-                enabled: true,
-            };
-            let new_id = state.new_id.clone();
-            state.staged.insert(new_id.clone(), staged);
-            // Focus the window on the instance we just created so its inputs and
-            // outputs can be edited straight away.
-            state.editing = Some(new_id);
-            state.new_id.clear();
-            state.new_script.clear();
+impl StagedInstance {
+    pub fn to_instance(&self) -> ScriptInstance {
+        ScriptInstance {
+            id: self.id.clone(),
+            script: self.script.clone(),
+            inputs: Some(self.inputs.clone()),
+            outputs: Some(self.outputs.clone()),
+            enabled: self.enabled,
         }
     }
 }
+
+/// Transient editor state held in `DataVisApp` for the Scripts modal.
+///
+/// Simplification vs old egui panel: the old panel had a `HashMap<id,
+/// StagedInstance>` for every committed instance plus a separate "new" form.
+/// Here we hold a single `staged` for the currently selected/new instance.
+/// This reduces UI complexity at the cost of not preserving unsaved edits for
+/// multiple instances simultaneously — acceptable for the iced port.
+#[derive(Default)]
+pub struct ScriptEditState {
+    /// The instance currently being edited (None = "add new" form).
+    pub selected_id: Option<String>,
+    /// The staged row being edited.
+    pub staged: StagedInstance,
+    /// Input filter query for the fuzzy script picker.
+    pub script_query: String,
+    /// Error message from last Apply (cleared on next Apply).
+    pub last_error: Option<String>,
+}
+
+// ── Status helper (pure) ─────────────────────────────────────────────────────
 
 fn status_line(s: &ScriptStatus) -> String {
     match &s.state {
-        ScriptState::Healthy => "  ● running".to_string(),
-        ScriptState::Waiting(what) => format!("  ○ waiting for {what}"),
-        ScriptState::Failed(msg) => format!("  ✗ {msg}"),
+        ScriptState::Healthy => "running".to_string(),
+        ScriptState::Waiting(what) => format!("waiting for {what}"),
+        ScriptState::Failed(msg) => format!("FAILED: {msg}"),
     }
 }
 
+// ── View ─────────────────────────────────────────────────────────────────────
+
+/// Build the modal body for the Scripts dialog.
+///
+/// * `instances`  — committed instances (from `DataVisApp::script_instances`).
+/// * `status`     — live per-script status from the engine thread.
+/// * `metas`      — peeked script metadata (for auto-filling inputs/outputs).
+/// * `disabled`   — `Some(reason)` when scripting is off; `None` when enabled.
+/// * `state`      — transient editor state held by `DataVisApp`.
+pub fn view<'a>(
+    instances: &'a [ScriptInstance],
+    status: &SharedStatus,
+    metas: &SharedMetas,
+    disabled: &Arc<Mutex<Option<String>>>,
+    state: &'a ScriptEditState,
+) -> Element<'a, Message> {
+    // ── Scripting-disabled notice (only thing shown when feature is off) ──
+    if let Some(reason) = disabled.lock().unwrap().as_ref() {
+        let notice = container(
+            column![
+                text("Scripting not enabled").size(18),
+                text(reason.clone()).size(14),
+            ]
+            .spacing(8),
+        )
+        .padding(20);
+        return card_container(notice.into());
+    }
+
+    let statuses = status.lock().unwrap().clone();
+    let metas_guard = metas.lock().unwrap();
+
+    // ── Instance list ─────────────────────────────────────────────────────
+    let mut instance_rows: Vec<Element<'_, Message>> = Vec::new();
+    instance_rows.push(text("Script Instances").size(16).into());
+
+    if instances.is_empty() {
+        instance_rows.push(text("No instances — use the form below to add one.").size(13).into());
+    } else {
+        for inst in instances {
+            let st = statuses.iter().find(|s| s.name == inst.id);
+            let status_str = match st {
+                Some(s) => status_line(s),
+                None => {
+                    if inst.enabled { "pending…".to_string() } else { "disabled".to_string() }
+                }
+            };
+
+            let is_selected = state.selected_id.as_deref() == Some(&inst.id);
+            let select_btn = if is_selected {
+                button(text("editing")).on_press(Message::ScriptSelect(inst.id.clone()))
+            } else {
+                button(text("edit")).on_press(Message::ScriptSelect(inst.id.clone()))
+            };
+            let remove_btn =
+                button(text("remove")).on_press(Message::ScriptRemove(inst.id.clone()));
+
+            let inst_row = row![
+                text(inst.id.clone()).width(Length::Fixed(120.0)),
+                text(status_str).width(Length::Fill),
+                select_btn,
+                remove_btn,
+            ]
+            .spacing(8)
+            .padding(2);
+            instance_rows.push(inst_row.into());
+        }
+    }
+
+    // ── Editor form ───────────────────────────────────────────────────────
+    let editing_title = if state.selected_id.is_some() { "Edit Instance" } else { "Add Instance" };
+    let mut form_rows: Vec<Element<'_, Message>> = Vec::new();
+    form_rows.push(text(editing_title).size(16).into());
+
+    // ID field (always shown; editable only for new instances)
+    let id_row = if state.selected_id.is_some() {
+        // Editing a committed instance — show id as label text
+        row![
+            text("ID:").width(Length::Fixed(80.0)),
+            text(state.staged.id.clone())
+        ].spacing(8)
+    } else {
+        let id_input = text_input("instance id", &state.staged.id)
+            .on_input(Message::ScriptIdChanged)
+            .width(Length::Fixed(200.0));
+        row![
+            text("ID:").width(Length::Fixed(80.0)),
+            id_input
+        ].spacing(8)
+    };
+    form_rows.push(id_row.into());
+
+    // Script picker (pick_list from discovered metas)
+    let mut script_names: Vec<String> = metas_guard.keys().cloned().collect();
+    script_names.sort();
+    let selected_script =
+        if state.staged.script.is_empty() { None } else { Some(state.staged.script.clone()) };
+    let script_picker =
+        pick_list(script_names, selected_script, Message::ScriptScriptChanged).width(Length::Fixed(200.0));
+    form_rows
+        .push(row![text("Script:").width(Length::Fixed(80.0)), script_picker].spacing(8).into());
+
+    // Input slots
+    if !state.staged.inputs.is_empty() {
+        for (i, inp) in state.staged.inputs.iter().enumerate() {
+            let label = if state.staged.inputs.len() == 1 {
+                "Input:".to_string()
+            } else {
+                format!("Input {i}:")
+            };
+            let input_field = text_input("channel name", inp)
+                .on_input(move |v| Message::ScriptInputChanged(i, v))
+                .width(Length::Fixed(200.0));
+            form_rows.push(
+                row![text(label).width(Length::Fixed(80.0)), input_field].spacing(8).into(),
+            );
+        }
+    }
+
+    // Output rows (simplified: just show name/type/unit as text; no inline editing
+    // to keep the modal compact — full per-slot editor is a future enhancement)
+    if !state.staged.outputs.is_empty() {
+        form_rows.push(text("Outputs:").size(13).into());
+        for (i, out) in state.staged.outputs.iter().enumerate() {
+            let out_name_input = text_input("output name", &out.name)
+                .on_input(move |v| Message::ScriptOutputNameChanged(i, v))
+                .width(Length::Fixed(180.0));
+            let type_options = vec!["float".to_string(), "int".to_string(), "bool".to_string()];
+            let out_type_picker = pick_list(
+                type_options,
+                Some(out.ty.clone()),
+                move |v| Message::ScriptOutputTypeChanged(i, v),
+            )
+            .width(Length::Fixed(80.0));
+            form_rows.push(
+                row![
+                    text(format!("[{i}]")).width(Length::Fixed(30.0)),
+                    out_name_input,
+                    out_type_picker,
+                ]
+                .spacing(6)
+                .into(),
+            );
+        }
+    }
+
+    // Enable checkbox (row with two buttons as substitute — iced 0.14 checkbox)
+    {
+        let enabled_label = if state.staged.enabled { "enabled" } else { "disabled" };
+        let toggle_btn =
+            button(text(enabled_label)).on_press(Message::ScriptToggleEnabled);
+        form_rows.push(row![text("State:").width(Length::Fixed(80.0)), toggle_btn].spacing(8).into());
+    }
+
+    // Error display
+    if let Some(err) = &state.last_error {
+        form_rows.push(text(format!("Error: {err}")).size(12).into());
+    }
+
+    // Apply / Clear buttons
+    let can_apply = !state.staged.id.is_empty() && !state.staged.script.is_empty();
+    let apply_btn = if can_apply {
+        button(text("Apply")).on_press(Message::ScriptApply)
+    } else {
+        button(text("Apply"))
+    };
+    let clear_btn = button(text("New")).on_press(Message::ScriptClearForm);
+    let close_btn = button(text("Close")).on_press(Message::CloseModal);
+    form_rows.push(
+        row![apply_btn, clear_btn, close_btn].spacing(8).into(),
+    );
+
+    // ── Compose ───────────────────────────────────────────────────────────
+    let instances_col = column(instance_rows).spacing(4);
+    let form_col = column(form_rows).spacing(8);
+
+    let body = scrollable(
+        column![
+            instances_col,
+            form_col,
+        ]
+        .spacing(16)
+        .padding(20)
+        .width(Length::Fixed(520.0)),
+    )
+    .height(Length::Fixed(480.0));
+
+    card_container(body.into())
+}
+
+/// Wrap content in a styled card container (same style as other dialogs).
+fn card_container(content: Element<'_, Message>) -> Element<'_, Message> {
+    container(content)
+        .style(|theme: &iced::Theme| {
+            let palette = theme.extended_palette();
+            container::Style {
+                background: Some(palette.background.base.color.into()),
+                border: iced::Border {
+                    color: palette.background.strong.color,
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                ..container::Style::default()
+            }
+        })
+        .into()
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use super::*;
+
+    // ── Pure helper tests (ported verbatim from old egui panel) ──────────
+
+    fn mk_status(st: ScriptState) -> ScriptStatus {
+        ScriptStatus { name: "x".into(), state: st }
+    }
 
     #[test]
     fn status_line_formats_each_state() {
-        let mk = |st| ScriptStatus { name: "x".into(), state: st };
-        assert!(status_line(&mk(ScriptState::Healthy)).contains("running"));
-        assert!(status_line(&mk(ScriptState::Waiting("in.a".into()))).contains("in.a"));
-        assert!(status_line(&mk(ScriptState::Failed("boom".into()))).contains("boom"));
+        assert!(status_line(&mk_status(ScriptState::Healthy)).contains("running"));
+        assert!(status_line(&mk_status(ScriptState::Waiting("in.a".into()))).contains("in.a"));
+        assert!(status_line(&mk_status(ScriptState::Failed("boom".into()))).contains("boom"));
     }
 
     #[test]
@@ -573,20 +464,9 @@ mod tests {
         assert!(!input_is_valid("", &names));
     }
 
-    fn staged(id: &str) -> StagedInstance {
-        StagedInstance {
-            id: id.into(),
-            script: "s".into(),
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-            enabled: true,
-        }
-    }
-
     #[test]
     fn staged_from_instance_materializes_script_defaults() {
         use crate::script::types::OutputSpec;
-        // Committed instance omits inputs and outputs -> relies on script defaults.
         let inst = ScriptInstance {
             id: "rms".into(),
             script: "sine_rms".into(),
@@ -631,31 +511,64 @@ mod tests {
         assert_eq!(staged.outputs[0].name, "explicit");
     }
 
-    #[test]
-    fn render_order_includes_staged_only_added_instance() {
-        // "existing" is a committed instance; "fresh" was just Add-ed and has no
-        // committed counterpart. Both must render, committed first, or the new
-        // row (and its Apply button) would be invisible.
-        let committed = vec!["existing".to_string()];
-        let mut st = HashMap::new();
-        st.insert("existing".to_string(), staged("existing"));
-        st.insert("fresh".to_string(), staged("fresh"));
+    // ── View build tests ─────────────────────────────────────────────────
 
-        let order = render_order(&committed, &st);
-        assert_eq!(order, vec!["existing".to_string(), "fresh".to_string()]);
+    /// Building the Element value (without rendering it) must not panic for
+    /// the disabled/scripting-off path.
+    #[test]
+    fn view_builds_without_panic_when_disabled() {
+        let instances: Vec<ScriptInstance> = vec![];
+        let status: SharedStatus = Arc::new(Mutex::new(vec![]));
+        let metas: SharedMetas = Arc::new(Mutex::new(HashMap::new()));
+        let disabled: Arc<Mutex<Option<String>>> =
+            Arc::new(Mutex::new(Some("scripting feature not enabled".to_string())));
+        let state = ScriptEditState::default();
+
+        // Building the element must not panic.
+        let _el: Element<'_, Message> = view(&instances, &status, &metas, &disabled, &state);
     }
 
+    /// Building the Element value must not panic when scripting is enabled and
+    /// there are some committed instances.
     #[test]
-    fn render_order_no_duplicates_and_committed_first() {
-        let committed = vec!["b".to_string(), "a".to_string()];
-        let mut st = HashMap::new();
-        for id in ["a", "b", "z", "m"] {
-            st.insert(id.to_string(), staged(id));
-        }
-        // Committed keep config order (b, a); staged-only are appended sorted (m, z).
-        assert_eq!(
-            render_order(&committed, &st),
-            vec!["b".to_string(), "a".to_string(), "m".to_string(), "z".to_string()]
-        );
+    fn view_builds_without_panic_when_enabled_with_instances() {
+        let instances = vec![
+            ScriptInstance {
+                id: "inst1".into(),
+                script: "myscript".into(),
+                inputs: Some(vec!["ch/a".into()]),
+                outputs: None,
+                enabled: true,
+            },
+            ScriptInstance {
+                id: "inst2".into(),
+                script: "other".into(),
+                inputs: None,
+                outputs: None,
+                enabled: false,
+            },
+        ];
+        let status: SharedStatus = Arc::new(Mutex::new(vec![ScriptStatus {
+            name: "inst1".into(),
+            state: ScriptState::Healthy,
+        }]));
+        let metas: SharedMetas = Arc::new(Mutex::new({
+            let mut m = HashMap::new();
+            m.insert("myscript".to_string(), ScriptMeta { inputs: vec!["ch/a".into()], outputs: vec![] });
+            m
+        }));
+        let disabled: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let mut state = ScriptEditState::default();
+        state.selected_id = Some("inst1".to_string());
+        state.staged = StagedInstance {
+            id: "inst1".into(),
+            script: "myscript".into(),
+            inputs: vec!["ch/a".into()],
+            outputs: vec![],
+            enabled: true,
+        };
+
+        // Building the element must not panic.
+        let _el: Element<'_, Message> = view(&instances, &status, &metas, &disabled, &state);
     }
 }
