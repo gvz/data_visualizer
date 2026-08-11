@@ -455,7 +455,8 @@ impl DataVisApp {
             Message::ScriptSelect(id) => {
                 // Load the clicked instance into the staged editor.
                 if let Some(inst) = self.script_instances.iter().find(|i| i.id == id) {
-                    let meta_guard = self.script_metas.lock().unwrap();
+                    // Poison-tolerant: a panicked script worker must not crash the UI.
+                    let meta_guard = self.script_metas.lock().unwrap_or_else(|e| e.into_inner());
                     let meta = meta_guard.get(&inst.script);
                     let staged = staged_from_instance(inst, meta);
                     drop(meta_guard);
@@ -497,7 +498,8 @@ impl DataVisApp {
             }
             Message::ScriptScriptChanged(val) => {
                 // When the script changes, resize inputs and prefill outputs.
-                let meta_guard = self.script_metas.lock().unwrap();
+                // Poison-tolerant: a panicked script worker must not crash the UI.
+                let meta_guard = self.script_metas.lock().unwrap_or_else(|e| e.into_inner());
                 let meta = meta_guard.get(&val);
                 if let Some(m) = meta {
                     let id = &self.script_edit.staged.id;

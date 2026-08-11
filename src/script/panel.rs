@@ -172,7 +172,9 @@ pub struct ScriptEditState {
     pub selected_id: Option<String>,
     /// The staged row being edited.
     pub staged: StagedInstance,
-    /// Input filter query for the fuzzy script picker.
+    /// Reserved for a future fuzzy channel/script filter field (wired to
+    /// nothing yet). Kept so the state shape is stable for that follow-up.
+    #[allow(dead_code)]
     pub script_query: String,
     /// Error message from last Apply (cleared on next Apply).
     pub last_error: Option<String>,
@@ -205,7 +207,11 @@ pub fn view<'a>(
     state: &'a ScriptEditState,
 ) -> Element<'a, Message> {
     // ── Scripting-disabled notice (only thing shown when feature is off) ──
-    if let Some(reason) = disabled.lock().unwrap().as_ref() {
+    // Frame-path locks use a poison-tolerant read: if a worker thread panicked
+    // while holding one of these locks, `.unwrap()` would crash the render loop
+    // on the next repaint. `unwrap_or_else(|e| e.into_inner())` recovers the
+    // last good value instead.
+    if let Some(reason) = disabled.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
         let notice = container(
             column![
                 text("Scripting not enabled").size(18),
@@ -217,8 +223,8 @@ pub fn view<'a>(
         return card_container(notice.into());
     }
 
-    let statuses = status.lock().unwrap().clone();
-    let metas_guard = metas.lock().unwrap();
+    let statuses = status.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let metas_guard = metas.lock().unwrap_or_else(|e| e.into_inner());
 
     // ── Instance list ─────────────────────────────────────────────────────
     let mut instance_rows: Vec<Element<'_, Message>> = Vec::new();
@@ -347,7 +353,10 @@ pub fn view<'a>(
         form_rows.push(text(format!("Error: {err}")).size(12).into());
     }
 
-    // Apply / Clear buttons
+    // Apply / Clear buttons. Gate Apply behind a non-empty id AND script so a
+    // blank instance can never be upserted and sent to the engine (mirrors the
+    // old egui panel's `can_add` gate). When disabled we render the button
+    // without `on_press`, which iced draws as inert.
     let can_apply = !state.staged.id.is_empty() && !state.staged.script.is_empty();
     let apply_btn = if can_apply {
         button(text("Apply")).on_press(Message::ScriptApply)
