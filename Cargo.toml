@@ -26,6 +26,7 @@ prost-types = "0.13"
 rumqttc = "0.24"
 boxcar = "0.2.14"
 egui-phosphor = "0.6"
+catppuccin-egui = { version = "5.7", default-features = false, features = ["egui28"] }
 tungstenite = "0.21"
 pyo3 = { version = "0.22", features = ["auto-initialize"], optional = true }
 numpy = { version = "0.22", optional = true }

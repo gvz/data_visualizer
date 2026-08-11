@@ -566,12 +566,12 @@ impl DataVisApp {
                     if self.dark_mode { (icon::SUN, "Light mode") } else { (icon::MOON, "Dark mode") };
                 if ui.button(theme_icon).on_hover_text(theme_hint).clicked() {
                     self.dark_mode = !self.dark_mode;
-                    let visuals = if self.dark_mode {
-                        egui::Visuals::dark()
+                    let theme = if self.dark_mode {
+                        catppuccin_egui::MOCHA
                     } else {
-                        egui::Visuals::light()
+                        catppuccin_egui::LATTE
                     };
-                    ctx.set_visuals(visuals);
+                    catppuccin_egui::set_theme(ctx, theme);
                 }
                 ui.separator();
 

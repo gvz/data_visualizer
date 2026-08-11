@@ -16,17 +16,17 @@ pub const TYPE_NAME: &str = "state_graph";
 
 const ACCEPTED: &[SampleType] = &[SampleType::Bool, SampleType::Int, SampleType::Text];
 
-const PALETTE: &[Color32] = &[
-    Color32::from_rgb(0x4c, 0xaf, 0x50), // green
-    Color32::from_rgb(0x21, 0x96, 0xf3), // blue
-    Color32::from_rgb(0xff, 0x98, 0x00), // orange
-    Color32::from_rgb(0xf4, 0x43, 0x36), // red
-    Color32::from_rgb(0x9c, 0x27, 0xb0), // purple
-    Color32::from_rgb(0x00, 0xbc, 0xd4), // cyan
-];
+/// State colors drawn from the active Catppuccin flavor's accent colors —
+/// Latte in light mode, Mocha in dark — so the state graph stays cohesive with
+/// the app theme and its light/dark toggle. Eight well-separated accents.
+fn palette(dark: bool) -> [Color32; 8] {
+    let t = if dark { catppuccin_egui::MOCHA } else { catppuccin_egui::LATTE };
+    [t.green, t.blue, t.peach, t.red, t.mauve, t.teal, t.yellow, t.pink]
+}
 
-fn color_for(value: i64) -> Color32 {
-    PALETTE[(value.rem_euclid(PALETTE.len() as i64)) as usize]
+fn color_for(value: i64, dark: bool) -> Color32 {
+    let p = palette(dark);
+    p[(value.rem_euclid(p.len() as i64)) as usize]
 }
 
 /// Grafana-style colored bands: one horizontal strip, one colored segment per
@@ -253,10 +253,12 @@ impl VizPanel for StateGraphPanel {
                 .map(|(_, s)| s.clone())
                 .unwrap_or_else(|| v.to_string())
         };
+        let dark = ui.visuals().dark_mode;
+        let bg = if dark { catppuccin_egui::MOCHA.mantle } else { catppuccin_egui::LATTE.mantle };
         let desired = egui::vec2(ui.available_width().max(80.0), 40.0);
         let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
         let painter = ui.painter();
-        painter.rect_filled(rect, 2.0, Color32::from_gray(30));
+        painter.rect_filled(rect, 2.0, bg);
         let x_of = |t: i64| {
             rect.left() + rect.width() * ((t - vt0) as f32 / vspan as f32)
         };
@@ -268,7 +270,7 @@ impl VizPanel for StateGraphPanel {
                 egui::pos2(x_of(s), rect.top()),
                 egui::pos2(x_of(e), rect.bottom()),
             );
-            painter.rect_filled(seg, 0.0, color_for(v));
+            painter.rect_filled(seg, 0.0, color_for(v, dark));
             if seg.width() > 40.0 {
                 painter.text(
                     seg.center(),
@@ -317,7 +319,7 @@ impl VizPanel for StateGraphPanel {
         ui.horizontal_wrapped(|ui| {
             for (v, label) in &legend {
                 let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                ui.painter().rect_filled(dot, 2.0, color_for(*v));
+                ui.painter().rect_filled(dot, 2.0, color_for(*v, dark));
                 ui.label(label);
             }
         });

@@ -196,7 +196,9 @@ fn main() -> anyhow::Result<()> {
         "datavis",
         eframe::NativeOptions { vsync: false, ..Default::default() },
         Box::new(|cc| {
-            cc.egui_ctx.set_visuals(eframe::egui::Visuals::light());
+            // Catppuccin Latte is the light default; the toolbar toggle swaps to
+            // Mocha for dark mode (see DataVisApp::menu_bar).
+            catppuccin_egui::set_theme(&cc.egui_ctx, catppuccin_egui::LATTE);
             let mut fonts = eframe::egui::FontDefinitions::default();
             egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
             cc.egui_ctx.set_fonts(fonts);
