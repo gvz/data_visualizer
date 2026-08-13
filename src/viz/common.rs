@@ -37,6 +37,16 @@ fn catppuccin_accents(dark: bool) -> [(&'static str, Color32); 14] {
 ///
 /// Returns a [`egui::Response`] whose `changed()` is true when the color moved.
 pub fn theme_color_button(ui: &mut egui::Ui, color: &mut Color32) -> egui::Response {
+    theme_color_button_ext(ui, color, |_| {})
+}
+
+/// Like [`theme_color_button`], but renders `extra` at the bottom of the popup,
+/// below the picker — e.g. a state-alias text field.
+pub fn theme_color_button_ext(
+    ui: &mut egui::Ui,
+    color: &mut Color32,
+    extra: impl FnOnce(&mut egui::Ui),
+) -> egui::Response {
     use egui::containers::popup::{popup_below_widget, PopupCloseBehavior};
 
     let dark = ui.visuals().dark_mode;
@@ -74,6 +84,7 @@ pub fn theme_color_button(ui: &mut egui::Ui, color: &mut Color32) -> egui::Respo
         if egui::color_picker::color_picker_color32(ui, color, egui::color_picker::Alpha::Opaque) {
             changed = true;
         }
+        extra(ui);
     });
 
     if changed {

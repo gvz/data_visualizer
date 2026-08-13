@@ -24,15 +24,39 @@ fn palette(dark: bool) -> [Color32; 8] {
     [t.green, t.blue, t.peach, t.red, t.mauve, t.teal, t.yellow, t.pink]
 }
 
-fn color_for(value: i64, dark: bool) -> Color32 {
+/// Default palette color for a state, indexed by its internal CODE. Codes are
+/// assigned append-only (a new state takes the next code and never changes), so
+/// this is distinct for the first `palette-len` states AND never shifts an
+/// existing state's color when a new one appears mid-session.
+fn color_for(code: i64, dark: bool) -> Color32 {
     let p = palette(dark);
-    p[(value.rem_euclid(p.len() as i64)) as usize]
+    p[(code.rem_euclid(p.len() as i64)) as usize]
 }
 
-/// Effective color for a state: an explicit override if set, else the
-/// theme-aware palette default.
-fn effective_color(overrides: &BTreeMap<i64, Color32>, value: i64, dark: bool) -> Color32 {
-    overrides.get(&value).copied().unwrap_or_else(|| color_for(value, dark))
+/// A legible text color (black or white) for a label drawn on top of `bg`,
+/// chosen by the background's perceived luminance so labels stay readable on
+/// both light and dark accent tones.
+fn text_on(bg: Color32) -> Color32 {
+    // Rec. 601 luma, 0..=255. Threshold ~150 favors black on mid/light tones
+    // and white on dark ones.
+    let luma = 0.299 * bg.r() as f32 + 0.587 * bg.g() as f32 + 0.114 * bg.b() as f32;
+    if luma > 150.0 {
+        Color32::BLACK
+    } else {
+        Color32::WHITE
+    }
+}
+
+/// Effective color for a state: an explicit override — keyed by the state's
+/// ACTUAL value so it stays bound across runs — if set, else the code-indexed
+/// palette default.
+fn effective_color(
+    overrides: &BTreeMap<String, Color32>,
+    key: &str,
+    code: i64,
+    dark: bool,
+) -> Color32 {
+    overrides.get(key).copied().unwrap_or_else(|| color_for(code, dark))
 }
 
 fn color_to_hex(c: Color32) -> String {
@@ -70,9 +94,16 @@ pub struct StateGraphPanel {
     /// panel has no drag-zoom of its own — it only follows and freezes.
     /// In-memory only; not serialized.
     zoom: Option<(i64, i64)>,
-    /// Per-state color overrides set by clicking a legend swatch. Values not
-    /// present fall back to the active Catppuccin accent palette. Persisted.
-    state_colors: BTreeMap<i64, Color32>,
+    /// Per-state color overrides set by clicking a legend swatch, keyed by the
+    /// state's ACTUAL value (like `aliases`) so they stay bound to the right
+    /// state across runs even when a Text channel's first-seen order differs.
+    /// Values not present fall back to the active Catppuccin palette. Persisted.
+    state_colors: BTreeMap<String, Color32>,
+    /// Per-state display aliases set from the legend swatch popup, keyed by the
+    /// state's ACTUAL value (the raw string for a Text channel, the number
+    /// otherwise) so config reads e.g. `IDLE = "System Idle"`. When present, the
+    /// alias replaces the state's label everywhere (segments + legend). Persisted.
+    aliases: BTreeMap<String, String>,
 }
 
 pub fn ctor(
@@ -89,11 +120,19 @@ pub fn ctor(
             states.insert(key, v.as_str().unwrap_or_default().to_string());
         }
     }
-    let mut state_colors = BTreeMap::new();
+    let mut state_colors: BTreeMap<String, Color32> = BTreeMap::new();
     if let Some(tbl) = cfg.get("colors").and_then(|v| v.as_table()) {
         for (k, v) in tbl {
-            if let (Ok(key), Some(color)) = (k.parse::<i64>(), v.as_str().and_then(hex_to_color)) {
-                state_colors.insert(key, color);
+            if let Some(color) = v.as_str().and_then(hex_to_color) {
+                state_colors.insert(k.clone(), color);
+            }
+        }
+    }
+    let mut aliases: BTreeMap<String, String> = BTreeMap::new();
+    if let Some(tbl) = cfg.get("aliases").and_then(|v| v.as_table()) {
+        for (k, v) in tbl {
+            if let Some(a) = v.as_str().filter(|a| !a.is_empty()) {
+                aliases.insert(k.clone(), a.to_string());
             }
         }
     }
@@ -106,6 +145,7 @@ pub fn ctor(
         time_window_s: opt_f64_opt(cfg, "time_window_s"),
         zoom: None,
         state_colors,
+        aliases,
     }))
 }
 
@@ -279,15 +319,34 @@ impl VizPanel for StateGraphPanel {
         } else {
             self.states.iter().map(|(k, v)| (*k, v.clone())).collect()
         };
+        // Aliases and colors key on the state's ACTUAL value, not the internal
+        // code — mirroring the legend source priority: the discovered coded-text
+        // label, then an interned `Text` string, then the numeric value. This
+        // keeps overrides bound to the right state across runs even when the
+        // code assignment (first-seen order) differs.
+        let text_labels = &self.text_labels;
+        let value_key = |v: i64| -> String {
+            if let Some(lbls) = &coded {
+                lbls.get(v as usize).cloned().unwrap_or_else(|| v.to_string())
+            } else if text_mode {
+                text_labels.get(&v).cloned().unwrap_or_else(|| v.to_string())
+            } else {
+                v.to_string()
+            }
+        };
+        let dark = ui.visuals().dark_mode;
+        let bg = if dark { catppuccin_egui::MOCHA.mantle } else { catppuccin_egui::LATTE.mantle };
+        let aliases = &self.aliases;
         let label_for = |v: i64| -> String {
+            if let Some(a) = aliases.get(&value_key(v)).filter(|a| !a.is_empty()) {
+                return a.clone();
+            }
             legend
                 .iter()
                 .find(|(code, _)| *code == v)
                 .map(|(_, s)| s.clone())
                 .unwrap_or_else(|| v.to_string())
         };
-        let dark = ui.visuals().dark_mode;
-        let bg = if dark { catppuccin_egui::MOCHA.mantle } else { catppuccin_egui::LATTE.mantle };
         let desired = egui::vec2(ui.available_width().max(80.0), 40.0);
         let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
         let painter = ui.painter();
@@ -303,14 +362,15 @@ impl VizPanel for StateGraphPanel {
                 egui::pos2(x_of(s), rect.top()),
                 egui::pos2(x_of(e), rect.bottom()),
             );
-            painter.rect_filled(seg, 0.0, effective_color(&self.state_colors, v, dark));
+            let fill = effective_color(&self.state_colors, &value_key(v), v, dark);
+            painter.rect_filled(seg, 0.0, fill);
             if seg.width() > 40.0 {
                 painter.text(
                     seg.center(),
                     Align2::CENTER_CENTER,
                     label_for(v),
                     FontId::proportional(12.0),
-                    Color32::BLACK,
+                    text_on(fill),
                 );
             }
         }
@@ -348,23 +408,45 @@ impl VizPanel for StateGraphPanel {
             );
             t += step;
         }
-        // Legend of known states. Each swatch is a color-picker button: click
-        // it to override that state's color (persisted); changes are collected
-        // and applied after the closure to avoid borrowing self mutably here.
-        let mut color_changes: Vec<(i64, Color32)> = Vec::new();
+        // Legend of known states. Each swatch opens a picker popup with an
+        // alias text field; both color and alias overrides are collected and
+        // applied after the closure to avoid borrowing self mutably here.
+        let mut color_changes: Vec<(String, Color32)> = Vec::new();
+        let mut alias_changes: Vec<(String, String)> = Vec::new();
         ui.horizontal_wrapped(|ui| {
-            for (v, label) in &legend {
-                let mut c = effective_color(&self.state_colors, *v, dark);
-                let resp = crate::viz::common::theme_color_button(ui, &mut c)
-                    .on_hover_text("Click to change this state's color");
+            for (v, _) in &legend {
+                let key = value_key(*v);
+                let mut c = effective_color(&self.state_colors, &key, *v, dark);
+                let orig_alias = self.aliases.get(&key).cloned().unwrap_or_default();
+                let mut alias = orig_alias.clone();
+                let resp = crate::viz::common::theme_color_button_ext(ui, &mut c, |ui| {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("Alias:");
+                        ui.text_edit_singleline(&mut alias)
+                            .on_hover_text("Replaces this state's label everywhere");
+                    });
+                })
+                .on_hover_text("Click to change this state's color or alias");
                 if resp.changed() {
-                    color_changes.push((*v, c));
+                    color_changes.push((key.clone(), c));
                 }
-                ui.label(label);
+                if alias != orig_alias {
+                    alias_changes.push((key, alias));
+                }
+                ui.label(label_for(*v));
             }
         });
-        for (v, c) in color_changes {
-            self.state_colors.insert(v, c);
+        for (key, c) in color_changes {
+            self.state_colors.insert(key, c);
+        }
+        for (key, a) in alias_changes {
+            let a = a.trim().to_string();
+            if a.is_empty() {
+                self.aliases.remove(&key);
+            } else {
+                self.aliases.insert(key, a);
+            }
         }
     }
 
@@ -384,9 +466,16 @@ impl VizPanel for StateGraphPanel {
         if !self.state_colors.is_empty() {
             let mut tbl = toml::Table::new();
             for (k, c) in &self.state_colors {
-                tbl.insert(k.to_string(), toml::Value::String(color_to_hex(*c)));
+                tbl.insert(k.clone(), toml::Value::String(color_to_hex(*c)));
             }
             t.insert("colors".to_string(), toml::Value::Table(tbl));
+        }
+        if !self.aliases.is_empty() {
+            let mut tbl = toml::Table::new();
+            for (k, a) in &self.aliases {
+                tbl.insert(k.clone(), toml::Value::String(a.clone()));
+            }
+            t.insert("aliases".to_string(), toml::Value::Table(tbl));
         }
         serialize_label(&mut t, &self.label);
         t
@@ -570,6 +659,7 @@ channel = "demo.enabled""#,
             time_window_s: None,
             zoom: None,
             state_colors: BTreeMap::new(),
+            aliases: BTreeMap::new(),
         }
     }
 
@@ -583,12 +673,42 @@ channel = "demo.enabled""#,
 
     #[test]
     fn effective_color_prefers_override() {
-        let mut overrides = BTreeMap::new();
+        let mut overrides: BTreeMap<String, Color32> = BTreeMap::new();
         let custom = Color32::from_rgb(1, 2, 3);
-        overrides.insert(2, custom);
-        assert_eq!(effective_color(&overrides, 2, true), custom);
-        // Unset state falls back to the palette default (not the override).
-        assert_eq!(effective_color(&overrides, 5, true), color_for(5, true));
+        overrides.insert("RUN".to_string(), custom);
+        // Override wins regardless of the code.
+        assert_eq!(effective_color(&overrides, "RUN", 2, true), custom);
+        // Unset state falls back to the code-indexed palette default.
+        assert_eq!(effective_color(&overrides, "IDLE", 5, true), color_for(5, true));
+    }
+
+    #[test]
+    fn text_on_picks_readable_contrast() {
+        assert_eq!(text_on(Color32::WHITE), Color32::BLACK);
+        assert_eq!(text_on(Color32::BLACK), Color32::WHITE);
+        // Mocha accents are bright pastels → black stays readable.
+        assert_eq!(text_on(catppuccin_egui::MOCHA.red), Color32::BLACK);
+        assert_eq!(text_on(catppuccin_egui::MOCHA.blue), Color32::BLACK);
+        // The genuinely-dark Latte accents (blue/red/mauve) flip to white —
+        // this is the case the user hit: black was unreadable on them.
+        assert_eq!(text_on(catppuccin_egui::LATTE.blue), Color32::WHITE);
+        assert_eq!(text_on(catppuccin_egui::LATTE.red), Color32::WHITE);
+        assert_eq!(text_on(catppuccin_egui::LATTE.mauve), Color32::WHITE);
+    }
+
+    #[test]
+    fn default_colors_are_distinct_and_shift_free() {
+        // The first palette-len codes get distinct colors (few states never
+        // collide), and each code's color is independent of how many states
+        // exist — appending a new state cannot change an existing one's color.
+        let p = palette(true);
+        for i in 0..p.len() as i64 {
+            assert_eq!(color_for(i, true), p[i as usize]);
+        }
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..p.len() as i64 {
+            assert!(seen.insert(color_for(i, true)), "codes 0..len are distinct");
+        }
     }
 
     #[test]
@@ -604,6 +724,26 @@ channel = "demo.enabled""#,
         let out = panel.serialize();
         let back = out.get("colors").and_then(|v| v.as_table()).unwrap();
         assert_eq!(back.get("3").and_then(|v| v.as_str()), Some("#ff8800"));
+    }
+
+    #[test]
+    fn state_aliases_survive_serialize_round_trip() {
+        let reg = ChannelRegistry::from_toml_str("").unwrap();
+        let mut cfg = toml::Table::new();
+        cfg.insert("channel".to_string(), toml::Value::String(String::new()));
+        let mut aliases = toml::Table::new();
+        // Keyed by the actual value: the raw string for a Text channel, or the
+        // number for a numeric one.
+        aliases.insert("idle".to_string(), toml::Value::String("System Idle".to_string()));
+        aliases.insert("0".to_string(), toml::Value::String("Off".to_string()));
+        aliases.insert("run".to_string(), toml::Value::String(String::new())); // dropped: empty
+        cfg.insert("aliases".to_string(), toml::Value::Table(aliases));
+
+        let out = ctor(&cfg, &reg).unwrap().serialize();
+        let back = out.get("aliases").and_then(|v| v.as_table()).unwrap();
+        assert_eq!(back.get("idle").and_then(|v| v.as_str()), Some("System Idle"));
+        assert_eq!(back.get("0").and_then(|v| v.as_str()), Some("Off"));
+        assert!(back.get("run").is_none(), "empty aliases are not stored");
     }
 
     #[test]
