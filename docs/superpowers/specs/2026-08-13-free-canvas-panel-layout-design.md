@@ -28,6 +28,7 @@ type (`VizPanel`) untouched.
 | Coordinate space | Normalized `0..1` of the canvas (panels scale with the window) |
 | Overlap | Impossible — collisions **block at contact** |
 | Collision resolution | Axis-independent clamp; moving/growing edge stops flush at nearest neighbor and at canvas bounds |
+| Snapping | While dragging/resizing, edges snap to align with neighbor (and canvas) edges, and size snaps to match a neighbor's width/height, within a pixel threshold |
 | Rendering | Custom themed frames placed by `allocate_ui_at_rect` (no `egui::Area`, no z-order) |
 | Target codebase | egui app on `theme/catppuccin` |
 
@@ -87,9 +88,9 @@ resize needs no migration — panels simply re-project onto the new canvas.
 ### Modules
 
 - **`src/canvas.rs`** (new): placement math, collision helpers, per-frame
-  rendering + input for a screen. Pure helpers (`resolve_move`,
-  `resolve_resize`, `auto_arrange`, `to_pixels`, `px_delta_to_norm`) are
-  unit-testable without egui.
+  rendering + input for a screen. Pure helpers (`snap_move`, `snap_resize`,
+  `resolve_move`, `resolve_resize`, `auto_arrange`, `to_pixels`,
+  `px_delta_to_norm`) are unit-testable without egui.
 - **`src/workspace.rs`** (trimmed): keeps `Workspace`, `ScreenState`,
   `PanelSlot`, add/delete/screen management, persistence glue, and the
   workspace-level settings window. `Workspace::ui` calls `canvas::show(...)`
@@ -119,36 +120,64 @@ each frame:
      `panel.render`, so the panel's own widgets (drag-values, plot zoom)
      register afterward and sit on top within the body — the same z-order
      lesson as the old `pane_ui`.
-4. Drag delta on the title bar → `resolve_move`; drag delta on the grip →
-   `resolve_resize`. The returned `NormRect` (already legal) is written
-   back to `layout[i].rect`.
+4. Drag on the title bar or grip produces a *desired* rect, which flows
+   through the **snap → block** pipeline (below); the resulting legal
+   `NormRect` is written back to `layout[i].rect`. While a drag/resize is
+   active, the matched snap guides are drawn as thin theme-accent lines
+   across the canvas so the alignment is visible.
 
 All frame chrome is custom-drawn with Catppuccin theme colors — the visual
 control that motivated this work.
 
-### Collision — block at contact
+### The snap → block pipeline
 
-Two pure helpers filter every proposed geometry so an overlapping state is
-unreachable:
+Four pure helpers process every gesture. Order matters: build the desired
+rect from the drag delta, **snap** it toward nearby guides, then **block**
+it out of any overlap. Snap is a soft attractor; block is the hard wall.
 
 ```rust
-fn resolve_move(me: NormRect, delta: Vec2, others: &[NormRect]) -> NormRect;
-fn resolve_resize(me: NormRect, grip_delta: Vec2, others: &[NormRect]) -> NormRect;
+fn snap_move(desired: NormRect, others: &[NormRect], snap: Vec2) -> NormRect;
+fn snap_resize(desired: NormRect, others: &[NormRect], snap: Vec2) -> NormRect;
+fn resolve_move(prev: NormRect, desired: NormRect, others: &[NormRect]) -> NormRect;
+fn resolve_resize(prev: NormRect, desired: NormRect, others: &[NormRect]) -> NormRect;
 ```
 
-Both resolve **axis-independently** (X, then Y):
+`others` excludes the panel being manipulated. Bounds `[0,1]` are baked
+into every clamp, so no separate `bounds` argument is needed. `snap` is the
+per-axis threshold in normalized units: a fixed `SNAP_PX` (~8 px) divided by
+the canvas width/height each frame, so the pull feels constant at any window
+size.
 
-- **Move, X axis:** propose `fx' = fx + delta.x`. Among `others` that
-  overlap `me` on the Y span, find the tightest bound: neighbors to the
-  right cap `fx' + fw`; neighbors to the left cap `fx'`. Clamp `fx'` to that
-  bound and to `[0, 1 - fw]`. Repeat for Y. Axis independence yields natural
-  "slide along the wall" when a drag pushes past a neighbor.
-- **Resize** (bottom-right grip): propose `fw' = fw + delta.x`. Among
-  `others` overlapping on Y, cap the right edge `fx + fw'` at the nearest
-  neighbor's left edge. Clamp to `[MIN, 1 - fx]`. Repeat for height.
+**Guides** are derived once per gesture from `others` plus the canvas frame:
+- *Vertical* (for X): `{0, 1}` ∪ each other's `fx` and `fx + fw`.
+- *Horizontal* (for Y): `{0, 1}` ∪ each other's `fy` and `fy + fh`.
+- *Size*: the set of neighbor widths `fw` and heights `fh`.
 
-`others` excludes the panel being moved. Bounds `[0,1]` come baked into the
-clamps, so no separate `bounds` argument is needed.
+**`snap_move`** (rect keeps its size): for X, consider aligning either the
+left edge `fx` or the right edge `fx + fw` to any vertical guide; take the
+smallest correction `|Δ| ≤ snap.x` and apply it to `fx`. Repeat for Y with
+the horizontal guides. This makes flush, aligned placement effortless —
+edges click to neighbor edges and to the canvas border.
+
+**`snap_resize`** (bottom-right grip moves the right/bottom edges): snap the
+right edge `fx + fw` to a vertical guide, and independently snap the width
+`fw` to a neighbor width (size-match); apply whichever correction is smaller
+and `≤ snap.x`. Repeat for the bottom edge / height with `snap.y`.
+
+**`resolve_move` / `resolve_resize`** then guarantee no overlap,
+**axis-independently** (X, then Y):
+- *Move, X:* if `desired`'s X-span overlaps a neighbor whose Y-span it also
+  overlaps, clamp `fx` flush against that neighbor on the side it came from
+  (sign of `desired.fx − prev.fx`); clamp to `[0, 1 − fw]`. Repeat for Y.
+  Axis independence yields natural "slide along the wall" past a neighbor.
+- *Resize, X:* cap the right edge at the nearest neighbor's left edge (for
+  neighbors overlapping on Y); clamp `fw` to `[MIN, 1 − fx]`. Repeat for
+  height.
+
+Because snapping aligns edges to exactly the block boundary (a right edge
+meeting a neighbor's left edge is flush, not overlapping), the two stages
+reinforce each other: snap lands the panel flush, block guarantees it never
+crosses.
 
 ---
 
@@ -239,10 +268,18 @@ channels = ["load/ch0", "load/ch1"]
 
 Pure helpers keep most coverage at the unit level (no egui):
 
+- **`snap_move`:** a left/right edge within `snap` of a neighbor or canvas
+  edge snaps flush; nothing snaps beyond the threshold; the nearest of
+  several candidates wins.
+- **`snap_resize`:** the right/bottom edge snaps to a neighbor edge, and
+  width/height snaps to match a neighbor's dimension, within `snap`; nothing
+  snaps beyond it.
 - **`resolve_move`:** stops flush at a neighbor; slides along the
   perpendicular axis when dragged past; clamps to `[0,1]` bounds.
 - **`resolve_resize`:** growth blocked at a neighbor edge; enforces `MIN`
   size; clamped to bounds.
+- **Pipeline:** snap-then-block on a gesture aimed into a neighbor lands the
+  panel flush and non-overlapping.
 - **`auto_arrange(n)`:** returns `n` rects, all in-bounds, pairwise
   non-overlapping.
 - **Persistence:** `frame` round-trips through `to_config`/`from_config`;
@@ -258,8 +295,8 @@ Pure helpers keep most coverage at the unit level (no egui):
 
 - `docs/book/src/configuration/layout.md`: replace the `tiles_json` section
   with `frame = [x, y, w, h]` (normalized `0..1`) per panel; document
-  drag-to-move, grip-resize, block-on-contact, and the toolbar / right-click
-  add.
+  drag-to-move, grip-resize, block-on-contact, edge/size snapping, and the
+  toolbar / right-click add.
 - `docs/book/src/panels.md`: drop the split instructions; note free
   placement.
 
@@ -267,7 +304,7 @@ Pure helpers keep most coverage at the unit level (no egui):
 
 | File | Responsibility |
 |---|---|
-| `src/canvas.rs` (new) | Norm↔pixel mapping, `resolve_move`/`resolve_resize`, `auto_arrange`, per-frame render + input for a screen |
+| `src/canvas.rs` (new) | Norm↔pixel mapping, `snap_move`/`snap_resize`, `resolve_move`/`resolve_resize`, `auto_arrange`, per-frame render + input (incl. snap-guide lines) for a screen |
 | `src/workspace.rs` (edit) | `Workspace`/`ScreenState`/`PanelSlot`, add/delete/screen mgmt, persistence glue, settings window; delegates drawing to `canvas` |
 | `src/config/layout.rs` (edit) | `PanelEntry.frame`; remove `ScreenConfig.tiles_json` |
 | `Cargo.toml` (edit) | Remove `egui_tiles` |
