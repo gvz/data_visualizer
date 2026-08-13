@@ -38,7 +38,7 @@ manage it.
 One table per panel, in tile order. Common keys:
 
 - `type` — the panel type (`waveform`, `gauge`, `state_graph`, `status`,
-  `spectrum`, `numeric`, `xy`, `log`). See [Panel Types](../panels.md).
+  `spectrum`, `numeric`, `xy_scatter`, `log`). See [Panel Types](../panels.md).
 - `channels` — a list of channel names, for multi-channel panels (waveform, FFT).
 - `channel` — a single channel name, for single-channel panels (gauge, status,
   state graph).

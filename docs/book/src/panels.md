@@ -13,13 +13,14 @@ error — it never crashes.
 | `spectrum` | float, int | FFT spectrum (via `rustfft`), configurable window function; warns on non-uniform timestamps |
 | `numeric` | float, int, bool | A large single-value readout with a unit label |
 | `gauge` | float, int | Arc / bar gauge with a configurable min/max |
-| `xy` | float, int | Two channels as X/Y (index-aligned), Lissajous-style |
-| `state_graph` | bool, int | Grafana-style coloured bands over time |
+| `xy_scatter` | float, int | Two channels as X/Y (index-aligned), Lissajous-style |
+| `state_graph` | bool, int, text | Grafana-style coloured bands over time |
 | `status` | text, int, bool | A single current-value state indicator (see below) |
 | `log` | text | Scrolling, filterable timestamped log |
 
 Single-channel panels (gauge, numeric, status, state graph) take a `channel`
-key; multi-channel panels (waveform, spectrum, xy) take a `channels` list. See
+key; multi-channel panels (waveform, spectrum) take a `channels` list; the
+`xy_scatter` panel takes separate `x_channel` and `y_channel` keys. See
 [Panels & Layout](configuration/layout.md).
 
 ## Waveform
