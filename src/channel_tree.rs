@@ -234,23 +234,32 @@ impl ChannelTree {
                 let id = egui::Id::new(("ch_leaf_drag", full_name.as_str()));
                 let resp = ui
                     .dnd_drag_source(id, payload, |ui| {
-                        let mut frame = egui::Frame::none()
-                            .inner_margin(egui::Margin::symmetric(2.0, 0.0));
-                        if is_sel {
-                            frame = frame.fill(egui::Color32::from_rgb(45, 70, 120));
-                        }
-                        frame.show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(label);
-                                if let Some(v) = value {
-                                    let display = if v.chars().count() > 10 {
-                                        let s: String = v.chars().take(10).collect();
-                                        format!("{}…", s)
-                                    } else {
-                                        v.clone()
-                                    };
-                                    ui.label(egui::RichText::new(display).small().weak());
-                                }
+                        // Pin the drag body to a stable, unique id. While a leaf
+                        // is being dragged, egui re-renders this closure in a
+                        // Tooltip layer; without a stable id the Frame's child-ui
+                        // takes an auto-generated (counter-based) id that then
+                        // gets registered under two layer_ids in the same frame,
+                        // panicking with "Widget changed layer_id during the
+                        // frame" (egui 0.28). Keying on full_name avoids that.
+                        ui.push_id(full_name.as_str(), |ui| {
+                            let mut frame = egui::Frame::none()
+                                .inner_margin(egui::Margin::symmetric(2.0, 0.0));
+                            if is_sel {
+                                frame = frame.fill(egui::Color32::from_rgb(45, 70, 120));
+                            }
+                            frame.show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(label);
+                                    if let Some(v) = value {
+                                        let display = if v.chars().count() > 10 {
+                                            let s: String = v.chars().take(10).collect();
+                                            format!("{}…", s)
+                                        } else {
+                                            v.clone()
+                                        };
+                                        ui.label(egui::RichText::new(display).small().weak());
+                                    }
+                                });
                             });
                         });
                     })
