@@ -142,6 +142,7 @@
 //! | [`script::ScriptEngine`] | `script` | Runs numba-compiled user scripts as a data source |
 
 pub mod app;
+pub mod canvas;
 pub mod channel_tree;
 pub mod config;
 pub mod data_source_window;
