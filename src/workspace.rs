@@ -183,7 +183,7 @@ impl ScreenState {
         let Some(slot) = self.panels.get_mut(idx) else {
             return;
         };
-        let entry = PanelEntry { panel_type: type_name.to_string(), config: toml::Table::new() };
+        let entry = PanelEntry { panel_type: type_name.to_string(), frame: None, config: toml::Table::new() };
         let panel = reg.build(&entry, channels).unwrap_or_else(|e| {
             Box::new(ErrorPanel {
                 title: format!("{type_name} (unconfigured)"),
@@ -268,6 +268,7 @@ impl Workspace {
                 let slot = &st.panels[*old_idx];
                 entries.push(PanelEntry {
                     panel_type: slot.type_name.clone(),
+                    frame: None,
                     config: slot.panel.serialize(),
                 });
             }
@@ -777,6 +778,7 @@ setting = 42
         assert_eq!(pane_count(&ws.screens["fresh"]), 0);
         let entry = PanelEntry {
             panel_type: "numeric".into(),
+            frame: None,
             config: toml::from_str(r#"channel = "demo.sine""#).unwrap(),
         };
         ws.add_panel(&entry, &reg, &ch).unwrap();
@@ -784,7 +786,7 @@ setting = 42
         assert_eq!(pane_count(&ws.screens["fresh"]), 2);
         assert_eq!(ws.screens["fresh"].panels.len(), 2);
         // Unknown type creates an ErrorPanel so the user sees it inline.
-        let bad = PanelEntry { panel_type: "hologram".into(), config: toml::Table::new() };
+        let bad = PanelEntry { panel_type: "hologram".into(), frame: None, config: toml::Table::new() };
         ws.add_panel(&bad, &reg, &ch).unwrap();
         assert_eq!(pane_count(&ws.screens["fresh"]), 3);
         assert_eq!(ws.screens["fresh"].panels.len(), 3);

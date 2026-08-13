@@ -44,6 +44,11 @@ pub struct ScreenConfig {
 pub struct PanelEntry {
     #[serde(rename = "type")]
     pub panel_type: String,
+    /// Normalized canvas geometry `[fx, fy, fw, fh]`, each `0..1`. Absent on
+    /// hand-written configs and pre-canvas layouts; the workspace auto-arranges
+    /// panels that lack it. A named field so it never enters `config`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<[f32; 4]>,
     #[serde(flatten)]
     pub config: toml::Table,
 }
@@ -226,5 +231,35 @@ channel = "volt.l1"
         assert_eq!(l.screens["empty"].tiles_json, None);
         let out = l.to_toml_string().unwrap();
         assert!(!out.contains("tiles_json"));
+    }
+
+    #[test]
+    fn frame_round_trips_and_is_separate_from_config() {
+        let src = r#"
+[[screens.main.panels]]
+type = "numeric"
+frame = [0.0, 0.25, 0.5, 0.5]
+channel = "demo.sine"
+"#;
+        let l = LayoutConfig::from_toml_str(src).unwrap();
+        let p = &l.screens["main"].panels[0];
+        assert_eq!(p.frame, Some([0.0, 0.25, 0.5, 0.5]));
+        // `frame` must NOT leak into the panel's own config table.
+        assert!(!p.config.contains_key("frame"));
+        assert_eq!(p.config["channel"], toml::Value::String("demo.sine".into()));
+        // Round-trips through serialization.
+        let l2 = LayoutConfig::from_toml_str(&l.to_toml_string().unwrap()).unwrap();
+        assert_eq!(l, l2);
+    }
+
+    #[test]
+    fn frame_absent_is_none() {
+        let src = r#"
+[[screens.main.panels]]
+type = "numeric"
+channel = "demo.sine"
+"#;
+        let l = LayoutConfig::from_toml_str(src).unwrap();
+        assert_eq!(l.screens["main"].panels[0].frame, None);
     }
 }

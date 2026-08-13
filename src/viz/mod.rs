@@ -253,7 +253,7 @@ channel = "demo.sine""#);
         let p = panels.build(&e, &channels).unwrap();
         let cfg = p.serialize();
         assert_eq!(cfg, e.config); // same panel-specific keys back out
-        let e2 = PanelEntry { panel_type: "numeric".into(), config: cfg };
+        let e2 = PanelEntry { panel_type: "numeric".into(), frame: None, config: cfg };
         assert!(panels.build(&e2, &channels).is_ok());
     }
 

@@ -66,7 +66,7 @@ pub fn build_panel_entry(panel_type: &str, selected: &[String]) -> Option<PanelE
             cfg.insert("channel".to_string(), toml::Value::String(selected[0].clone()));
         }
     }
-    Some(PanelEntry { panel_type: panel_type.to_string(), config: cfg })
+    Some(PanelEntry { panel_type: panel_type.to_string(), frame: None, config: cfg })
 }
 
 pub(crate) struct ReplayState {
