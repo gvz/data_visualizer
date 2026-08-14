@@ -30,12 +30,6 @@ impl Default for LayoutConfig {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ScreenConfig {
-    /// egui_tiles tree layout (JSON-encoded), written by the workspace module.
-    /// Absent on hand-written configs — a default grid is built instead.
-    /// MUST be declared before `panels`: TOML requires scalar values to
-    /// serialize before arrays-of-tables.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tiles_json: Option<String>,
     #[serde(default)]
     pub panels: Vec<PanelEntry>,
 }
@@ -160,24 +154,6 @@ max_lines = 500
         assert_eq!(l, l2);
     }
 
-    #[test]
-    fn tiles_json_round_trips() {
-        let src = r#"
-[screens.main]
-tiles_json = '{"fake":"tree"}'
-
-[[screens.main.panels]]
-type = "numeric"
-channel = "demo.sine"
-"#;
-        let l = LayoutConfig::from_toml_str(src).unwrap();
-        assert_eq!(
-            l.screens["main"].tiles_json.as_deref(),
-            Some(r#"{"fake":"tree"}"#)
-        );
-        let l2 = LayoutConfig::from_toml_str(&l.to_toml_string().unwrap()).unwrap();
-        assert_eq!(l, l2);
-    }
 
     #[test]
     fn save_preserves_channels_and_comments() {
@@ -225,12 +201,20 @@ channel = "volt.l1"
         assert_eq!(l2.screens["main"].panels.len(), 1);
     }
 
+
     #[test]
-    fn tiles_json_absent_is_none_and_not_serialized() {
-        let l = LayoutConfig::from_toml_str("[screens.empty]\n").unwrap();
-        assert_eq!(l.screens["empty"].tiles_json, None);
-        let out = l.to_toml_string().unwrap();
-        assert!(!out.contains("tiles_json"));
+    fn stale_tiles_json_key_is_ignored() {
+        let src = r#"
+[screens.main]
+tiles_json = '{"x":1}'
+[[screens.main.panels]]
+type = "numeric"
+channel = "demo.sine"
+"#;
+        let l = LayoutConfig::from_toml_str(src).unwrap();
+        assert_eq!(l.screens["main"].panels.len(), 1);
+        // Not re-serialized.
+        assert!(!l.to_toml_string().unwrap().contains("tiles_json"));
     }
 
     #[test]
