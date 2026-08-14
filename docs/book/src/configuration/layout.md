@@ -2,12 +2,13 @@
 
 The panel layout lives in `config.toml` under `[screens.*]`. Unlike the channel
 tables, this section is **GUI-managed**: datavis writes it back as you rearrange
-tiles and on exit. You can hand-edit it, but the app owns its formatting.
+panels and on exit. You can hand-edit it, but the app owns its formatting.
 
 ## Screens
 
-A screen is one named workspace of tiles. Multiple screens are switchable from
-the toolbar. Each screen carries the tile tree plus the list of panels on it:
+A screen is one named free-canvas workspace of panels. Multiple screens are
+switchable from the toolbar. Each screen carries its list of panels, each with
+its own canvas position:
 
 ```toml
 default_window_s = 10.0
@@ -36,7 +37,7 @@ then writes real `frame`s back as you move them.
 
 ### `[[screens.<name>.panels]]`
 
-One table per panel, in tile order. Common keys:
+One table per panel. Common keys:
 
 - `type` — the panel type (`waveform`, `gauge`, `state_graph`, `status`,
   `spectrum`, `numeric`, `xy_scatter`, `log`). See [Panel Types](../panels.md).
