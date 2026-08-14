@@ -40,9 +40,9 @@ Only these two keys; per-channel values win. Omit for built-in defaults.
 
 ## `[screens.*]` — [Panels & Layout](../configuration/layout.md)
 
-GUI-managed. `[screens.<name>]` carries `tiles_json` (opaque tile geometry) and
-a list of `[[screens.<name>.panels]]` tables, each with a `type` and either a
-`channel` or `channels` plus panel-specific keys.
+GUI-managed. `[screens.<name>]` carries a list of `[[screens.<name>.panels]]`
+tables, each with a `type`, a `frame = [x, y, w, h]` (normalized canvas position),
+and either a `channel` or `channels` plus panel-specific keys.
 
 ## `[[sources.bridge]]` — [Bridge Adapters](../sources/bridge.md)
 

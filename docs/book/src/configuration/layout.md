@@ -13,10 +13,10 @@ the toolbar. Each screen carries the tile tree plus the list of panels on it:
 default_window_s = 10.0
 
 [screens.main]
-tiles_json = '{"id":...,"root":1,"tiles":{ ... }}'
 
 [[screens.main.panels]]
 type = "waveform"
+frame = [0.0, 0.0, 0.5, 0.4]
 channels = ["load/ch0", "load/ch7", "scripts/rms"]
 cursors = false
 dots = false
@@ -26,12 +26,13 @@ type = "state_graph"
 channel = "load/state0"
 ```
 
-### `tiles_json`
+### `frame`
 
-The tile geometry — how the window is split into a tree of horizontal and
-vertical containers — is serialised as a JSON string in `tiles_json`. This is
-produced by the tiling engine (`egui_tiles`); treat it as opaque and let the GUI
-manage it.
+Each panel carries its canvas geometry as `frame = [x, y, w, h]`, four numbers
+in `0..1` normalized to the screen area (`x`/`y` = top-left corner, `w`/`h` =
+size). Panels are placed freely, never overlap, and scale with the window.
+Omit `frame` and datavis auto-arranges the screen's panels into a grid on load,
+then writes real `frame`s back as you move them.
 
 ### `[[screens.<name>.panels]]`
 
@@ -51,11 +52,14 @@ shown as an inline error — never a crash.
 
 ## Building a layout in the GUI
 
-1. Split the window into tiles by dragging tile edges / using the tile menu.
-2. Add a panel to a tile from the **panel type picker**.
-3. Drag channels from the sidebar onto a panel. Select several and drop them
+1. Add a panel from the toolbar, or right-click empty canvas → **Add panel here**.
+2. Choose a panel type from the picker.
+3. Drag a panel by its title bar to move it; drag the bottom-right grip to
+   resize. Panels snap to each other's edges and sizes and block on contact, so
+   they never overlap.
+4. Drag channels from the sidebar onto a panel. Select several and drop them
    together onto a multi-channel panel.
-4. The arrangement is saved back to `config.toml` automatically.
+5. The arrangement is saved back to `config.toml` automatically.
 
 ## Time window
 
