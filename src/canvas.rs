@@ -396,8 +396,12 @@ pub fn show(
             }
         });
 
-        // Drag-drop channels onto the panel.
-        let drop_resp = ui.interact(px, id.with("drop"), egui::Sense::hover());
+        // Drag-drop channels onto the panel BODY. Scoped to `body_rect` (not the
+        // full `px`): a full-panel interactive rect registered here — after the
+        // title-bar buttons — sits on top of them and swallows their clicks, so
+        // the gear/close buttons would never fire. The title bar isn't a drop
+        // target anyway.
+        let drop_resp = ui.interact(body_rect, id.with("drop"), egui::Sense::hover());
         if drop_resp.dnd_hover_payload::<Vec<String>>().is_some() {
             ui.painter()
                 .rect_stroke(px, 4.0, egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(80, 140, 255)));

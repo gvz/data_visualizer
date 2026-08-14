@@ -575,6 +575,59 @@ channel = "demo.sine"
         assert_eq!(st.panels[0].type_name, "gauge");
     }
 
+    /// A panel's title-bar gear button must open its settings window. Regression
+    /// guard for a full-panel drop-interaction rect swallowing the title-bar
+    /// buttons' clicks (they never fired). Injects a real pointer click at the
+    /// gear and asserts `settings_open` is set.
+    #[test]
+    fn title_bar_gear_click_opens_settings() {
+        use egui::{pos2, vec2, Event, PointerButton, Rect};
+        let ch = channels();
+        let reg = PanelRegistry::with_builtins();
+        // One numeric panel filling the whole canvas.
+        let cfg = LayoutConfig::from_toml_str(
+            "[[screens.main.panels]]\ntype = \"numeric\"\nframe = [0.0,0.0,1.0,1.0]\nchannel = \"demo.sine\"\n",
+        )
+        .unwrap();
+        let store = LiveStore::from_registry(&ch);
+        let mut ws = Workspace::from_config(&cfg, &reg, &ch);
+        ws.active = "main".to_string();
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+        let run = |ws: &mut Workspace, events: Vec<Event>| {
+            let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ws.ui(ui, &store, &ch, &reg, None);
+                });
+            });
+        };
+        // Warm-up frame establishes widget geometry for hit-testing.
+        run(&mut ws, vec![]);
+
+        // The gear sits at the right end of the 22px title bar. Scan that strip
+        // for a click that opens settings (exact glyph metrics vary by build).
+        let mut opened = false;
+        'scan: for gx in (600..796).step_by(2) {
+            for gy in (4..20).step_by(2) {
+                let p = pos2(gx as f32, gy as f32);
+                run(&mut ws, vec![
+                    Event::PointerMoved(p),
+                    Event::PointerButton { pos: p, button: PointerButton::Primary, pressed: true, modifiers: Default::default() },
+                ]);
+                run(&mut ws, vec![
+                    Event::PointerButton { pos: p, button: PointerButton::Primary, pressed: false, modifiers: Default::default() },
+                ]);
+                if ws.screens["main"].settings_open == Some(0) {
+                    opened = true;
+                    break 'scan;
+                }
+            }
+        }
+        assert!(opened, "clicking the title-bar gear never opened panel settings");
+    }
+
     #[test]
     fn ui_renders_headless_without_panic() {
         let (ch, reg, mut ws) = build();
