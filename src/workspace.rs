@@ -89,7 +89,15 @@ impl ScreenState {
     }
 
     /// Add an undefined panel at `rect` (from a canvas right-click).
+    /// If `rect` overlaps an existing placement the requested position is
+    /// discarded and we fall back to the same free-slot / carve logic used by
+    /// `add_panel`, preserving the "panels never overlap" invariant.
     fn add_undefined_at(&mut self, rect: NormRect) {
+        let rect = if self.layout.iter().any(|p| rects_overlap(rect, p.rect)) {
+            free_slot(&self.layout).unwrap_or_else(|| carve_slot(&mut self.layout))
+        } else {
+            rect
+        };
         self.panels.push(PanelSlot {
             type_name: placeholder::TYPE_NAME.to_string(),
             panel: Box::new(placeholder::PlaceholderPanel),
@@ -250,7 +258,7 @@ impl Workspace {
                 .collect();
             cfg.screens.insert(
                 name.clone(),
-                ScreenConfig { panels: entries, ..Default::default() },
+                ScreenConfig { panels: entries },
             );
         }
         cfg
@@ -390,6 +398,8 @@ impl Workspace {
         });
         st.panels.push(PanelSlot { type_name: entry.panel_type.clone(), panel });
         let rect = match entry.frame {
+            // Explicit frame is trusted: comes from config-load or programmatic
+            // callers (same assumption as `from_screen_config`).
             Some(f) => NormRect::from_array(f),
             None => carve_slot(&mut st.layout),
         };
@@ -577,6 +587,40 @@ channel = "demo.sine"
                 ws.ui(ui, &store, &ch, &reg, None);
             });
         });
+    }
+
+    #[test]
+    fn add_undefined_at_over_existing_panel_does_not_overlap() {
+        // Start from a screen with two side-by-side panels that together fill
+        // the canvas (left half and right half).
+        let mut st = ScreenState::empty("blank");
+        st.panels.push(PanelSlot {
+            type_name: placeholder::TYPE_NAME.to_string(),
+            panel: Box::new(placeholder::PlaceholderPanel),
+        });
+        st.layout.push(PanelPlacement { rect: NormRect { fx: 0.0, fy: 0.0, fw: 0.5, fh: 1.0 } });
+        st.panels.push(PanelSlot {
+            type_name: placeholder::TYPE_NAME.to_string(),
+            panel: Box::new(placeholder::PlaceholderPanel),
+        });
+        st.layout.push(PanelPlacement { rect: NormRect { fx: 0.5, fy: 0.0, fw: 0.5, fh: 1.0 } });
+
+        // Call add_undefined_at with a rect that overlaps the first panel.
+        let overlapping = NormRect { fx: 0.0, fy: 0.0, fw: 0.5, fh: 1.0 };
+        st.add_undefined_at(overlapping);
+
+        assert_eq!(st.panels.len(), 3);
+        assert_eq!(st.layout.len(), 3);
+        let new = st.layout[2].rect;
+        for i in 0..2 {
+            let o = st.layout[i].rect;
+            assert!(
+                !rects_overlap(new, o),
+                "new panel at {:?} overlaps existing {:?}",
+                new,
+                o
+            );
+        }
     }
 
     #[test]
