@@ -223,6 +223,213 @@ pub fn auto_arrange(n: usize) -> Vec<NormRect> {
         .collect()
 }
 
+use egui_phosphor::regular as icon;
+
+use crate::config::ChannelRegistry;
+use crate::dynamic_channel::resolve_or_register_drop;
+use crate::store::ChannelStore;
+use crate::viz::placeholder;
+use crate::workspace::{MqttDropCtx, PanelSlot};
+
+const TITLE_H: f32 = 22.0;
+const GRIP: f32 = 12.0;
+
+/// A user action the canvas cannot apply itself (it only borrows slices, so it
+/// cannot add/remove entries). The workspace applies these after `show`.
+pub enum CanvasEvent {
+    Define(usize, String),
+    Settings(usize),
+    ResetZoom(usize),
+    Delete(usize),
+    AddAt(NormRect),
+}
+
+/// A phosphor glyph hinting at each panel type on the type picker.
+fn type_pictogram(type_name: &str) -> &'static str {
+    match type_name {
+        "gauge" => icon::GAUGE,
+        "waveform" => icon::WAVE_SINE,
+        "numeric" => icon::HASH,
+        "spectrum" => icon::CHART_BAR,
+        "state_graph" => icon::WAVE_SQUARE,
+        "status" => icon::TAG,
+        "log" => icon::SCROLL,
+        "xy_scatter" => icon::CHART_SCATTER,
+        _ => icon::SQUARE,
+    }
+}
+
+fn draw_type_picker(
+    ui: &mut egui::Ui,
+    type_names: &[&'static str],
+    idx: usize,
+    events: &mut Vec<CanvasEvent>,
+) {
+    ui.vertical_centered(|ui| {
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("Choose a panel type").weak());
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            for t in type_names {
+                ui.allocate_ui(egui::vec2(64.0, 74.0), |ui| {
+                    ui.vertical_centered(|ui| {
+                        let glyph = type_pictogram(t);
+                        let btn = egui::Button::new(egui::RichText::new(glyph).size(30.0))
+                            .min_size(egui::vec2(52.0, 52.0));
+                        if ui.add(btn).on_hover_text(*t).clicked() {
+                            events.push(CanvasEvent::Define(idx, t.to_string()));
+                        }
+                        ui.label(egui::RichText::new(*t).small());
+                    });
+                });
+            }
+        });
+    });
+}
+
+/// Render every panel of a screen as a free-floating, snappable, non-overlapping
+/// frame. Mutates geometry (`layout`) and per-panel state (drop) in place;
+/// structural changes come back as [`CanvasEvent`]s.
+pub fn show(
+    ui: &mut egui::Ui,
+    panels: &mut [PanelSlot],
+    layout: &mut [PanelPlacement],
+    store: &dyn ChannelStore,
+    channels: &ChannelRegistry,
+    mqtt: Option<MqttDropCtx>,
+    type_names: &[&'static str],
+) -> Vec<CanvasEvent> {
+    let canvas = ui.max_rect();
+    let snap = egui::vec2(SNAP_PX / canvas.width().max(1.0), SNAP_PX / canvas.height().max(1.0));
+    let rects: Vec<NormRect> = layout.iter().map(|p| p.rect).collect();
+    let mut events = Vec::new();
+
+    // Right-click empty canvas → add a panel at that spot.
+    let bg = ui.interact(canvas, ui.id().with("canvas-bg"), egui::Sense::click());
+    bg.context_menu(|ui| {
+        if ui.button(format!("{} Add panel here", icon::PLUS_SQUARE)).clicked() {
+            if let Some(p) = ui.ctx().pointer_interact_pos() {
+                let fx = ((p.x - canvas.left()) / canvas.width().max(1.0)).clamp(0.0, 1.0 - 0.3);
+                let fy = ((p.y - canvas.top()) / canvas.height().max(1.0)).clamp(0.0, 1.0 - 0.3);
+                events.push(CanvasEvent::AddAt(NormRect { fx, fy, fw: 0.3, fh: 0.3 }));
+            }
+            ui.close_menu();
+        }
+    });
+
+    for i in 0..panels.len() {
+        let px = rects[i].to_pixels(canvas);
+        let id = ui.id().with(("panel", i));
+        let title_rect = egui::Rect::from_min_size(px.min, egui::vec2(px.width(), TITLE_H));
+        let grip_rect = egui::Rect::from_min_size(
+            egui::pos2(px.right() - GRIP, px.bottom() - GRIP),
+            egui::vec2(GRIP, GRIP),
+        );
+        let others: Vec<NormRect> =
+            rects.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, r)| *r).collect();
+
+        // Interactions FIRST so the panel body's own widgets sit on top.
+        let title_resp = ui.interact(title_rect, id.with("title"), egui::Sense::click_and_drag());
+        let grip_resp = ui.interact(grip_rect, id.with("grip"), egui::Sense::drag());
+
+        if title_resp.dragged() {
+            let d = px_delta_to_norm(title_resp.drag_delta(), canvas);
+            let desired = NormRect { fx: rects[i].fx + d.x, fy: rects[i].fy + d.y, ..rects[i] };
+            let snapped = snap_move(desired, &others, snap);
+            layout[i].rect = resolve_move(rects[i], snapped, &others);
+        }
+        if grip_resp.dragged() {
+            let d = px_delta_to_norm(grip_resp.drag_delta(), canvas);
+            let desired = NormRect { fw: rects[i].fw + d.x, fh: rects[i].fh + d.y, ..rects[i] };
+            let snapped = snap_resize(desired, &others, snap);
+            layout[i].rect = resolve_resize(rects[i], snapped, &others);
+        }
+
+        // Chrome.
+        let v = ui.visuals().clone();
+        ui.painter().rect_filled(px, 4.0, v.window_fill);
+        ui.painter().rect_stroke(px, 4.0, v.window_stroke());
+        ui.painter().rect_filled(
+            title_rect,
+            egui::Rounding { nw: 4.0, ne: 4.0, sw: 0.0, se: 0.0 },
+            v.widgets.active.bg_fill,
+        );
+        // Resize grip: two short diagonal ticks.
+        let gs = grip_rect.shrink(3.0);
+        for off in [0.0, 4.0] {
+            ui.painter().line_segment(
+                [
+                    egui::pos2(gs.right() - off, gs.bottom()),
+                    egui::pos2(gs.right(), gs.bottom() - off),
+                ],
+                egui::Stroke::new(1.0_f32, v.weak_text_color()),
+            );
+        }
+
+        let is_undefined = panels[i].type_name == placeholder::TYPE_NAME;
+
+        // Title bar contents.
+        ui.allocate_ui_at_rect(title_rect.shrink2(egui::vec2(6.0, 2.0)), |ui| {
+            ui.horizontal(|ui| {
+                if !is_undefined {
+                    ui.strong(panels[i].panel.title());
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button(icon::X).clicked() {
+                        events.push(CanvasEvent::Delete(i));
+                    }
+                    if ui.small_button(icon::GEAR).clicked() {
+                        events.push(CanvasEvent::Settings(i));
+                    }
+                });
+            });
+        });
+
+        // Body.
+        let body_rect =
+            egui::Rect::from_min_max(egui::pos2(px.left(), px.top() + TITLE_H), px.max).shrink(4.0);
+        ui.allocate_ui_at_rect(body_rect, |ui| {
+            if is_undefined {
+                draw_type_picker(ui, type_names, i, &mut events);
+            } else {
+                panels[i].panel.render(ui, store);
+            }
+        });
+
+        // Drag-drop channels onto the panel.
+        let drop_resp = ui.interact(px, id.with("drop"), egui::Sense::hover());
+        if drop_resp.dnd_hover_payload::<Vec<String>>().is_some() {
+            ui.painter()
+                .rect_stroke(px, 4.0, egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(80, 140, 255)));
+        }
+        if let Some(dropped) = drop_resp.dnd_release_payload::<Vec<String>>() {
+            for raw in dropped.iter() {
+                if let Some(name) = resolve_or_register_drop(raw, channels, store, mqtt) {
+                    panels[i].panel.drop_channel(&name, channels);
+                }
+            }
+        }
+
+        // Context menu.
+        drop_resp.context_menu(|ui| {
+            if ui.button(format!("{} Settings", icon::GEAR)).clicked() {
+                events.push(CanvasEvent::Settings(i));
+                ui.close_menu();
+            }
+            if ui.button(format!("{} Reset zoom", icon::MAGNIFYING_GLASS_MINUS)).clicked() {
+                events.push(CanvasEvent::ResetZoom(i));
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui.button(format!("{} Delete panel", icon::TRASH)).clicked() {
+                events.push(CanvasEvent::Delete(i));
+                ui.close_menu();
+            }
+        });
+    }
+    events
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
