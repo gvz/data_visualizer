@@ -14,6 +14,11 @@ pub const TYPE_NAME: &str = "xy_scatter";
 
 const ACCEPTED: &[SampleType] = &[SampleType::Float, SampleType::Int];
 
+/// Upper bound on scatter markers handed to the plot. A panel a few hundred
+/// pixels wide cannot resolve more, and every extra point inflates the mesh
+/// egui tessellates each frame — the dominant cost of this panel under load.
+const MAX_POINTS: usize = 4_000;
+
 /// Two channels plotted against each other, aligned by sample index from the
 /// newest sample backwards (uniform-rate assumption; no interpolation in v1).
 pub struct XyScatterPanel {
@@ -41,11 +46,16 @@ pub fn ctor(
 }
 
 /// Pair up the newest min(len) samples of both series.
-pub(crate) fn index_align(x: &[f64], y: &[f64]) -> Vec<[f64; 2]> {
+pub(crate) fn index_align(x: &[f64], y: &[f64], max: usize) -> Vec<[f64; 2]> {
     let n = x.len().min(y.len());
+    // Subsample by an even stride when the tail exceeds `max` (0 = no cap), so
+    // the returned point count — and thus the plot mesh — stays bounded rather
+    // than growing with the window's sample count.
+    let stride = if max == 0 || n <= max { 1 } else { n.div_ceil(max) };
     x[x.len() - n..]
         .iter()
         .zip(&y[y.len() - n..])
+        .step_by(stride)
         .map(|(&a, &b)| [a, b])
         .collect()
 }
@@ -66,6 +76,7 @@ impl VizPanel for XyScatterPanel {
         });
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn render(&mut self, ui: &mut egui::Ui, store: &dyn ChannelStore) {
         if self.x.name.is_empty() || self.y.name.is_empty() {
             ui.label(egui::RichText::new("Drop two channels here (x then y)").weak());
@@ -98,7 +109,7 @@ impl VizPanel for XyScatterPanel {
         else {
             return;
         };
-        let pts = index_align(&xv, &yv);
+        let pts = index_align(&xv, &yv, MAX_POINTS);
         let dark = ui.visuals().dark_mode;
         Plot::new(("xy", &self.title))
             .data_aspect(1.0)
@@ -172,8 +183,16 @@ type = "int"
         // Different lengths: align from the newest sample backwards.
         let x = [1.0, 2.0, 3.0, 4.0];
         let y = [10.0, 20.0];
-        assert_eq!(index_align(&x, &y), vec![[3.0, 10.0], [4.0, 20.0]]);
-        assert!(index_align(&[], &y).is_empty());
+        assert_eq!(index_align(&x, &y, 0), vec![[3.0, 10.0], [4.0, 20.0]]);
+        assert!(index_align(&[], &y, 0).is_empty());
+    }
+
+    #[test]
+    fn index_align_caps_point_count() {
+        let x: Vec<f64> = (0..1000).map(|i| i as f64).collect();
+        let out = index_align(&x, &x, 100);
+        assert!(out.len() <= 100, "capped, got {}", out.len());
+        assert_eq!(out[0], [0.0, 0.0]); // strided from the tail start
     }
 
     #[test]
