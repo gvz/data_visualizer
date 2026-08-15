@@ -628,6 +628,61 @@ channel = "demo.sine"
         assert!(opened, "clicking the title-bar gear never opened panel settings");
     }
 
+    /// Holding Ctrl/⌘ and dragging anywhere in a panel (here: its body, away
+    /// from the title bar) must move the panel.
+    #[test]
+    fn ctrl_drag_body_moves_panel() {
+        use egui::{pos2, vec2, Event, Modifiers, PointerButton, Rect};
+        let ch = channels();
+        let reg = PanelRegistry::with_builtins();
+        // One small panel with room to move on the canvas.
+        let cfg = LayoutConfig::from_toml_str(
+            "[[screens.main.panels]]\ntype = \"numeric\"\nframe = [0.1,0.1,0.3,0.3]\nchannel = \"demo.sine\"\n",
+        )
+        .unwrap();
+        let store = LiveStore::from_registry(&ch);
+        let mut ws = Workspace::from_config(&cfg, &reg, &ch);
+        ws.active = "main".to_string();
+
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+        let cmd = Modifiers { command: true, ctrl: true, ..Default::default() };
+        let run = |ws: &mut Workspace, events: Vec<Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                modifiers: cmd,
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ws.ui(ui, &store, &ch, &reg, None);
+                });
+            });
+        };
+        run(&mut ws, vec![]); // warm-up geometry
+
+        let start_fx = ws.screens["main"].layout[0].rect.fx;
+        // Press in the body (well below the 22px title bar), then drag right.
+        let p0 = pos2(200.0, 160.0);
+        run(&mut ws, vec![
+            Event::PointerMoved(p0),
+            Event::PointerButton { pos: p0, button: PointerButton::Primary, pressed: true, modifiers: cmd },
+        ]);
+        let p1 = pos2(300.0, 160.0);
+        run(&mut ws, vec![Event::PointerMoved(p1)]);
+        run(&mut ws, vec![Event::PointerMoved(p1)]);
+        let moved_fx = ws.screens["main"].layout[0].rect.fx;
+        run(&mut ws, vec![
+            Event::PointerButton { pos: p1, button: PointerButton::Primary, pressed: false, modifiers: cmd },
+        ]);
+
+        assert!(
+            moved_fx > start_fx + 0.05,
+            "ctrl+drag in body should move panel right: start={start_fx} moved={moved_fx}"
+        );
+    }
+
     #[test]
     fn ui_renders_headless_without_panic() {
         let (ch, reg, mut ws) = build();

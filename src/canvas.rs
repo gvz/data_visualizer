@@ -430,6 +430,23 @@ pub fn show(
                 ui.close_menu();
             }
         });
+
+        // Ctrl/⌘ + drag anywhere in the panel moves it (in addition to the
+        // title bar). Registered last so it sits above the body's own widgets
+        // and captures the drag; only while the modifier is held, so normal
+        // interaction with plots/buttons is untouched otherwise.
+        if ui.input(|i| i.modifiers.command) {
+            let move_resp = ui.interact(px, id.with("mod-move"), egui::Sense::click_and_drag());
+            if move_resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+            }
+            if move_resp.dragged() {
+                let d = px_delta_to_norm(move_resp.drag_delta(), canvas);
+                let desired = NormRect { fx: rects[i].fx + d.x, fy: rects[i].fy + d.y, ..rects[i] };
+                let snapped = snap_move(desired, &others, snap);
+                layout[i].rect = resolve_move(rects[i], snapped, &others);
+            }
+        }
     }
     events
 }
