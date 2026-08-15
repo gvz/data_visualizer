@@ -614,18 +614,14 @@ impl DataVisApp {
                             (icon::PAUSE, "Pause")
                         };
                         if ui.button(pause_icon).on_hover_text(pause_hint).clicked() {
-                            if self.live_paused {
-                                self.live_paused = false;
-                            } else {
-                                // Freeze whatever is on screen: the scrubbed instant
-                                // if scrolled back, otherwise the current wall clock.
-                                self.live_pause_ns = if self.live_view_offset_ns != 0 {
-                                    crate::types::now_ns() + self.live_view_offset_ns
-                                } else {
-                                    crate::types::now_ns()
-                                };
-                                self.live_paused = true;
-                            }
+                            // Only toggle here. The freeze instant is captured in
+                            // the per-frame view sync in update(), which runs with
+                            // the same wall clock the panels render against this
+                            // frame. Capturing it here — in the toolbar, which runs
+                            // *before* the panels — froze a moment earlier than the
+                            // last displayed frame and dropped the newest sample, so
+                            // status badges jumped to a previous value on pause.
+                            self.live_paused = !self.live_paused;
                         }
                         ui.separator();
 
@@ -1045,11 +1041,26 @@ impl eframe::App for DataVisApp {
         // 0 means "use wall clock"; non-zero freezes the view at that ns value.
         if matches!(self.mode, AppMode::Live) {
             let v = if self.live_paused {
+                // Capture the freeze instant on the first paused frame (sentinel
+                // 0 = not captured yet), using the wall clock the panels render
+                // with this frame — so the frozen view matches what is on screen
+                // instead of an earlier toolbar-time snapshot. Freeze the scrubbed
+                // instant if scrolled back, else the current wall clock.
+                if self.live_pause_ns == 0 {
+                    self.live_pause_ns = if self.live_view_offset_ns != 0 {
+                        crate::types::now_ns() + self.live_view_offset_ns
+                    } else {
+                        crate::types::now_ns()
+                    };
+                }
                 self.live_pause_ns
-            } else if self.live_view_offset_ns != 0 {
-                crate::types::now_ns() + self.live_view_offset_ns
             } else {
-                0
+                self.live_pause_ns = 0; // reset so the next pause recaptures
+                if self.live_view_offset_ns != 0 {
+                    crate::types::now_ns() + self.live_view_offset_ns
+                } else {
+                    0
+                }
             };
             self.live_view_ns.store(v, Ordering::Relaxed);
         }
