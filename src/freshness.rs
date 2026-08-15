@@ -16,7 +16,7 @@
 //!  - The cadence baseline is the interval between *advances* (the real
 //!    production rate), not the spacing of samples within a batch — so a source
 //!    that emits a burst per tick does not flicker between bursts.
-//!  - Evaluation is throttled to [`MIN_EVAL_INTERVAL_NS`] (100 Hz) per channel;
+//!  - Evaluation is throttled to `MIN_EVAL_INTERVAL_NS` (100 Hz) per channel;
 //!    the dot holds its last value between evaluations, so it never flickers
 //!    faster than that no matter how often the GUI repaints.
 
