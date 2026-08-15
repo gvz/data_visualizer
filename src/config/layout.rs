@@ -53,7 +53,30 @@ impl LayoutConfig {
     }
 
     pub fn to_toml_string(&self) -> anyhow::Result<String> {
-        toml::to_string_pretty(self).context("serializing layout")
+        let raw = toml::to_string_pretty(self).context("serializing layout")?;
+        let mut doc: toml_edit::DocumentMut =
+            raw.parse().context("reformatting serialized layout")?;
+        if let Some(screens) = doc.get_mut("screens").and_then(|i| i.as_table_mut()) {
+            for (_, screen) in screens.iter_mut() {
+                let Some(panels) = screen
+                    .as_table_mut()
+                    .and_then(|t| t.get_mut("panels"))
+                    .and_then(|i| i.as_array_of_tables_mut())
+                else {
+                    continue;
+                };
+                for panel in panels.iter_mut() {
+                    for (mut key, item) in panel.iter_mut() {
+                        if inline_item(item) {
+                            // A former `[..]`/`[[..]]` header key carries no
+                            // ` ` before the `=`; give it the standard spacing.
+                            key.leaf_decor_mut().set_suffix(" ");
+                        }
+                    }
+                }
+            }
+        }
+        Ok(doc.to_string())
     }
 
     pub fn load(path: &Path) -> anyhow::Result<Self> {
@@ -92,6 +115,43 @@ impl LayoutConfig {
         } else {
             Ok(format!("{}\n\n{}\n", layout.trim_end(), preserved))
         }
+    }
+}
+
+/// Collapse a panel's child structures onto one line so the hierarchy reads at
+/// a glance: nested tables (`aliases`, `colors`) become inline tables, arrays
+/// of tables (`thresholds`, status `states`) become arrays of inline tables,
+/// and scalar arrays (`frame`, `channels`) lose their per-element line breaks.
+/// The default `toml::to_string_pretty` renders each of these as a separate
+/// `[screens.main.panels.aliases]`-style header that visually detaches from its
+/// owning panel; inlining keeps them nested where they belong.
+/// Returns `true` when the item was a table or array-of-tables that got
+/// rewritten as an inline value — the caller then fixes up the key's spacing,
+/// since a former header key carries no ` ` before its `=`.
+fn inline_item(item: &mut toml_edit::Item) -> bool {
+    use toml_edit::{Item, Value};
+    match item {
+        Item::Table(t) => {
+            let mut inline = std::mem::take(t).into_inline_table();
+            inline.fmt();
+            *item = Item::Value(Value::InlineTable(inline));
+            true
+        }
+        Item::ArrayOfTables(aot) => {
+            let mut arr = toml_edit::Array::new();
+            for t in aot.iter() {
+                let mut inline = t.clone().into_inline_table();
+                inline.fmt();
+                arr.push(Value::InlineTable(inline));
+            }
+            *item = Item::Value(Value::Array(arr));
+            true
+        }
+        Item::Value(Value::Array(a)) => {
+            a.fmt();
+            false
+        }
+        _ => false,
     }
 }
 
@@ -233,6 +293,54 @@ channel = "demo.sine"
         assert_eq!(p.config["channel"], toml::Value::String("demo.sine".into()));
         // Round-trips through serialization.
         let l2 = LayoutConfig::from_toml_str(&l.to_toml_string().unwrap()).unwrap();
+        assert_eq!(l, l2);
+    }
+
+    #[test]
+    fn panel_subtables_serialize_inline() {
+        let src = r##"
+[[screens.main.panels]]
+type = "state_graph"
+channel = "load/state0"
+frame = [0.0, 0.35, 0.5, 0.13]
+
+[screens.main.panels.aliases]
+idle = "test"
+
+[screens.main.panels.colors]
+done = "#d8cece"
+
+[[screens.main.panels]]
+type = "gauge"
+channel = "load/ch5"
+
+[[screens.main.panels.thresholds]]
+color = "#fe640b"
+value = 0.0
+"##;
+        let l = LayoutConfig::from_toml_str(src).unwrap();
+        let out = l.to_toml_string().unwrap();
+        // Sub-tables stay nested inside the panel as inline tables — no
+        // detached `[screens.main.panels.aliases]` headers.
+        assert!(out.contains(r#"aliases = { idle = "test" }"#), "got:\n{out}");
+        assert!(out.contains(r##"colors = { done = "#d8cece" }"##), "got:\n{out}");
+        assert!(!out.contains("[screens.main.panels.aliases]"), "got:\n{out}");
+        // Array-of-tables collapses to an array of inline tables.
+        assert!(
+            out.contains(r##"thresholds = [{ color = "#fe640b", value = 0.0 }]"##),
+            "got:\n{out}"
+        );
+        // Scalar arrays sit on one line (values are f32, so don't match on
+        // exact decimals — assert the whole array is on a single line).
+        assert!(
+            out.lines().any(|l| {
+                let l = l.trim();
+                l.starts_with("frame = [") && l.ends_with(']')
+            }),
+            "got:\n{out}"
+        );
+        // And it all still parses back to the same layout.
+        let l2 = LayoutConfig::from_toml_str(&out).unwrap();
         assert_eq!(l, l2);
     }
 
