@@ -736,6 +736,57 @@ channel = "demo.sine"
         assert!(grown > start + 0.05, "grip drag over the legend should grow panel height: start={start} got {grown}");
     }
 
+    /// Clicking a type-picker icon on a freshly-added (undefined) panel must
+    /// define it. Regression guard: the body's drop/menu overlay must not sit on
+    /// top of the picker and swallow its button clicks.
+    #[test]
+    fn type_picker_icon_defines_panel() {
+        use egui::{pos2, vec2, Event, PointerButton, Rect};
+        let ch = channels();
+        let reg = PanelRegistry::with_builtins();
+        let store = LiveStore::from_registry(&ch);
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+
+        // Empty screen seeds one undefined (placeholder) panel; force it to fill
+        // the canvas so the picker icons are easy to hit.
+        let mut ws = Workspace::from_config(&LayoutConfig::default(), &reg, &ch);
+        ws.active = "main".to_string();
+        let ctx = egui::Context::default();
+        let run = |ws: &mut Workspace, events: Vec<Event>| {
+            let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| { ws.ui(ui, &store, &ch, &reg, None); });
+            });
+        };
+        run(&mut ws, vec![]); // seed placeholder
+        ws.screens.get_mut("main").unwrap().layout[0].rect =
+            NormRect { fx: 0.0, fy: 0.0, fw: 1.0, fh: 1.0 };
+        run(&mut ws, vec![]); // lay the picker out full-size
+
+        assert_eq!(ws.screens["main"].panels[0].type_name, placeholder::TYPE_NAME);
+        // Scan the picker area (below the ~22px title bar; avoid the title-bar
+        // X delete) for a click that defines the panel.
+        let mut defined = false;
+        'scan: for gy in (48..260).step_by(10) {
+            for gx in (40..720).step_by(10) {
+                let p = pos2(gx as f32, gy as f32);
+                run(&mut ws, vec![
+                    Event::PointerMoved(p),
+                    Event::PointerButton { pos: p, button: PointerButton::Primary, pressed: true, modifiers: Default::default() },
+                ]);
+                run(&mut ws, vec![Event::PointerButton { pos: p, button: PointerButton::Primary, pressed: false, modifiers: Default::default() }]);
+                if ws.screens["main"].panels.is_empty() {
+                    panic!("scan click hit the delete button — narrow the scan region");
+                }
+                if ws.screens["main"].panels[0].type_name != placeholder::TYPE_NAME {
+                    defined = true;
+                    break 'scan;
+                }
+            }
+        }
+        assert!(defined, "clicking a type-picker icon never defined the panel");
+    }
+
     /// Right-clicking a panel's title bar opens its context menu and the
     /// "Remove panel" item deletes it. Regression guard: the menu must be
     /// reachable on the title bar, not only the body.

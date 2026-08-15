@@ -371,16 +371,29 @@ pub fn show(
             });
         });
 
-        // Body.
+        // Body + drop/menu overlay. The overlay (`drop_resp`) is a hover-only
+        // rect that carries the drag-drop target and the context menu. A hover
+        // rect swallows the *clicks* of widgets beneath it (though not their
+        // drags), so its z-order relative to the body depends on the panel kind:
+        //  - undefined → click-based type picker: overlay goes UNDER the picker
+        //    so its buttons stay clickable (the menu still opens on the empty
+        //    surround); otherwise the picker icons cannot be clicked.
+        //  - defined → drag-based body (e.g. a plot): overlay goes ON TOP so the
+        //    context menu opens anywhere over it, without blocking its drags.
         let body_rect =
             egui::Rect::from_min_max(egui::pos2(px.left(), px.top() + TITLE_H), px.max).shrink(4.0);
-        ui.allocate_ui_at_rect(body_rect, |ui| {
-            if is_undefined {
+        let drop_resp = if is_undefined {
+            let r = ui.interact(body_rect, id.with("drop"), egui::Sense::hover());
+            ui.allocate_ui_at_rect(body_rect, |ui| {
                 draw_type_picker(ui, type_names, i, &mut events);
-            } else {
+            });
+            r
+        } else {
+            ui.allocate_ui_at_rect(body_rect, |ui| {
                 panels[i].panel.render(ui, store);
-            }
-        });
+            });
+            ui.interact(body_rect, id.with("drop"), egui::Sense::hover())
+        };
 
         // Resize grip, registered AFTER the body so it sits on top and is always
         // grabbable — even when the body's own widgets reach the bottom-right
@@ -404,12 +417,7 @@ pub fn show(
             );
         }
 
-        // Drag-drop channels onto the panel BODY. Scoped to `body_rect` (not the
-        // full `px`): a full-panel interactive rect registered here — after the
-        // title-bar buttons — sits on top of them and swallows their clicks, so
-        // the gear/close buttons would never fire. The title bar isn't a drop
-        // target anyway.
-        let drop_resp = ui.interact(body_rect, id.with("drop"), egui::Sense::hover());
+        // Drag-drop channels onto the panel body.
         if drop_resp.dnd_hover_payload::<Vec<String>>().is_some() {
             ui.painter()
                 .rect_stroke(px, 4.0, egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(80, 140, 255)));
