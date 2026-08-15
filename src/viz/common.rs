@@ -64,26 +64,7 @@ pub fn theme_color_button_ext(
 
     let mut changed = false;
     popup_below_widget(ui, popup_id, &resp, PopupCloseBehavior::CloseOnClickOutside, |ui| {
-        ui.set_min_width(240.0);
-        ui.label(if dark { "Catppuccin Mocha" } else { "Catppuccin Latte" });
-        ui.horizontal_wrapped(|ui| {
-            for (name, c) in catppuccin_accents(dark) {
-                let (r, sw) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
-                ui.painter().rect_filled(r, 2.0, c);
-                if *color == c {
-                    ui.painter()
-                        .rect_stroke(r, 2.0, egui::Stroke::new(1.5, ui.visuals().text_color()));
-                }
-                if sw.on_hover_text(name).clicked() {
-                    *color = c;
-                    changed = true;
-                }
-            }
-        });
-        ui.separator();
-        if egui::color_picker::color_picker_color32(ui, color, egui::color_picker::Alpha::Opaque) {
-            changed = true;
-        }
+        changed = catppuccin_color_body(ui, color, dark);
         extra(ui);
     });
 
@@ -91,6 +72,36 @@ pub fn theme_color_button_ext(
         resp.mark_changed();
     }
     resp
+}
+
+/// The Catppuccin swatch grid plus the standard egui color picker, rendered
+/// inline into `ui`. Returns true when the color changed. Split out from
+/// [`theme_color_button`] so it can be dropped straight into a menu (or submenu),
+/// where a *nested* popup would be dismissed by the enclosing menu's
+/// click-outside handling before the pick registers.
+pub fn catppuccin_color_body(ui: &mut egui::Ui, color: &mut Color32, dark: bool) -> bool {
+    let mut changed = false;
+    ui.set_min_width(240.0);
+    ui.label(if dark { "Catppuccin Mocha" } else { "Catppuccin Latte" });
+    ui.horizontal_wrapped(|ui| {
+        for (name, c) in catppuccin_accents(dark) {
+            let (r, sw) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
+            ui.painter().rect_filled(r, 2.0, c);
+            if *color == c {
+                ui.painter()
+                    .rect_stroke(r, 2.0, egui::Stroke::new(1.5_f32, ui.visuals().text_color()));
+            }
+            if sw.on_hover_text(name).clicked() {
+                *color = c;
+                changed = true;
+            }
+        }
+    });
+    ui.separator();
+    if egui::color_picker::color_picker_color32(ui, color, egui::color_picker::Alpha::Opaque) {
+        changed = true;
+    }
+    changed
 }
 
 /// A panel's link to one channel: resolved id + validity + display metadata.

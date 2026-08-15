@@ -6,9 +6,9 @@ use crate::config::ChannelRegistry;
 use crate::store::ChannelStore;
 use crate::types::{ChannelId, SampleType, TimeWindow};
 use crate::viz::common::{
-    bind, binding_color, binding_error, color_to_hex, effective_window_s, format_time_of_day,
-    hex_to_color, label_config_row, opt_bool, opt_f64_opt, opt_label, opt_str, opt_str_array,
-    refresh_binding, serialize_label, shorten_common_prefix, snapshot_to_f64, theme_color_button,
+    bind, binding_color, binding_error, catppuccin_color_body, color_to_hex, effective_window_s,
+    format_time_of_day, hex_to_color, label_config_row, opt_bool, opt_f64_opt, opt_label, opt_str,
+    opt_str_array, refresh_binding, serialize_label, shorten_common_prefix, snapshot_to_f64,
     window_config_row, Binding, RebindCtx,
 };
 use crate::viz::decimate::decimate_minmax;
@@ -228,18 +228,22 @@ impl VizPanel for WaveformPanel {
                     toggle = Some(b.name.clone());
                 }
                 resp.context_menu(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Color");
+                    // A submenu (not a nested popup) so the swatch grid and
+                    // picker live inside the menu tree — a popup opened from
+                    // within a context menu is dismissed by the menu's
+                    // click-outside handling before the pick registers.
+                    ui.menu_button(format!("{} Color", icon::PALETTE), |ui| {
+                        // Apply on change but keep the submenu open: dragging the
+                        // HSV picker updates continuously, and the user dismisses
+                        // by clicking away (same as a swatch popup).
                         let mut c = color;
-                        if theme_color_button(ui, &mut c).changed() {
+                        if catppuccin_color_body(ui, &mut c, dark) {
                             color_change = Some((i, Some(c)));
                         }
                     });
                     // Only offer "automatic" when this channel is currently
                     // overridden — otherwise it already uses the palette color.
-                    if !b.auto_color
-                        && ui.button(format!("{} Automatic color", icon::PALETTE)).clicked()
-                    {
+                    if !b.auto_color && ui.button("Automatic color").clicked() {
                         color_change = Some((i, None));
                         ui.close_menu();
                     }
