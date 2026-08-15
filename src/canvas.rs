@@ -361,6 +361,7 @@ pub fn show(
             crate::freshness::DataFreshness::NoData
         } else {
             crate::freshness::panel_freshness(
+                ui.ctx(),
                 store,
                 &panels[i].panel.data_channels(),
                 store.now_ns(),
