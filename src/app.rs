@@ -993,8 +993,33 @@ impl DataVisApp {
     }
 }
 
+/// Deadline for the timed profiling self-exit, or `None` when
+/// `DATAVIS_EXIT_AFTER_S` is unset or invalid. Parsed once; the clock starts at
+/// the first frame it is read on.
+fn profile_exit_deadline() -> Option<Instant> {
+    static DEADLINE: std::sync::OnceLock<Option<Instant>> = std::sync::OnceLock::new();
+    *DEADLINE.get_or_init(|| {
+        std::env::var("DATAVIS_EXIT_AFTER_S")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|s| *s > 0.0)
+            .map(|s| Instant::now() + Duration::from_secs_f64(s))
+    })
+}
+
 impl eframe::App for DataVisApp {
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Timed self-exit for headless/automated profiling runs. When
+        // DATAVIS_EXIT_AFTER_S is set, close the window once that many seconds
+        // have elapsed so the process shuts down cleanly and the hotpath
+        // profiler flushes its report. No-op when the var is unset.
+        if let Some(deadline) = profile_exit_deadline() {
+            if Instant::now() >= deadline {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+
         // Repaint only as fast as something actually changes. A blanket 60 fps
         // repaint burns a full CPU core re-tessellating static panels even with
         // no data. Animate at 60 fps while replay is playing or fresh live

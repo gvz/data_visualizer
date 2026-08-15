@@ -14,6 +14,7 @@ use datavis::store::{ChannelStore, LiveStore};
 use datavis::viz::PanelRegistry;
 use datavis::workspace::Workspace;
 
+#[cfg_attr(feature = "hotpath", hotpath::main)]
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {

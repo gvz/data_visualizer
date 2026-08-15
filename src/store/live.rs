@@ -125,6 +125,7 @@ impl ChannelStore for LiveStore {
         if v != 0 { v } else { crate::types::now_ns() }
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn write_numeric(&self, channel: ChannelId, ts: i64, val: NumericVal) {
         self.writes.fetch_add(1, Ordering::Relaxed);
         match (&self.slot(channel).data, val) {
@@ -135,6 +136,7 @@ impl ChannelStore for LiveStore {
         }
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn write_text(&self, channel: ChannelId, ts: i64, line: String) {
         self.writes.fetch_add(1, Ordering::Relaxed);
         match &self.slot(channel).data {
