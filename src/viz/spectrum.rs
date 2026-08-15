@@ -1,4 +1,4 @@
-use eframe::egui::{self, Color32};
+use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
@@ -147,8 +147,11 @@ impl VizPanel for SpectrumPanel {
             return;
         };
         if !uniform {
+            // Theme-aware warning color (catppuccin peach): readable on both the
+            // light Latte and dark Mocha backgrounds, unlike a hard-coded yellow.
+            let warn = ui.visuals().warn_fg_color;
             ui.colored_label(
-                Color32::YELLOW,
+                warn,
                 "warning: non-uniform sample timestamps \u{2014} spectrum may be distorted",
             );
         }
