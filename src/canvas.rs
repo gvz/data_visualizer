@@ -390,29 +390,28 @@ pub fn show(
             });
         });
 
-        // Body + drop/menu overlay. The overlay (`drop_resp`) is a hover-only
-        // rect that carries the drag-drop target and the context menu. A hover
-        // rect swallows the *clicks* of widgets beneath it (though not their
-        // drags), so its z-order relative to the body depends on the panel kind:
-        //  - undefined → click-based type picker: overlay goes UNDER the picker
-        //    so its buttons stay clickable (the menu still opens on the empty
-        //    surround); otherwise the picker icons cannot be clicked.
-        //  - defined → drag-based body (e.g. a plot): overlay goes ON TOP so the
-        //    context menu opens anywhere over it, without blocking its drags.
+        // Body + drop/menu overlay. `drop_resp` carries the drag-drop target and
+        // the context menu, and is registered UNDER the body (before its content)
+        // so the panel's own widgets — the type-picker buttons, the waveform
+        // legend, plot handles — receive their clicks. This matters because
+        // `Response::context_menu` upgrades `drop_resp` to sense clicks, and a
+        // click-sensing rect ON TOP would win the click hit for the whole body
+        // (egui hit-testing: topmost click-sensing widget wins), swallowing those
+        // widgets' clicks. Drag-drop still works from underneath: it keys on
+        // `contains_pointer`, not z-order. The menu only wins where the body has
+        // no interactive widget of its own.
         let body_rect =
             egui::Rect::from_min_max(egui::pos2(px.left(), px.top() + TITLE_H), px.max).shrink(4.0);
-        let drop_resp = if is_undefined {
-            let r = ui.interact(body_rect, id.with("drop"), egui::Sense::hover());
+        let drop_resp = ui.interact(body_rect, id.with("drop"), egui::Sense::hover());
+        if is_undefined {
             ui.allocate_ui_at_rect(body_rect, |ui| {
                 draw_type_picker(ui, type_names, i, &mut events);
             });
-            r
         } else {
             ui.allocate_ui_at_rect(body_rect, |ui| {
                 panels[i].panel.render(ui, store);
             });
-            ui.interact(body_rect, id.with("drop"), egui::Sense::hover())
-        };
+        }
 
         // Resize grip, registered AFTER the body so it sits on top and is always
         // grabbable — even when the body's own widgets reach the bottom-right
@@ -569,6 +568,81 @@ mod tests {
         let out = resolve_resize(prev, desired, &[neighbor]);
         assert!(out.fx + out.fw <= 0.50 + 1e-4, "blocked at neighbor left edge");
         assert!(out.fw >= MIN - 1e-6);
+    }
+
+    /// The body's drop/menu rect must be registered UNDER the panel body so the
+    /// body's own interactive widgets (e.g. the waveform legend) still receive
+    /// clicks. Regression guard: `Response::context_menu` upgrades that rect to
+    /// sense clicks, so an on-top copy wins the click hit for the whole body and
+    /// swallows those widgets' clicks. Reproduces both orderings and injects a
+    /// real click on a body button.
+    #[test]
+    fn body_overlay_under_keeps_body_widget_clickable() {
+        use egui::{pos2, vec2, Event, PointerButton, Rect, Sense};
+
+        fn body_button_clicks_with_overlay(overlay_on_top: bool) -> bool {
+            let ctx = egui::Context::default();
+            let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 200.0));
+            let body = Rect::from_min_size(pos2(20.0, 20.0), vec2(140.0, 80.0));
+            let btn = Rect::from_min_size(pos2(45.0, 40.0), vec2(60.0, 24.0));
+            let center = btn.center();
+            let clicked = std::cell::Cell::new(false);
+
+            let frame = |events: Vec<Event>| {
+                let input =
+                    egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+                let _ = ctx.run(input, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        // The drop/menu rect: a hover rect that context_menu
+                        // upgrades to sense clicks, exactly like canvas `show`.
+                        let overlay = |ui: &mut egui::Ui| {
+                            let r = ui.interact(body, egui::Id::new("overlay"), Sense::hover());
+                            r.context_menu(|ui| {
+                                let _ = ui.button("menu");
+                            });
+                        };
+                        if !overlay_on_top {
+                            overlay(ui);
+                        }
+                        if ui.put(btn, egui::Button::new("b")).clicked() {
+                            clicked.set(true);
+                        }
+                        if overlay_on_top {
+                            overlay(ui);
+                        }
+                    });
+                });
+            };
+
+            frame(vec![]); // warm-up establishes widget geometry
+            frame(vec![
+                Event::PointerMoved(center),
+                Event::PointerButton {
+                    pos: center,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ]);
+            frame(vec![Event::PointerButton {
+                pos: center,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }]);
+            clicked.get()
+        }
+
+        // Overlay UNDER the body (the canvas order): body button stays clickable.
+        assert!(
+            body_button_clicks_with_overlay(false),
+            "body widget must receive clicks when the drop overlay is under it",
+        );
+        // Control: overlay ON TOP swallows the click — the bug this guards.
+        assert!(
+            !body_button_clicks_with_overlay(true),
+            "an on-top click-sensing overlay is expected to swallow body clicks",
+        );
     }
 
     #[test]
