@@ -99,13 +99,14 @@ impl VizPanel for XyScatterPanel {
             return;
         };
         let pts = index_align(&xv, &yv);
+        let dark = ui.visuals().dark_mode;
         Plot::new(("xy", &self.title))
             .data_aspect(1.0)
             .show(ui, |plot_ui| {
                 plot_ui.points(
                     Points::new(PlotPoints::from(pts))
                         .radius(1.5_f32)
-                        .color(crate::viz::common::binding_color(&self.y)),
+                        .color(crate::viz::common::binding_color(&self.y, dark)),
                 );
             });
     }

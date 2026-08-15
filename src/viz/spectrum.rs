@@ -161,13 +161,14 @@ impl VizPanel for SpectrumPanel {
             vec![1.0; self.fft_size]
         };
         let bins = spectrum_db(tail, &window, rate);
+        let dark = ui.visuals().dark_mode;
         Plot::new(("spectrum", &self.bound.name))
             .x_axis_label("Hz")
             .y_axis_label("dB")
             .show(ui, |plot_ui| {
                 plot_ui.line(
                     Line::new(PlotPoints::from(bins))
-                        .color(crate::viz::common::binding_color(&self.bound)),
+                        .color(crate::viz::common::binding_color(&self.bound, dark)),
                 );
             });
     }

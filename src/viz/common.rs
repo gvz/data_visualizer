@@ -105,24 +105,23 @@ pub struct Binding {
     pub auto_color: bool,
 }
 
-/// Qualitative palette (Tableau 10) for auto-coloring plotted series. Distinct,
-/// colorblind-friendlier than a single default gray.
-pub const PALETTE: &[Color32] = &[
-    Color32::from_rgb(0x1f, 0x77, 0xb4), // blue
-    Color32::from_rgb(0xff, 0x7f, 0x0e), // orange
-    Color32::from_rgb(0x2c, 0xa0, 0x2c), // green
-    Color32::from_rgb(0xd6, 0x27, 0x28), // red
-    Color32::from_rgb(0x94, 0x67, 0xbd), // purple
-    Color32::from_rgb(0x8c, 0x56, 0x4b), // brown
-    Color32::from_rgb(0xe3, 0x77, 0xc2), // pink
-    Color32::from_rgb(0xbc, 0xbd, 0x22), // olive
-    Color32::from_rgb(0x17, 0xbe, 0xcf), // cyan
-    Color32::from_rgb(0x7f, 0x7f, 0x7f), // gray
-];
+/// Qualitative palette for auto-coloring plotted series: the Catppuccin accent
+/// colors of the active flavor (Mocha in dark mode, Latte in light) so lines
+/// match the theme. Ordered for series distinctness — the first entries are the
+/// most visually separated, which matters when a panel plots only a handful of
+/// channels.
+pub fn palette_accents(dark: bool) -> [Color32; 14] {
+    let t = if dark { catppuccin_egui::MOCHA } else { catppuccin_egui::LATTE };
+    [
+        t.blue, t.peach, t.green, t.red, t.mauve, t.yellow, t.teal, t.pink,
+        t.sapphire, t.maroon, t.sky, t.lavender, t.flamingo, t.rosewater,
+    ]
+}
 
-/// Palette color for the i-th series (wraps around).
-pub fn palette_color(i: usize) -> Color32 {
-    PALETTE[i % PALETTE.len()]
+/// Palette color for the i-th series (wraps around), themed light/dark.
+pub fn palette_color(i: usize, dark: bool) -> Color32 {
+    let p = palette_accents(dark);
+    p[i % p.len()]
 }
 
 /// The channel-config default color; channels using it get palette colors.
@@ -132,12 +131,12 @@ const DEFAULT_CHANNEL_COLOR: &str = "#cccccc";
 /// color keyed by the channel's stable id when the color is left at the
 /// default. Keying on the id (not a per-panel series index) gives one channel
 /// the same auto color in every panel. Unresolved channels fall back to slot 0.
-/// Trade-off: two channels whose ids collide mod `PALETTE.len()` share a color
-/// even within one panel — accepted for cross-panel consistency (10 slots make
-/// collisions rare).
-pub fn binding_color(b: &Binding) -> Color32 {
+/// Trade-off: two channels whose ids collide mod the palette length share a
+/// color even within one panel — accepted for cross-panel consistency (14
+/// accent slots make collisions rare).
+pub fn binding_color(b: &Binding, dark: bool) -> Color32 {
     if b.auto_color {
-        palette_color(b.id.map(|c| c.0 as usize).unwrap_or(0))
+        palette_color(b.id.map(|c| c.0 as usize).unwrap_or(0), dark)
     } else {
         b.color
     }

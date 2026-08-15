@@ -184,8 +184,9 @@ impl VizPanel for WaveformPanel {
                 ui.add(egui::Label::new(egui::RichText::new(&prefix).weak()).selectable(false))
                     .on_hover_text("prefix shared by all channels");
             }
+            let dark = ui.visuals().dark_mode;
             for (i, b) in self.bound.iter().enumerate() {
-                let color = binding_color(b);
+                let color = binding_color(b, dark);
                 let hidden = self.hidden.contains(&b.name);
                 let swatch = if hidden { Color32::GRAY } else { color };
                 let text = egui::RichText::new(&shorts[i]).color(swatch);
@@ -330,13 +331,14 @@ impl VizPanel for WaveformPanel {
         // Timestamps where the polyline must not span the gap — the joins
         // between stitched recordings. Empty for a single file or live data.
         let breaks = store.break_times();
+        let dark = ui.visuals().dark_mode;
         let inner = plot.show(ui, |plot_ui| {
             for (i, ts, vals) in &snaps {
                 let b = &self.bound[*i];
                 if self.hidden.contains(&b.name) {
                     continue;
                 }
-                let color = binding_color(b);
+                let color = binding_color(b, dark);
                 // Split the samples at dataset breaks and draw one line per
                 // segment, so no segment bridges the gap between two recordings.
                 // Legend name goes on the first segment only.

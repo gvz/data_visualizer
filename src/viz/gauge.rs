@@ -92,7 +92,9 @@ impl VizPanel for GaugePanel {
         // the base color, then the channel's binding color.
         let bar_color = value
             .and_then(|v| self.colors.color_for(v))
-            .unwrap_or_else(|| crate::viz::common::binding_color(&self.bound));
+            .unwrap_or_else(|| {
+                crate::viz::common::binding_color(&self.bound, ui.visuals().dark_mode)
+            });
         let text = match value {
             Some(v) => {
                 let mut fill = rect;
