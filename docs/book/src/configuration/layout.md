@@ -46,6 +46,9 @@ One table per panel. Common keys:
   state graph).
 - Panel-specific keys — e.g. waveform's `cursors` and `dots`, status's
   `states`, gauge's min/max. Each panel type documents its own keys.
+- `colors` (waveform) — an optional `{ "channel.name" = "#rrggbb" }` table of
+  per-channel line-color overrides. Set from the legend's right-click menu;
+  channels without an entry cycle through the Catppuccin accent palette.
 
 Panels resolve channel *names* to ids through the channel registry at load. A
 name that does not resolve, or a channel of the wrong type for the panel, is

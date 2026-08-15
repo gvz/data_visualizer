@@ -6,9 +6,10 @@ use crate::config::ChannelRegistry;
 use crate::store::ChannelStore;
 use crate::types::{ChannelId, SampleType, TimeWindow};
 use crate::viz::common::{
-    bind, binding_color, binding_error, effective_window_s, format_time_of_day, label_config_row,
-    opt_bool, opt_f64_opt, opt_label, opt_str, opt_str_array, refresh_binding, serialize_label,
-    shorten_common_prefix, snapshot_to_f64, window_config_row, Binding, RebindCtx,
+    bind, binding_color, binding_error, color_to_hex, effective_window_s, format_time_of_day,
+    hex_to_color, label_config_row, opt_bool, opt_f64_opt, opt_label, opt_str, opt_str_array,
+    refresh_binding, serialize_label, shorten_common_prefix, snapshot_to_f64, theme_color_button,
+    window_config_row, Binding, RebindCtx,
 };
 use crate::viz::decimate::decimate_minmax;
 use crate::viz::measure::{stats, Stats};
@@ -57,6 +58,23 @@ pub struct WaveformPanel {
     /// drag-start. Needed on the release frame to know the box's opposite corner
     /// (the press origin is gone once the button is up). In-memory only.
     zoom_drag_origin: Option<egui::Pos2>,
+    /// Per-channel line-color overrides set from the legend's right-click menu,
+    /// keyed by channel name. Take precedence over the auto/registry color and
+    /// are persisted; absent entries fall back to `binding_color`.
+    color_overrides: std::collections::BTreeMap<String, Color32>,
+}
+
+/// Parse the `colors` config table (`{ "chan.name" = "#rrggbb" }`) into a
+/// name→color map; unparsable entries are skipped.
+fn parse_color_overrides(cfg: &toml::Table) -> std::collections::BTreeMap<String, Color32> {
+    cfg.get("colors")
+        .and_then(|v| v.as_table())
+        .map(|t| {
+            t.iter()
+                .filter_map(|(k, v)| Some((k.clone(), hex_to_color(v.as_str()?)?)))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub fn ctor(
@@ -64,7 +82,15 @@ pub fn ctor(
     reg: &ChannelRegistry,
 ) -> anyhow::Result<Box<dyn VizPanel>> {
     let names = opt_str_array(cfg, "channels");
-    let bound: Vec<Binding> = names.iter().map(|n| bind(n, reg, ACCEPTED)).collect();
+    let color_overrides = parse_color_overrides(cfg);
+    let mut bound: Vec<Binding> = names.iter().map(|n| bind(n, reg, ACCEPTED)).collect();
+    // Apply saved per-channel color overrides over the auto/registry color.
+    for b in &mut bound {
+        if let Some(c) = color_overrides.get(&b.name) {
+            b.color = *c;
+            b.auto_color = false;
+        }
+    }
     Ok(Box::new(WaveformPanel {
         title: names.join(", "),
         label: opt_label(cfg),
@@ -79,6 +105,7 @@ pub fn ctor(
         zoom: None,
         y_zoom: None,
         zoom_drag_origin: None,
+        color_overrides,
     }))
 }
 
@@ -171,10 +198,14 @@ impl VizPanel for WaveformPanel {
         }
 
         // Custom legend: left-click an entry toggles its visibility, right-click
-        // opens a menu to remove the channel from the panel. (egui_plot's built-in
+        // opens a menu to recolor or remove the channel. (egui_plot's built-in
         // legend exposes no per-item right-click, so we draw our own.)
         let mut toggle: Option<String> = None;
         let mut remove_idx: Option<usize> = None;
+        // Set by the legend menu: (channel index, Some(color) to override or
+        // None to revert to the automatic palette color). Applied after the loop
+        // since the loop borrows `self.bound` immutably.
+        let mut color_change: Option<(usize, Option<Color32>)> = None;
         // Drop the path prefix common to every channel and show it once, so
         // entries carry only the part that distinguishes them.
         let names: Vec<&str> = self.bound.iter().map(|b| b.name.as_str()).collect();
@@ -192,11 +223,27 @@ impl VizPanel for WaveformPanel {
                 let text = egui::RichText::new(&shorts[i]).color(swatch);
                 let resp = ui
                     .add(egui::Button::new(text).small().frame(false))
-                    .on_hover_text("click: show/hide — right-click: remove");
+                    .on_hover_text("click: show/hide — right-click: color / remove");
                 if resp.clicked() {
                     toggle = Some(b.name.clone());
                 }
                 resp.context_menu(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Color");
+                        let mut c = color;
+                        if theme_color_button(ui, &mut c).changed() {
+                            color_change = Some((i, Some(c)));
+                        }
+                    });
+                    // Only offer "automatic" when this channel is currently
+                    // overridden — otherwise it already uses the palette color.
+                    if !b.auto_color
+                        && ui.button(format!("{} Automatic color", icon::PALETTE)).clicked()
+                    {
+                        color_change = Some((i, None));
+                        ui.close_menu();
+                    }
+                    ui.separator();
                     if ui.button(format!("{} Remove channel", icon::TRASH)).clicked() {
                         remove_idx = Some(i);
                         ui.close_menu();
@@ -209,9 +256,25 @@ impl VizPanel for WaveformPanel {
                 self.hidden.insert(name);
             }
         }
+        if let Some((i, c)) = color_change {
+            let name = self.bound[i].name.clone();
+            match c {
+                Some(c) => {
+                    self.bound[i].color = c;
+                    self.bound[i].auto_color = false;
+                    self.color_overrides.insert(name, c);
+                }
+                None => {
+                    // Revert to the automatic palette color.
+                    self.bound[i].auto_color = true;
+                    self.color_overrides.remove(&name);
+                }
+            }
+        }
         if let Some(i) = remove_idx {
             let b = self.bound.remove(i);
             self.hidden.remove(&b.name);
+            self.color_overrides.remove(&b.name);
             self.title =
                 self.bound.iter().map(|b| b.name.as_str()).collect::<Vec<_>>().join(", ");
         }
@@ -555,6 +618,14 @@ impl VizPanel for WaveformPanel {
         if !self.y_unit.is_empty() {
             t.insert("y_unit".to_string(), toml::Value::String(self.y_unit.clone()));
         }
+        if !self.color_overrides.is_empty() {
+            let colors = self
+                .color_overrides
+                .iter()
+                .map(|(name, c)| (name.clone(), toml::Value::String(color_to_hex(*c))))
+                .collect();
+            t.insert("colors".to_string(), toml::Value::Table(colors));
+        }
         serialize_label(&mut t, &self.label);
         t
     }
@@ -636,6 +707,24 @@ dots = true"#,
         );
         let p = reg.build(&e, &channels).unwrap();
         assert_eq!(p.title(), "demo.sine");
+        assert_eq!(p.serialize(), e.config);
+    }
+
+    #[test]
+    fn color_override_round_trips() {
+        let channels = registry();
+        let reg = PanelRegistry::with_builtins();
+        let e = entry(
+            r##"type = "waveform"
+channels = ["demo.sine"]
+cursors = false
+dots = false
+
+[colors]
+"demo.sine" = "#ff8800""##,
+        );
+        let p = reg.build(&e, &channels).unwrap();
+        // The per-channel color override survives a build → serialize round-trip.
         assert_eq!(p.serialize(), e.config);
     }
 
@@ -723,6 +812,7 @@ channels = ["demo.sine"]"#,
             zoom: Some((200_000_000, 400_000_000)),
             y_zoom: None,
             zoom_drag_origin: None,
+            color_overrides: Default::default(),
         };
         let ctx = egui::Context::default();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
@@ -803,6 +893,7 @@ channels = ["demo.sine", "demo.log", "does.not.exist"]"#,
             // Vertical zoom set; horizontal scroll stays live.
             y_zoom: Some((-0.5, 0.5)),
             zoom_drag_origin: None,
+            color_overrides: Default::default(),
         };
         let ctx = egui::Context::default();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
@@ -858,6 +949,7 @@ channels = ["demo.sine", "demo.log", "does.not.exist"]"#,
             zoom: None,
             y_zoom: None,
             zoom_drag_origin: None,
+            color_overrides: Default::default(),
         };
         p.freeze_time_zoom((5, 9));
         assert_eq!(p.zoom, Some((5, 9)));
