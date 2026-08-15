@@ -1041,22 +1041,26 @@ impl eframe::App for DataVisApp {
         // 0 means "use wall clock"; non-zero freezes the view at that ns value.
         if matches!(self.mode, AppMode::Live) {
             let v = if self.live_paused {
-                // Freeze at the instant of the last live frame. Captured on the
-                // first paused frame (sentinel 0 = not yet captured); the value
-                // below is the same per-frame snapshot the panels rendered with,
-                // so the frozen view equals what was on screen — no jump across a
-                // sample boundary on pause.
+                // Capture the freeze instant on the first paused frame (sentinel
+                // 0 = not captured yet), using the wall clock the panels render
+                // with this frame — so the frozen view matches what is on screen
+                // instead of an earlier toolbar-time snapshot. Freeze the scrubbed
+                // instant if scrolled back, else the current wall clock.
                 if self.live_pause_ns == 0 {
-                    self.live_pause_ns = crate::types::now_ns() + self.live_view_offset_ns;
+                    self.live_pause_ns = if self.live_view_offset_ns != 0 {
+                        crate::types::now_ns() + self.live_view_offset_ns
+                    } else {
+                        crate::types::now_ns()
+                    };
                 }
                 self.live_pause_ns
             } else {
                 self.live_pause_ns = 0; // reset so the next pause recaptures
-                // Snapshot the wall clock every frame instead of falling through
-                // to 0, so every panel in a frame shares one `now_ns`. That makes
-                // the displayed value deterministic per frame; pausing then simply
-                // stops advancing it, keeping the badge on exactly what was shown.
-                crate::types::now_ns() + self.live_view_offset_ns
+                if self.live_view_offset_ns != 0 {
+                    crate::types::now_ns() + self.live_view_offset_ns
+                } else {
+                    0
+                }
             };
             self.live_view_ns.store(v, Ordering::Relaxed);
         }
