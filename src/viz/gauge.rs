@@ -13,8 +13,16 @@ pub const TYPE_NAME: &str = "gauge";
 
 const ACCEPTED: &[SampleType] = &[SampleType::Float, SampleType::Int];
 
-/// The empty-track color behind every gauge fill.
-const TRACK: Color32 = Color32::from_gray(40);
+/// The empty-track color behind every gauge fill: a dark trough in the Mocha
+/// theme, a light one in Latte (a near-black track looks wrong on the bright
+/// background).
+fn track_color(dark: bool) -> Color32 {
+    if dark {
+        Color32::from_gray(40)
+    } else {
+        Color32::from_gray(205)
+    }
+}
 
 /// Which shape the gauge draws its value with. `Bar` is the original horizontal
 /// fill and the default (so existing configs and their serialization are
@@ -228,10 +236,11 @@ impl GaugePanel {
     /// Horizontal bar filling left→right, with min/max labels beneath.
     fn draw_bar(&mut self, ui: &mut egui::Ui, value: Option<f64>) {
         let bar_color = self.fill_color(ui, value);
+        let track = track_color(ui.visuals().dark_mode);
         let desired = egui::vec2(ui.available_width().max(80.0), 32.0);
         let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
         let painter = ui.painter();
-        painter.rect_filled(rect, 4.0, TRACK);
+        painter.rect_filled(rect, 4.0, track);
         if let Some(v) = value {
             let mut fill = rect;
             fill.set_width(rect.width() * fraction(v, self.min, self.max));
@@ -252,6 +261,7 @@ impl GaugePanel {
     /// Vertical bar filling bottom→top, with max/min labels beside the ends.
     fn draw_vertical(&mut self, ui: &mut egui::Ui, value: Option<f64>) {
         let bar_color = self.fill_color(ui, value);
+        let track_col = track_color(ui.visuals().dark_mode);
         let text_col = ui.visuals().text_color();
         let avail = ui.available_size();
         let (rect, _) = ui.allocate_exact_size(
@@ -264,7 +274,7 @@ impl GaugePanel {
             egui::vec2(bar_w, rect.height()),
         );
         let painter = ui.painter();
-        painter.rect_filled(track, 4.0, TRACK);
+        painter.rect_filled(track, 4.0, track_col);
         if let Some(v) = value {
             let fill_h = track.height() * fraction(v, self.min, self.max);
             let fill = egui::Rect::from_min_max(
@@ -305,10 +315,11 @@ impl GaugePanel {
     fn draw_led(&mut self, ui: &mut egui::Ui, value: Option<f64>) {
         const N: usize = 20;
         let fallback = self.fill_color(ui, value);
+        let dark = ui.visuals().dark_mode;
         let desired = egui::vec2(ui.available_width().max(80.0), 32.0);
         let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
         let painter = ui.painter();
-        painter.rect_filled(rect, 4.0, TRACK);
+        painter.rect_filled(rect, 4.0, track_color(dark));
         let frac = value.map(|v| fraction(v, self.min, self.max)).unwrap_or(0.0);
         let lit = (frac * N as f32).round() as usize;
         let gap = 3.0;
@@ -323,7 +334,9 @@ impl GaugePanel {
                 let seg_val = self.min + ((i as f64 + 0.5) / N as f64) * (self.max - self.min);
                 self.colors.color_for(seg_val).unwrap_or(fallback)
             } else {
-                Color32::from_gray(64)
+                // Unlit segment: darker than the trough in Mocha, a touch
+                // darker than it in Latte so it still reads as "off".
+                if dark { Color32::from_gray(64) } else { Color32::from_gray(180) }
             };
             painter.rect_filled(seg, 2.0, col);
         }
@@ -357,8 +370,9 @@ impl GaugePanel {
         let center = egui::pos2(rect.center().x, rect.top() + rect.height() * 0.58);
         let radius = (rect.width().min(rect.height()) * 0.40).max(20.0);
         let thickness = (radius * 0.22).clamp(8.0, 22.0);
+        let track = track_color(dark);
         let painter = ui.painter();
-        stroke_arc(painter, center, radius, START, START - SWEEP, thickness, TRACK);
+        stroke_arc(painter, center, radius, START, START - SWEEP, thickness, track);
         if let Some(v) = value {
             let end = START - SWEEP * fraction(v, self.min, self.max) as f64;
             stroke_arc(painter, center, radius, START, end, thickness, bar_color);
