@@ -1,14 +1,16 @@
+use std::sync::Arc;
+
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 use rustfft::num_complex::Complex;
-use rustfft::FftPlanner;
+use rustfft::{Fft, FftPlanner};
 
 use crate::config::ChannelRegistry;
 use crate::store::ChannelStore;
 use crate::types::{ChannelId, SampleType, TimeWindow};
 use crate::viz::common::{
     bind, binding_error, label_config_row, opt_i64, opt_label, opt_str, refresh_binding,
-    serialize_label, snapshot_to_f64, Binding, RebindCtx,
+    serialize_label, Binding, RebindCtx,
 };
 use crate::viz::VizPanel;
 
@@ -22,6 +24,61 @@ pub struct SpectrumPanel {
     label: Option<String>,
     fft_size: usize,
     hann_window: bool,
+    /// Reused FFT plan + scratch/output buffers, rebuilt only when `fft_size`
+    /// or `hann_window` changes. Keeps the per-frame transform allocation-free.
+    fft: Option<FftCache>,
+    /// Time span (ns) of the window analysed last frame. Used to bound the next
+    /// frame's snapshot to just the tail the FFT needs instead of copying the
+    /// whole channel history. `None` until a sample rate has been established
+    /// (or after a short read), in which case that frame snapshots everything.
+    tail_span_ns: Option<i64>,
+}
+
+/// Cached FFT plan and buffers for one `(size, window)` pair, so a live
+/// spectrum panel allocates nothing per frame for the transform itself.
+struct FftCache {
+    size: usize,
+    hann: bool,
+    fft: Arc<dyn Fft<f64>>,
+    window: Vec<f64>,
+    buf: Vec<Complex<f64>>,
+    scratch: Vec<Complex<f64>>,
+    bins: Vec<[f64; 2]>,
+}
+
+impl FftCache {
+    fn new(size: usize, hann_win: bool) -> Self {
+        let fft = FftPlanner::new().plan_fft_forward(size);
+        let scratch = vec![Complex::new(0.0, 0.0); fft.get_inplace_scratch_len()];
+        FftCache {
+            size,
+            hann: hann_win,
+            fft,
+            window: if hann_win { hann(size) } else { vec![1.0; size] },
+            buf: vec![Complex::new(0.0, 0.0); size],
+            scratch,
+            bins: vec![[0.0; 2]; size / 2],
+        }
+    }
+
+    /// Transform `tail` (len == `size`) in place and fill the reused `bins` with
+    /// (freq_hz, magnitude_db) for bins `0..size/2`. Returns the bins slice.
+    fn compute(&mut self, tail: &[f64], sample_rate: f64) -> &[[f64; 2]] {
+        let n = self.size;
+        for (b, (&s, &w)) in self.buf.iter_mut().zip(tail.iter().zip(&self.window)) {
+            *b = Complex::new(s * w, 0.0);
+        }
+        self.fft.process_with_scratch(&mut self.buf, &mut self.scratch);
+        let scale = 2.0 / n as f64;
+        for (i, out) in self.bins.iter_mut().enumerate() {
+            let mag = self.buf[i].norm() * scale;
+            *out = [
+                i as f64 * sample_rate / n as f64,
+                20.0 * mag.max(1e-12).log10(),
+            ];
+        }
+        &self.bins
+    }
 }
 
 pub fn ctor(
@@ -42,6 +99,8 @@ pub fn ctor(
         label: opt_label(cfg),
         fft_size,
         hann_window,
+        fft: None,
+        tail_span_ns: None,
     }))
 }
 
@@ -52,7 +111,9 @@ pub(crate) fn hann(n: usize) -> Vec<f64> {
         .collect()
 }
 
-/// (freq_hz, magnitude_db) for bins 0..n/2.
+/// (freq_hz, magnitude_db) for bins 0..n/2. Reference implementation used by the
+/// unit test; the live panel uses [`FftCache`] to avoid per-frame allocation.
+#[cfg(test)]
 pub(crate) fn spectrum_db(samples: &[f64], window: &[f64], sample_rate: f64) -> Vec<[f64; 2]> {
     let n = samples.len();
     debug_assert_eq!(n, window.len());
@@ -113,6 +174,7 @@ impl VizPanel for SpectrumPanel {
         });
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn render(&mut self, ui: &mut egui::Ui, store: &dyn ChannelStore) {
         if self.bound.name.is_empty() {
             ui.label(egui::RichText::new("Drop a channel here").weak());
@@ -130,13 +192,26 @@ impl VizPanel for SpectrumPanel {
         // select which window is analyzed, not always the newest sample. In sync
         // mode the shared zoom window bounds it so the FFT is computed over the
         // data in the zoomed range.
-        let (start_ns, end_ns) = crate::viz::common::linked_window(ui.ctx())
-            .unwrap_or((i64::MIN, store.now_ns()));
-        let snap = store.snapshot(id, TimeWindow { start_ns, end_ns: end_ns + 1 });
-        let Some((ts, vals)) = snapshot_to_f64(&snap) else {
+        // Only the newest `fft_size` samples feed the FFT, so bound the snapshot
+        // to a recent span rather than copying the whole history every frame
+        // (which dominated this panel's per-frame allocation). In linked-zoom
+        // mode the shared window governs instead. `tail_span_ns` is `None` on the
+        // first frame (or after a short read), which snapshots everything once to
+        // re-establish the rate.
+        let (start_ns, end_ns) = crate::viz::common::linked_window(ui.ctx()).unwrap_or_else(|| {
+            let now = store.now_ns();
+            (self.tail_span_ns.map(|s| now - s).unwrap_or(i64::MIN), now)
+        });
+        let Some((ts, vals)) = store
+            .snapshot(id, TimeWindow { start_ns, end_ns: end_ns + 1 })
+            .into_f64()
+        else {
             return;
         };
         if vals.len() < self.fft_size {
+            // A bounded snapshot fell short (rate rose, or a burst gap): widen
+            // back to the full history next frame so the panel self-heals.
+            self.tail_span_ns = None;
             ui.label(format!("collecting\u{2026} {}/{}", vals.len(), self.fft_size));
             return;
         }
@@ -155,21 +230,25 @@ impl VizPanel for SpectrumPanel {
                 "warning: non-uniform sample timestamps \u{2014} spectrum may be distorted",
             );
         }
-        let window = if self.hann_window {
-            hann(self.fft_size)
-        } else {
-            vec![1.0; self.fft_size]
-        };
-        let bins = spectrum_db(tail, &window, rate);
-        let dark = ui.visuals().dark_mode;
+        // Bound next frame's snapshot to ~2× the span these `fft_size` samples
+        // cover, absorbing rate wobble and bursty arrival.
+        self.tail_span_ns = Some(((self.fft_size as f64 / rate) * 2.0e9).ceil() as i64);
+
+        // (Re)build the plan only when size or window changed; otherwise reuse.
+        if self
+            .fft
+            .as_ref()
+            .map_or(true, |c| c.size != self.fft_size || c.hann != self.hann_window)
+        {
+            self.fft = Some(FftCache::new(self.fft_size, self.hann_window));
+        }
+        let color = crate::viz::common::binding_color(&self.bound, ui.visuals().dark_mode);
+        let bins = self.fft.as_mut().unwrap().compute(tail, rate).to_vec();
         Plot::new(("spectrum", &self.bound.name))
             .x_axis_label("Hz")
             .y_axis_label("dB")
             .show(ui, |plot_ui| {
-                plot_ui.line(
-                    Line::new(PlotPoints::from(bins))
-                        .color(crate::viz::common::binding_color(&self.bound, dark)),
-                );
+                plot_ui.line(Line::new(PlotPoints::from(bins)).color(color));
             });
     }
 
