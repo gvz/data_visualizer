@@ -13,8 +13,16 @@ pub const TYPE_NAME: &str = "status";
 
 const ACCEPTED: &[SampleType] = &[SampleType::Text, SampleType::Int, SampleType::Bool];
 
-/// Fallback badge fill for a value with no configured state entry.
-const UNMAPPED_COLOR: Color32 = Color32::from_gray(70);
+/// Fallback badge fill for a value with no configured state entry: a dark gray
+/// in the Mocha theme, a light one in Latte (a near-black badge looks wrong on
+/// the bright background). Configured state colors are used as-is.
+fn unmapped_color(dark: bool) -> Color32 {
+    if dark {
+        Color32::from_gray(70)
+    } else {
+        Color32::from_gray(200)
+    }
+}
 
 /// The string match key for a sample: `Text` as-is, `Int`/`Bool` stringified.
 /// `Float` has no discrete key (the type is rejected before render).
@@ -194,6 +202,7 @@ impl VizPanel for StatusPanel {
             .unwrap_or_else(|| store.now_ns());
         let sample = store.latest_at(id, at).map(|(_, s)| s);
         let key = sample.as_ref().and_then(sample_to_key);
+        let unmapped = unmapped_color(ui.visuals().dark_mode);
         // Matched entry → its label+color; unmapped value → raw text on gray;
         // no sample → dash on gray. `key` is None only when there is no sample:
         // Float is rejected at bind time (ACCEPTED), so it never reaches
@@ -201,9 +210,9 @@ impl VizPanel for StatusPanel {
         let (text, color) = match &key {
             Some(k) => match self.states.lookup(k) {
                 Some(e) => (e.display().to_string(), e.color),
-                None => (k.clone(), UNMAPPED_COLOR),
+                None => (k.clone(), unmapped),
             },
-            None => ("\u{2014}".to_string(), UNMAPPED_COLOR),
+            None => ("\u{2014}".to_string(), unmapped),
         };
 
         let desired = egui::vec2(ui.available_width().max(80.0), 48.0);
