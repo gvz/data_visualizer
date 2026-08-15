@@ -196,6 +196,30 @@ impl ChannelStore for LiveStore {
         }
     }
 
+    fn latest_at(&self, channel: ChannelId, end_ns: i64) -> Option<(i64, Sample)> {
+        // Fast path: the newest sample is already at/before the cutoff.
+        match self.latest(channel) {
+            None => return None,
+            Some((t, s)) if t <= end_ns => return Some((t, s)),
+            _ => {}
+        }
+        // Scrubbed (or paused) into the past. Coded text stores interned integer
+        // codes, so the generic snapshot path would hand back a raw `Int` code —
+        // the badge would show a number instead of the label. Decode it here
+        // against this channel's codec; every other kind keeps the default
+        // windowed-last behavior.
+        let slot = self.try_slot(channel)?;
+        let window = TimeWindow { start_ns: i64::MIN, end_ns: end_ns + 1 };
+        if let ChannelData::CodedText { ring, codec } = &slot.data {
+            let (mut ts, mut vals) = (Vec::new(), Vec::new());
+            ring.read_window(window, &mut ts, &mut vals);
+            let (t, code) = (*ts.last()?, *vals.last()?);
+            let label = codec.lock().unwrap().label(code).unwrap_or("").to_string();
+            return Some((t, Sample::Text(label)));
+        }
+        crate::store::snapshot_last(&self.snapshot(channel, window))
+    }
+
     fn recent_timestamps(&self, channel: ChannelId, max: usize) -> Vec<i64> {
         let Some(slot) = self.try_slot(channel) else {
             return Vec::new();
@@ -311,6 +335,35 @@ max_lines = 10
         assert_eq!(vals[200], 2); // error
         // latest reconstructs the string.
         assert_eq!(store.latest(id), Some((1999, Sample::Text("running".into()))));
+    }
+
+    /// `latest_at` on a coded-text channel must decode to the label even when the
+    /// cutoff scrubs behind the newest sample — the generic snapshot path returns
+    /// raw `Int` codes, which would show as a number on a status badge.
+    #[test]
+    fn latest_at_decodes_coded_text_when_scrubbed_back() {
+        let reg = registry();
+        let store = LiveStore::from_registry(&reg);
+        let id = crate::types::ChannelId(reg.len() as u32);
+        store.add_channel(ChannelMeta {
+            name: "vx/state".into(),
+            sample_type: SampleType::Text,
+            unit: String::new(),
+            color: "#cccccc".into(),
+            max_rate: 100,
+            history_s: 10.0,
+            max_lines: 5,
+            text_coded: true,
+        });
+        store.write_text(id, 10, "idle".into());
+        store.write_text(id, 20, "running".into());
+        // Cutoff between the two samples: the newest ("running"@20) is excluded,
+        // so this exercises the windowed-last branch. Must be the decoded label.
+        assert_eq!(store.latest_at(id, 15), Some((10, Sample::Text("idle".into()))));
+        // Cutoff behind everything: no sample.
+        assert_eq!(store.latest_at(id, 5), None);
+        // Cutoff at/after the newest: fast path, decoded label.
+        assert_eq!(store.latest_at(id, 25), Some((20, Sample::Text("running".into()))));
     }
 
     #[test]

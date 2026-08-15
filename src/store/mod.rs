@@ -82,7 +82,7 @@ pub trait ChannelStore: Send + Sync {
 }
 
 /// Last (newest) sample of a snapshot, if any.
-fn snapshot_last(snap: &ChannelSnapshot) -> Option<(i64, Sample)> {
+pub(crate) fn snapshot_last(snap: &ChannelSnapshot) -> Option<(i64, Sample)> {
     match snap {
         ChannelSnapshot::Float { ts, vals } => Some((*ts.last()?, Sample::Float(*vals.last()?))),
         ChannelSnapshot::Int { ts, vals } => Some((*ts.last()?, Sample::Int(*vals.last()?))),
