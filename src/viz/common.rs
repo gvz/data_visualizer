@@ -6,7 +6,7 @@ use eframe::egui::{self, Color32};
 use crate::config::ChannelRegistry;
 use crate::dynamic_channel::{resolve_or_register_drop, MqttTopicMap};
 use crate::store::ChannelStore;
-use crate::types::{ChannelId, ChannelSnapshot, Sample, SampleType};
+use crate::types::{ChannelId, Sample, SampleType};
 
 /// The 14 Catppuccin accent colors of the active flavor — Mocha in dark mode,
 /// Latte in light — as `(name, color)` pairs for quick-select swatches.
@@ -386,20 +386,6 @@ pub fn outlined_text(
     painter.text(center, egui::Align2::CENTER_CENTER, text, font, color);
 }
 
-/// Numeric snapshot as (borrowed ts, owned f64 values). None for Text.
-pub fn snapshot_to_f64(snap: &ChannelSnapshot) -> Option<(&[i64], Vec<f64>)> {
-    match snap {
-        ChannelSnapshot::Float { ts, vals } => Some((ts, vals.clone())),
-        ChannelSnapshot::Int { ts, vals } => {
-            Some((ts, vals.iter().map(|&v| v as f64).collect()))
-        }
-        ChannelSnapshot::Bool { ts, vals } => {
-            Some((ts, vals.iter().map(|&v| v as f64).collect()))
-        }
-        ChannelSnapshot::Text { .. } => None,
-    }
-}
-
 pub fn sample_as_f64(s: &Sample) -> Option<f64> {
     match s {
         Sample::Float(v) => Some(*v),
@@ -719,7 +705,7 @@ pub fn opt_str_array(cfg: &toml::Table, key: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::SampleType;
+    use crate::types::{ChannelSnapshot, SampleType};
 
     #[test]
     fn hex_color_round_trips() {
@@ -828,10 +814,10 @@ type = "text"
     #[test]
     fn snapshot_conversions() {
         let snap = ChannelSnapshot::Int { ts: vec![1, 2], vals: vec![10, 20] };
-        let (ts, vals) = snapshot_to_f64(&snap).unwrap();
-        assert_eq!(ts, &[1, 2]);
+        let (ts, vals) = snap.into_f64().unwrap();
+        assert_eq!(ts, vec![1, 2]);
         assert_eq!(vals, vec![10.0, 20.0]);
-        assert!(snapshot_to_f64(&ChannelSnapshot::Text { lines: vec![] }).is_none());
+        assert!(ChannelSnapshot::Text { lines: vec![] }.into_f64().is_none());
         assert_eq!(sample_as_f64(&Sample::Bool(true)), Some(1.0));
         assert_eq!(sample_as_f64(&Sample::Text("x".into())), None);
     }

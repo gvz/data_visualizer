@@ -65,18 +65,7 @@ pub struct ScriptRunner {
 /// Convert a numeric snapshot into parallel (ts, f64 vals). Text snapshots
 /// (never a script input) yield empty arrays.
 fn snapshot_to_f64(snap: ChannelSnapshot) -> (Vec<i64>, Vec<f64>) {
-    match snap {
-        ChannelSnapshot::Float { ts, vals } => (ts, vals),
-        ChannelSnapshot::Int { ts, vals } => {
-            let f = vals.into_iter().map(|v| v as f64).collect();
-            (ts, f)
-        }
-        ChannelSnapshot::Bool { ts, vals } => {
-            let f = vals.into_iter().map(|v| v as f64).collect();
-            (ts, f)
-        }
-        ChannelSnapshot::Text { .. } => (Vec::new(), Vec::new()),
-    }
+    snap.into_f64().unwrap_or_default()
 }
 
 /// Cast a computed f64 to the channel's declared numeric type.

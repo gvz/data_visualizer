@@ -8,8 +8,8 @@ use crate::types::{ChannelId, SampleType, TimeWindow};
 use crate::viz::common::{
     bind, binding_color, binding_error, catppuccin_color_body, color_to_hex, effective_window_s,
     format_time_of_day, hex_to_color, label_config_row, opt_bool, opt_f64_opt, opt_label, opt_str,
-    opt_str_array, refresh_binding, serialize_label, shorten_common_prefix, snapshot_to_f64,
-    window_config_row, Binding, RebindCtx,
+    opt_str_array, refresh_binding, serialize_label, shorten_common_prefix, window_config_row,
+    Binding, RebindCtx,
 };
 use crate::viz::decimate::decimate_minmax;
 use crate::viz::measure::{stats, Stats};
@@ -188,6 +188,7 @@ impl VizPanel for WaveformPanel {
         });
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn render(&mut self, ui: &mut egui::Ui, store: &dyn ChannelStore) {
         if self.bound.is_empty() {
             ui.label(egui::RichText::new("Drop channels here").weak());
@@ -337,9 +338,8 @@ impl VizPanel for WaveformPanel {
         let mut snaps: Vec<(usize, Vec<i64>, Vec<f64>)> = Vec::new();
         for (i, b) in self.bound.iter().enumerate() {
             let (Some(id), true) = (b.id, b.type_ok) else { continue };
-            let snap = store.snapshot(id, window);
-            if let Some((ts, vals)) = snapshot_to_f64(&snap) {
-                snaps.push((i, ts.to_vec(), vals));
+            if let Some((ts, vals)) = store.snapshot(id, window).into_f64() {
+                snaps.push((i, ts, vals));
             }
         }
 

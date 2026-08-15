@@ -120,6 +120,23 @@ impl ChannelSnapshot {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Consume into parallel `(timestamps, values-as-f64)`. `Float` moves its
+    /// buffers with no copy; `Int`/`Bool` convert element-wise; `Text` yields
+    /// `None`. Preferred over cloning a borrowed snapshot in the hot render
+    /// path — panels own the snapshot, so moving avoids a per-frame copy.
+    pub fn into_f64(self) -> Option<(Vec<i64>, Vec<f64>)> {
+        match self {
+            ChannelSnapshot::Float { ts, vals } => Some((ts, vals)),
+            ChannelSnapshot::Int { ts, vals } => {
+                Some((ts, vals.into_iter().map(|v| v as f64).collect()))
+            }
+            ChannelSnapshot::Bool { ts, vals } => {
+                Some((ts, vals.into_iter().map(|v| v as f64).collect()))
+            }
+            ChannelSnapshot::Text { .. } => None,
+        }
+    }
 }
 
 /// Wall clock as i64 ns since Unix epoch.

@@ -6,7 +6,7 @@ use crate::store::ChannelStore;
 use crate::types::{ChannelId, SampleType, TimeWindow};
 use crate::viz::common::{
     bind, binding_error, effective_window_s, label_config_row, opt_f64_opt, opt_label, opt_str,
-    refresh_binding, serialize_label, snapshot_to_f64, window_config_row, Binding, RebindCtx,
+    refresh_binding, serialize_label, window_config_row, Binding, RebindCtx,
 };
 use crate::viz::VizPanel;
 
@@ -93,9 +93,9 @@ impl VizPanel for XyScatterPanel {
                 TimeWindow { start_ns: end_ns - span, end_ns: end_ns + 1 }
             }
         };
-        let xs = store.snapshot(xid, window);
-        let ys = store.snapshot(yid, window);
-        let (Some((_, xv)), Some((_, yv))) = (snapshot_to_f64(&xs), snapshot_to_f64(&ys)) else {
+        let (Some((_, xv)), Some((_, yv))) =
+            (store.snapshot(xid, window).into_f64(), store.snapshot(yid, window).into_f64())
+        else {
             return;
         };
         let pts = index_align(&xv, &yv);
