@@ -12,7 +12,7 @@ error — it never crashes.
 | `waveform` | float, int, bool | Scrolling time-series with a configurable window, cursors and measurements |
 | `spectrum` | float, int | FFT spectrum (via `rustfft`), configurable window function; warns on non-uniform timestamps |
 | `numeric` | float, int, bool | A large single-value readout with a unit label |
-| `gauge` | float, int | Arc / bar gauge with a configurable min/max |
+| `gauge` | float, int | Single value in a bar, vertical bar, LED meter, or arc dial (`style` key), with a configurable min/max |
 | `xy_scatter` | float, int | Two channels as X/Y (index-aligned), Lissajous-style |
 | `state_graph` | bool, int, text | Grafana-style coloured bands over time |
 | `status` | text, int, bool | A single current-value state indicator (see below) |

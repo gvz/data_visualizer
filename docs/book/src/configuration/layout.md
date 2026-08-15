@@ -46,6 +46,9 @@ One table per panel. Common keys:
   state graph).
 - Panel-specific keys — e.g. waveform's `cursors` and `dots`, status's
   `states`, gauge's min/max. Each panel type documents its own keys.
+- `style` (gauge) — the gauge shape: `bar` (default, horizontal fill),
+  `vertical` (bottom-up bar), `led` (segmented VU meter), or `arc` (270°
+  dial). Chosen from the panel's settings; omitted from config when `bar`.
 - `colors` (waveform) — an optional `{ "channel.name" = "#rrggbb" }` table of
   per-channel line-color overrides. Set from the legend's right-click menu;
   channels without an entry cycle through the Catppuccin accent palette.

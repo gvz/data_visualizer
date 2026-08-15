@@ -1,4 +1,4 @@
-use eframe::egui::{self, Color32, FontId};
+use eframe::egui::{self, Align2, Color32, FontId, Pos2, Sense, Stroke};
 
 use crate::config::ChannelRegistry;
 use crate::store::ChannelStore;
@@ -13,14 +13,56 @@ pub const TYPE_NAME: &str = "gauge";
 
 const ACCEPTED: &[SampleType] = &[SampleType::Float, SampleType::Int];
 
-/// Horizontal bar gauge showing the latest value within [min, max].
+/// The empty-track color behind every gauge fill.
+const TRACK: Color32 = Color32::from_gray(40);
+
+/// Which shape the gauge draws its value with. `Bar` is the original horizontal
+/// fill and the default (so existing configs and their serialization are
+/// unchanged); the others are chosen in the panel settings.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum GaugeStyle {
+    /// Horizontal bar filling left→right.
+    #[default]
+    Bar,
+    /// Vertical bar filling bottom→top.
+    Vertical,
+    /// Row of discrete lit segments (VU-meter look).
+    Led,
+    /// 270° radial dial arc.
+    Arc,
+}
+
+impl GaugeStyle {
+    fn parse(s: &str) -> Self {
+        match s {
+            "vertical" => GaugeStyle::Vertical,
+            "led" => GaugeStyle::Led,
+            "arc" => GaugeStyle::Arc,
+            _ => GaugeStyle::Bar,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            GaugeStyle::Bar => "bar",
+            GaugeStyle::Vertical => "vertical",
+            GaugeStyle::Led => "led",
+            GaugeStyle::Arc => "arc",
+        }
+    }
+}
+
+/// Single-value gauge showing the latest sample within [min, max]. The `style`
+/// field selects the shape; all styles share the min/max range and the color
+/// thresholds.
 pub struct GaugePanel {
     bound: Binding,
     label: Option<String>,
     min: f64,
     max: f64,
-    /// Color cutoffs applied to the bar fill.
+    /// Color cutoffs applied to the fill.
     colors: ColorThresholds,
+    style: GaugeStyle,
 }
 
 pub fn ctor(
@@ -39,11 +81,40 @@ pub fn ctor(
         min,
         max,
         colors: ColorThresholds::from_config(cfg),
+        style: GaugeStyle::parse(&opt_str(cfg, "style")),
     }))
 }
 
 pub(crate) fn fraction(v: f64, min: f64, max: f64) -> f32 {
     (((v - min) / (max - min)).clamp(0.0, 1.0)) as f32
+}
+
+/// Point on a circle of radius `r` around `center` at `deg` degrees, measured
+/// from the +x axis with angles rising counterclockwise on screen (y is down,
+/// so the sine is negated).
+fn arc_point(center: Pos2, r: f32, deg: f64) -> Pos2 {
+    let a = deg.to_radians();
+    egui::pos2(center.x + r * a.cos() as f32, center.y - r * a.sin() as f32)
+}
+
+/// Stroke a circular arc from `from_deg` to `to_deg` as a polyline.
+fn stroke_arc(
+    painter: &egui::Painter,
+    center: Pos2,
+    r: f32,
+    from_deg: f64,
+    to_deg: f64,
+    width: f32,
+    color: Color32,
+) {
+    const STEPS: usize = 64;
+    let pts: Vec<Pos2> = (0..=STEPS)
+        .map(|i| {
+            let t = i as f64 / STEPS as f64;
+            arc_point(center, r, from_deg + (to_deg - from_deg) * t)
+        })
+        .collect();
+    painter.add(egui::Shape::line(pts, Stroke::new(width, color)));
 }
 
 impl VizPanel for GaugePanel {
@@ -57,6 +128,13 @@ impl VizPanel for GaugePanel {
 
     fn config_ui(&mut self, ui: &mut egui::Ui) {
         label_config_row(ui, &mut self.label, &self.bound.name);
+        ui.horizontal(|ui| {
+            ui.label("style:");
+            ui.selectable_value(&mut self.style, GaugeStyle::Bar, "Bar");
+            ui.selectable_value(&mut self.style, GaugeStyle::Vertical, "Vertical");
+            ui.selectable_value(&mut self.style, GaugeStyle::Led, "LED");
+            ui.selectable_value(&mut self.style, GaugeStyle::Arc, "Arc");
+        });
         ui.horizontal(|ui| {
             ui.label("min:");
             ui.add(egui::DragValue::new(&mut self.min).speed(0.1));
@@ -84,48 +162,12 @@ impl VizPanel for GaugePanel {
             .map(|(_, end)| end)
             .unwrap_or_else(|| store.now_ns());
         let value = store.latest_at(id, at).and_then(|(_, s)| sample_as_f64(&s));
-        let desired = egui::vec2(ui.available_width().max(80.0), 32.0);
-        let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
-        let painter = ui.painter();
-        painter.rect_filled(rect, 4.0, Color32::from_gray(40));
-        // Bar color follows the thresholds; below all of them it falls back to
-        // the base color, then the channel's binding color.
-        let bar_color = value
-            .and_then(|v| self.colors.color_for(v))
-            .unwrap_or_else(|| {
-                crate::viz::common::binding_color(&self.bound, ui.visuals().dark_mode)
-            });
-        let text = match value {
-            Some(v) => {
-                let mut fill = rect;
-                fill.set_width(rect.width() * fraction(v, self.min, self.max));
-                painter.rect_filled(fill, 4.0, bar_color);
-                format!("{v:.3} {}", self.bound.unit)
-            }
-            None => "—".to_string(),
-        };
-        // Keep the readout legible over any fill: pick black on light bars,
-        // white on dark ones, and outline with the opposite so the part of the
-        // text over the unfilled track stays readable too.
-        let (fg, outline) = if is_light(bar_color) {
-            (Color32::BLACK, Color32::WHITE)
-        } else {
-            (Color32::WHITE, Color32::BLACK)
-        };
-        outlined_text(
-            painter,
-            rect.center(),
-            &text,
-            FontId::proportional(16.0),
-            fg,
-            outline,
-        );
-        ui.horizontal(|ui| {
-            ui.label(format!("{:.1}", self.min));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(format!("{:.1}", self.max));
-            });
-        });
+        match self.style {
+            GaugeStyle::Bar => self.draw_bar(ui, value),
+            GaugeStyle::Vertical => self.draw_vertical(ui, value),
+            GaugeStyle::Led => self.draw_led(ui, value),
+            GaugeStyle::Arc => self.draw_arc(ui, value),
+        }
     }
 
     fn serialize(&self) -> toml::Table {
@@ -133,6 +175,10 @@ impl VizPanel for GaugePanel {
         t.insert("channel".to_string(), toml::Value::String(self.bound.name.clone()));
         t.insert("min".to_string(), toml::Value::Float(self.min));
         t.insert("max".to_string(), toml::Value::Float(self.max));
+        // Omit the default so bar gauges serialize exactly as before.
+        if self.style != GaugeStyle::Bar {
+            t.insert("style".to_string(), toml::Value::String(self.style.as_str().to_string()));
+        }
         serialize_label(&mut t, &self.label);
         self.colors.write_config(&mut t);
         t
@@ -148,6 +194,215 @@ impl VizPanel for GaugePanel {
 
     fn data_channels(&self) -> Vec<ChannelId> {
         self.bound.id.into_iter().collect()
+    }
+}
+
+impl GaugePanel {
+    /// "value unit" for a reading, or an em dash when there is no sample.
+    fn readout(&self, value: Option<f64>) -> String {
+        match value {
+            Some(v) => format!("{v:.3} {}", self.bound.unit),
+            None => "—".to_string(),
+        }
+    }
+
+    /// Fill color: the highest matching threshold, else the base color, else the
+    /// channel's binding color.
+    fn fill_color(&self, ui: &egui::Ui, value: Option<f64>) -> Color32 {
+        value.and_then(|v| self.colors.color_for(v)).unwrap_or_else(|| {
+            crate::viz::common::binding_color(&self.bound, ui.visuals().dark_mode)
+        })
+    }
+
+    /// Text + outline that stays legible over a fill of `on` color: black on
+    /// light fills, white on dark, outlined with the opposite so the part over
+    /// the empty track reads too.
+    fn readout_colors(on: Color32) -> (Color32, Color32) {
+        if is_light(on) {
+            (Color32::BLACK, Color32::WHITE)
+        } else {
+            (Color32::WHITE, Color32::BLACK)
+        }
+    }
+
+    /// Horizontal bar filling left→right, with min/max labels beneath.
+    fn draw_bar(&mut self, ui: &mut egui::Ui, value: Option<f64>) {
+        let bar_color = self.fill_color(ui, value);
+        let desired = egui::vec2(ui.available_width().max(80.0), 32.0);
+        let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
+        let painter = ui.painter();
+        painter.rect_filled(rect, 4.0, TRACK);
+        if let Some(v) = value {
+            let mut fill = rect;
+            fill.set_width(rect.width() * fraction(v, self.min, self.max));
+            painter.rect_filled(fill, 4.0, bar_color);
+        }
+        let (fg, outline) = Self::readout_colors(bar_color);
+        outlined_text(
+            painter,
+            rect.center(),
+            &self.readout(value),
+            FontId::proportional(16.0),
+            fg,
+            outline,
+        );
+        self.range_row(ui);
+    }
+
+    /// Vertical bar filling bottom→top, with max/min labels beside the ends.
+    fn draw_vertical(&mut self, ui: &mut egui::Ui, value: Option<f64>) {
+        let bar_color = self.fill_color(ui, value);
+        let text_col = ui.visuals().text_color();
+        let avail = ui.available_size();
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(avail.x.max(48.0), avail.y.max(80.0)),
+            Sense::hover(),
+        );
+        let bar_w = (rect.width() * 0.5).clamp(24.0, 64.0);
+        let track = egui::Rect::from_center_size(
+            egui::pos2(rect.center().x, rect.center().y),
+            egui::vec2(bar_w, rect.height()),
+        );
+        let painter = ui.painter();
+        painter.rect_filled(track, 4.0, TRACK);
+        if let Some(v) = value {
+            let fill_h = track.height() * fraction(v, self.min, self.max);
+            let fill = egui::Rect::from_min_max(
+                egui::pos2(track.min.x, track.max.y - fill_h),
+                track.max,
+            );
+            painter.rect_filled(fill, 4.0, bar_color);
+        }
+        let (fg, outline) = Self::readout_colors(bar_color);
+        outlined_text(
+            painter,
+            track.center(),
+            &self.readout(value),
+            FontId::proportional(16.0),
+            fg,
+            outline,
+        );
+        let font = FontId::proportional(12.0);
+        painter.text(
+            egui::pos2(track.right() + 6.0, track.top()),
+            Align2::LEFT_TOP,
+            format!("{:.1}", self.max),
+            font.clone(),
+            text_col,
+        );
+        painter.text(
+            egui::pos2(track.right() + 6.0, track.bottom()),
+            Align2::LEFT_BOTTOM,
+            format!("{:.1}", self.min),
+            font,
+            text_col,
+        );
+    }
+
+    /// Row of discrete lit segments (VU meter). Each segment is colored by the
+    /// threshold at the value it represents, so a green→amber→red ramp emerges
+    /// naturally; unlit segments are dim.
+    fn draw_led(&mut self, ui: &mut egui::Ui, value: Option<f64>) {
+        const N: usize = 20;
+        let fallback = self.fill_color(ui, value);
+        let desired = egui::vec2(ui.available_width().max(80.0), 32.0);
+        let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
+        let painter = ui.painter();
+        painter.rect_filled(rect, 4.0, TRACK);
+        let frac = value.map(|v| fraction(v, self.min, self.max)).unwrap_or(0.0);
+        let lit = (frac * N as f32).round() as usize;
+        let gap = 3.0;
+        let seg_w = (rect.width() - gap * (N as f32 + 1.0)) / N as f32;
+        for i in 0..N {
+            let x0 = rect.left() + gap + i as f32 * (seg_w + gap);
+            let seg = egui::Rect::from_min_size(
+                egui::pos2(x0, rect.top() + gap),
+                egui::vec2(seg_w.max(1.0), rect.height() - 2.0 * gap),
+            );
+            let col = if i < lit {
+                let seg_val = self.min + ((i as f64 + 0.5) / N as f64) * (self.max - self.min);
+                self.colors.color_for(seg_val).unwrap_or(fallback)
+            } else {
+                Color32::from_gray(64)
+            };
+            painter.rect_filled(seg, 2.0, col);
+        }
+        let (fg, outline) = Self::readout_colors(fallback);
+        outlined_text(
+            painter,
+            rect.center(),
+            &self.readout(value),
+            FontId::proportional(16.0),
+            fg,
+            outline,
+        );
+        self.range_row(ui);
+    }
+
+    /// 270° dial arc sweeping from the lower-left up over the top to the
+    /// lower-right, with the reading in the hub and min/max at the arc ends.
+    fn draw_arc(&mut self, ui: &mut egui::Ui, value: Option<f64>) {
+        // Sweep: lower-left (225°) clockwise to lower-right (-45°).
+        const START: f64 = 225.0;
+        const SWEEP: f64 = 270.0;
+        let bar_color = self.fill_color(ui, value);
+        let dark = ui.visuals().dark_mode;
+        let text_col = ui.visuals().text_color();
+        let avail = ui.available_size();
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(avail.x.max(80.0), avail.y.max(80.0)),
+            Sense::hover(),
+        );
+        // Center below the geometric middle so the 270° arc's bottom gap fits.
+        let center = egui::pos2(rect.center().x, rect.top() + rect.height() * 0.58);
+        let radius = (rect.width().min(rect.height()) * 0.40).max(20.0);
+        let thickness = (radius * 0.22).clamp(8.0, 22.0);
+        let painter = ui.painter();
+        stroke_arc(painter, center, radius, START, START - SWEEP, thickness, TRACK);
+        if let Some(v) = value {
+            let end = START - SWEEP * fraction(v, self.min, self.max) as f64;
+            stroke_arc(painter, center, radius, START, end, thickness, bar_color);
+        }
+        let (fg, outline) = if dark {
+            (Color32::WHITE, Color32::BLACK)
+        } else {
+            (Color32::BLACK, Color32::WHITE)
+        };
+        outlined_text(
+            painter,
+            center,
+            &self.readout(value),
+            FontId::proportional(18.0),
+            fg,
+            outline,
+        );
+        let font = FontId::proportional(12.0);
+        let lo = arc_point(center, radius, START);
+        let hi = arc_point(center, radius, START - SWEEP);
+        painter.text(
+            lo + egui::vec2(0.0, thickness),
+            Align2::CENTER_TOP,
+            format!("{:.1}", self.min),
+            font.clone(),
+            text_col,
+        );
+        painter.text(
+            hi + egui::vec2(0.0, thickness),
+            Align2::CENTER_TOP,
+            format!("{:.1}", self.max),
+            font,
+            text_col,
+        );
+    }
+
+    /// The min (left) / max (right) label row beneath the horizontal styles.
+    fn range_row(&self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(format!("{:.1}", self.min));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(format!("{:.1}", self.max));
+            });
+        });
     }
 }
 
@@ -240,24 +495,55 @@ max = 5.0"#,
     }
 
     #[test]
-    fn renders_headless_without_panic() {
+    fn style_round_trips_and_bar_is_omitted() {
+        let channels = registry();
+        let reg = PanelRegistry::with_builtins();
+        // A non-default style serializes its key and round-trips.
+        let e: PanelEntry = toml::from_str(
+            r#"type = "gauge"
+channel = "demo.sine"
+min = 0.0
+max = 100.0
+style = "arc""#,
+        )
+        .unwrap();
+        let out = reg.build(&e, &channels).unwrap().serialize();
+        assert_eq!(out.get("style").and_then(|v| v.as_str()), Some("arc"));
+        assert_eq!(out, e.config);
+
+        // The default bar style omits the key entirely (config stability).
+        let e: PanelEntry = toml::from_str(
+            r#"type = "gauge"
+channel = "demo.sine"
+min = 0.0
+max = 100.0
+style = "bar""#,
+        )
+        .unwrap();
+        let out = reg.build(&e, &channels).unwrap().serialize();
+        assert!(out.get("style").is_none());
+    }
+
+    #[test]
+    fn every_style_renders_headless_without_panic() {
         let channels = registry();
         let store = LiveStore::from_registry(&channels);
         let id = channels.id("demo.sine").unwrap();
         store.write_numeric(id, 1, NumericVal::Float(3.0));
         let reg = PanelRegistry::with_builtins();
-        let e: PanelEntry = toml::from_str(
-            r#"type = "gauge"
-channel = "demo.sine""#,
-        )
-        .unwrap();
-        let mut p = reg.build(&e, &channels).unwrap();
-        let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                p.render(ui, &store);
-                p.config_ui(ui);
+        for style in ["bar", "vertical", "led", "arc"] {
+            let e: PanelEntry = toml::from_str(&format!(
+                "type = \"gauge\"\nchannel = \"demo.sine\"\nstyle = \"{style}\""
+            ))
+            .unwrap();
+            let mut p = reg.build(&e, &channels).unwrap();
+            let ctx = egui::Context::default();
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    p.render(ui, &store);
+                    p.config_ui(ui);
+                });
             });
-        });
+        }
     }
 }
