@@ -328,21 +328,18 @@ pub fn show(
         let others: Vec<NormRect> =
             rects.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, r)| *r).collect();
 
-        // Interactions FIRST so the panel body's own widgets sit on top.
+        // Title-bar drag moves the panel. Registered before the title-bar
+        // buttons so those sit on top and stay clickable. The resize grip is
+        // registered AFTER the body (below), so it stays grabbable over a
+        // panel whose own body reaches the corner (e.g. the state graph's
+        // interactive legend).
         let title_resp = ui.interact(title_rect, id.with("title"), egui::Sense::click_and_drag());
-        let grip_resp = ui.interact(grip_rect, id.with("grip"), egui::Sense::drag());
 
         if title_resp.dragged() {
             let d = px_delta_to_norm(title_resp.drag_delta(), canvas);
             let desired = NormRect { fx: rects[i].fx + d.x, fy: rects[i].fy + d.y, ..rects[i] };
             let snapped = snap_move(desired, &others, snap);
             layout[i].rect = resolve_move(rects[i], snapped, &others);
-        }
-        if grip_resp.dragged() {
-            let d = px_delta_to_norm(grip_resp.drag_delta(), canvas);
-            let desired = NormRect { fw: rects[i].fw + d.x, fh: rects[i].fh + d.y, ..rects[i] };
-            let snapped = snap_resize(desired, &others, snap);
-            layout[i].rect = resolve_resize(rects[i], snapped, &others);
         }
 
         // Chrome.
@@ -354,17 +351,6 @@ pub fn show(
             egui::Rounding { nw: 4.0, ne: 4.0, sw: 0.0, se: 0.0 },
             v.widgets.active.bg_fill,
         );
-        // Resize grip: two short diagonal ticks.
-        let gs = grip_rect.shrink(3.0);
-        for off in [0.0, 4.0] {
-            ui.painter().line_segment(
-                [
-                    egui::pos2(gs.right() - off, gs.bottom()),
-                    egui::pos2(gs.right(), gs.bottom() - off),
-                ],
-                egui::Stroke::new(1.0_f32, v.weak_text_color()),
-            );
-        }
 
         let is_undefined = panels[i].type_name == placeholder::TYPE_NAME;
 
@@ -395,6 +381,28 @@ pub fn show(
                 panels[i].panel.render(ui, store);
             }
         });
+
+        // Resize grip, registered AFTER the body so it sits on top and is always
+        // grabbable — even when the body's own widgets reach the bottom-right
+        // corner (the state graph's legend swatches otherwise stole the drag).
+        let grip_resp = ui.interact(grip_rect, id.with("grip"), egui::Sense::drag());
+        if grip_resp.dragged() {
+            let d = px_delta_to_norm(grip_resp.drag_delta(), canvas);
+            let desired = NormRect { fw: rects[i].fw + d.x, fh: rects[i].fh + d.y, ..rects[i] };
+            let snapped = snap_resize(desired, &others, snap);
+            layout[i].rect = resolve_resize(rects[i], snapped, &others);
+        }
+        // Resize grip: two short diagonal ticks, painted on top of the body.
+        let gs = grip_rect.shrink(3.0);
+        for off in [0.0, 4.0] {
+            ui.painter().line_segment(
+                [
+                    egui::pos2(gs.right() - off, gs.bottom()),
+                    egui::pos2(gs.right(), gs.bottom() - off),
+                ],
+                egui::Stroke::new(1.0_f32, v.weak_text_color()),
+            );
+        }
 
         // Drag-drop channels onto the panel BODY. Scoped to `body_rect` (not the
         // full `px`): a full-panel interactive rect registered here — after the

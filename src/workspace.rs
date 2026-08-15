@@ -683,6 +683,59 @@ channel = "demo.sine"
         );
     }
 
+    /// Dragging the bottom-right grip resizes the panel even when the body's own
+    /// widgets reach the corner. Regression guard: a state graph's interactive
+    /// legend sits at the panel's bottom and used to steal the grip drag, so the
+    /// panel could not be resized there (the drag "went into the legend").
+    #[test]
+    fn grip_drag_resizes_over_state_graph_legend() {
+        use egui::{pos2, vec2, Event, PointerButton, Rect};
+        let ch = channels();
+        let reg = PanelRegistry::with_builtins();
+        let store = LiveStore::from_registry(&ch);
+        // A short, wide state graph with many legend entries so the legend wraps
+        // across the bottom, up to the bottom-right grip.
+        let cfg = LayoutConfig::from_toml_str(
+            "[[screens.main.panels]]\ntype = \"state_graph\"\nframe = [0.05,0.05,0.9,0.15]\nchannel = \"demo.counter\"\nstates = { 0=\"AA\", 1=\"BB\", 2=\"CC\", 3=\"DD\", 4=\"EE\", 5=\"FF\", 6=\"GG\", 7=\"HH\" }\n",
+        )
+        .unwrap();
+        // Give it a sample so it renders bands + legend (not the "no data" stub).
+        store.write_numeric(ch.id("demo.counter").unwrap(), 1, NumericVal::Int(3));
+
+        let mut ws = Workspace::from_config(&cfg, &reg, &ch);
+        ws.active = "main".to_string();
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+        let run = |ws: &mut Workspace, events: Vec<Event>| {
+            let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| { ws.ui(ui, &store, &ch, &reg, None); });
+            });
+        };
+        run(&mut ws, vec![]);
+        // Locate the grip from the panel's actual pixel rect (the CentralPanel
+        // insets the canvas, so compute rather than assume 800x600 maps 1:1).
+        let start = ws.screens["main"].layout[0].rect.fh;
+        let corner = {
+            let r = ws.screens["main"].layout[0].rect;
+            // Canvas is inset ~8px; derive the panel's bottom-right and step
+            // inside the 12px grip.
+            let cx = 8.0 + (r.fx + r.fw) * 784.0;
+            let cy = 8.0 + (r.fy + r.fh) * 584.0;
+            pos2(cx - 6.0, cy - 6.0)
+        };
+        run(&mut ws, vec![
+            Event::PointerMoved(corner),
+            Event::PointerButton { pos: corner, button: PointerButton::Primary, pressed: true, modifiers: Default::default() },
+        ]);
+        let c2 = pos2(corner.x, corner.y + 180.0);
+        run(&mut ws, vec![Event::PointerMoved(c2)]);
+        run(&mut ws, vec![Event::PointerMoved(c2)]);
+        let grown = ws.screens["main"].layout[0].rect.fh;
+        run(&mut ws, vec![Event::PointerButton { pos: c2, button: PointerButton::Primary, pressed: false, modifiers: Default::default() }]);
+        assert!(grown > start + 0.05, "grip drag over the legend should grow panel height: start={start} got {grown}");
+    }
+
     /// Right-clicking a panel's title bar opens its context menu and the
     /// "Remove panel" item deletes it. Regression guard: the menu must be
     /// reachable on the title bar, not only the body.
