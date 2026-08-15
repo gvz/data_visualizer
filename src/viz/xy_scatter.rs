@@ -3,7 +3,7 @@ use egui_plot::{Plot, PlotPoints, Points};
 
 use crate::config::ChannelRegistry;
 use crate::store::ChannelStore;
-use crate::types::{SampleType, TimeWindow};
+use crate::types::{ChannelId, SampleType, TimeWindow};
 use crate::viz::common::{
     bind, binding_error, effective_window_s, label_config_row, opt_f64_opt, opt_label, opt_str,
     refresh_binding, serialize_label, snapshot_to_f64, window_config_row, Binding, RebindCtx,
@@ -131,6 +131,10 @@ impl VizPanel for XyScatterPanel {
     fn refresh_bindings(&mut self, ctx: &RebindCtx) {
         refresh_binding(&mut self.x, ACCEPTED, ctx);
         refresh_binding(&mut self.y, ACCEPTED, ctx);
+    }
+
+    fn data_channels(&self) -> Vec<ChannelId> {
+        [self.x.id, self.y.id].into_iter().flatten().collect()
     }
 }
 

@@ -170,6 +170,10 @@ impl VizPanel for NumericPanel {
             self.drop_channel(&name, ctx.channels);
         }
     }
+
+    fn data_channels(&self) -> Vec<ChannelId> {
+        self.channel.into_iter().collect()
+    }
 }
 
 #[cfg(test)]

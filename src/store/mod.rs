@@ -47,6 +47,24 @@ pub trait ChannelStore: Send + Sync {
         0
     }
 
+    /// Newest up-to-`max` sample timestamps for `channel`, oldest-first, used
+    /// for data-freshness detection (learning a channel's inter-arrival
+    /// cadence). The default reads a full snapshot and keeps the tail;
+    /// [`LiveStore`] overrides it for a bounded, values-free ring read.
+    fn recent_timestamps(&self, channel: ChannelId, max: usize) -> Vec<i64> {
+        let snap =
+            self.snapshot(channel, TimeWindow { start_ns: i64::MIN, end_ns: i64::MAX });
+        let mut ts: Vec<i64> = match snap {
+            ChannelSnapshot::Float { ts, .. }
+            | ChannelSnapshot::Int { ts, .. }
+            | ChannelSnapshot::Bool { ts, .. } => ts,
+            ChannelSnapshot::Text { lines } => lines.into_iter().map(|(t, _)| t).collect(),
+        };
+        let start = ts.len().saturating_sub(max);
+        ts.drain(..start);
+        ts
+    }
+
     /// Newest sample at or before `end_ns`. When panels pass `now_ns()`, this
     /// honors the live scrub slider (and replay position) instead of always
     /// returning the very latest sample.

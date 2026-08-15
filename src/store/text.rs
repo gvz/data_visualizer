@@ -36,6 +36,15 @@ impl TextBuf {
     pub fn latest(&self) -> Option<(i64, String)> {
         self.lines.lock().unwrap().back().cloned()
     }
+
+    /// Newest up-to-`max` timestamps, oldest-first, without cloning the lines.
+    /// For data-freshness cadence estimation.
+    pub fn recent_timestamps(&self, max: usize, out: &mut Vec<i64>) {
+        out.clear();
+        let lines = self.lines.lock().unwrap();
+        let start = lines.len().saturating_sub(max);
+        out.extend(lines.iter().skip(start).map(|(ts, _)| *ts));
+    }
 }
 
 #[cfg(test)]

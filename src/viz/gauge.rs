@@ -2,7 +2,7 @@ use eframe::egui::{self, Color32, FontId};
 
 use crate::config::ChannelRegistry;
 use crate::store::ChannelStore;
-use crate::types::SampleType;
+use crate::types::{ChannelId, SampleType};
 use crate::viz::common::{
     bind, binding_error, is_light, label_config_row, opt_f64, opt_label, opt_str, outlined_text,
     refresh_binding, sample_as_f64, serialize_label, Binding, ColorThresholds, RebindCtx,
@@ -142,6 +142,10 @@ impl VizPanel for GaugePanel {
 
     fn refresh_bindings(&mut self, ctx: &RebindCtx) {
         refresh_binding(&mut self.bound, ACCEPTED, ctx);
+    }
+
+    fn data_channels(&self) -> Vec<ChannelId> {
+        self.bound.id.into_iter().collect()
     }
 }
 

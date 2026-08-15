@@ -4,7 +4,7 @@ use egui_plot::{Line, MarkerShape, Plot, PlotPoints, Points, VLine};
 
 use crate::config::ChannelRegistry;
 use crate::store::ChannelStore;
-use crate::types::{SampleType, TimeWindow};
+use crate::types::{ChannelId, SampleType, TimeWindow};
 use crate::viz::common::{
     bind, binding_color, binding_error, effective_window_s, format_time_of_day, label_config_row,
     opt_bool, opt_f64_opt, opt_label, opt_str, opt_str_array, refresh_binding, serialize_label,
@@ -579,6 +579,10 @@ impl VizPanel for WaveformPanel {
         self.zoom = None;
         self.y_zoom = None;
         self.zoom_drag_origin = None;
+    }
+
+    fn data_channels(&self) -> Vec<ChannelId> {
+        self.bound.iter().filter_map(|b| b.id).collect()
     }
 }
 

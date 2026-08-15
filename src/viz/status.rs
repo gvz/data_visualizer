@@ -2,7 +2,7 @@ use eframe::egui::{self, Color32, FontId};
 
 use crate::config::ChannelRegistry;
 use crate::store::ChannelStore;
-use crate::types::{Sample, SampleType};
+use crate::types::{ChannelId, Sample, SampleType};
 use crate::viz::common::{
     bind, binding_error, color_to_hex, hex_to_color, is_light, label_config_row, linked_window,
     opt_label, opt_str, outlined_text, refresh_binding, serialize_label, Binding, RebindCtx,
@@ -234,6 +234,10 @@ impl VizPanel for StatusPanel {
 
     fn refresh_bindings(&mut self, ctx: &RebindCtx) {
         refresh_binding(&mut self.bound, ACCEPTED, ctx);
+    }
+
+    fn data_channels(&self) -> Vec<ChannelId> {
+        self.bound.id.into_iter().collect()
     }
 }
 

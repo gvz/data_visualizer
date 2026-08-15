@@ -354,9 +354,28 @@ pub fn show(
 
         let is_undefined = panels[i].type_name == placeholder::TYPE_NAME;
 
+        // Data-freshness dot: worst state across the panel's channels, judged
+        // against each channel's own learned inter-arrival cadence. Undefined
+        // (type-picker) panels have no channels, so no dot.
+        let fresh = if is_undefined {
+            crate::freshness::DataFreshness::NoData
+        } else {
+            crate::freshness::panel_freshness(
+                store,
+                &panels[i].panel.data_channels(),
+                store.now_ns(),
+            )
+        };
+
         // Title bar contents.
         ui.allocate_ui_at_rect(title_rect.shrink2(egui::vec2(6.0, 2.0)), |ui| {
             ui.horizontal(|ui| {
+                if let Some(color) = fresh.dot_color() {
+                    let (rect, resp) =
+                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 4.0, color);
+                    resp.on_hover_text(fresh.tooltip());
+                }
                 if !is_undefined {
                     ui.strong(panels[i].panel.title());
                 }

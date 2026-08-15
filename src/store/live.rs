@@ -196,6 +196,21 @@ impl ChannelStore for LiveStore {
         }
     }
 
+    fn recent_timestamps(&self, channel: ChannelId, max: usize) -> Vec<i64> {
+        let Some(slot) = self.try_slot(channel) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        match &slot.data {
+            ChannelData::Float(r) => r.recent_timestamps(max, &mut out),
+            ChannelData::Int(r) => r.recent_timestamps(max, &mut out),
+            ChannelData::Bool(r) => r.recent_timestamps(max, &mut out),
+            ChannelData::CodedText { ring, .. } => ring.recent_timestamps(max, &mut out),
+            ChannelData::Text(t) => t.recent_timestamps(max, &mut out),
+        }
+        out
+    }
+
     fn channel_meta(&self, channel: ChannelId) -> &ChannelMeta {
         &self.slot(channel).meta
     }
@@ -314,6 +329,26 @@ max_lines = 10
         }
         assert_eq!(store.latest(ahead), None);
         assert_eq!(store.latest_at(ahead, i64::MAX), None);
+    }
+
+    #[test]
+    fn recent_timestamps_returns_bounded_tail_oldest_first() {
+        let reg = registry();
+        let store = LiveStore::from_registry(&reg);
+        let fa = reg.id("a.float").unwrap();
+        for i in 0..50i64 {
+            store.write_numeric(fa, i, NumericVal::Float(i as f64));
+        }
+        // Newest 5 timestamps, oldest-first.
+        let ts = store.recent_timestamps(fa, 5);
+        assert_eq!(ts, vec![45, 46, 47, 48, 49]);
+        // Fewer samples than asked for → all of them.
+        let td = reg.id("d.log").unwrap();
+        store.write_text(td, 100, "a".into());
+        store.write_text(td, 200, "b".into());
+        assert_eq!(store.recent_timestamps(td, 10), vec![100, 200]);
+        // Empty channel → empty.
+        assert!(store.recent_timestamps(reg.id("b.int").unwrap(), 5).is_empty());
     }
 
     #[test]

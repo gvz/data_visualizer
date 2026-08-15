@@ -60,7 +60,9 @@ shown as an inline error — never a crash.
    snap to each other's edges and sizes and block on contact, so they never
    overlap.
 4. Right-click a panel (title bar or body) for its menu: **Settings**, **Reset
-   zoom**, and **Remove panel**. The title-bar gear and ✕ do the same.
+   zoom**, and **Remove panel**. The title-bar gear and ✕ do the same. The dot
+   in the title bar tracks data freshness — green when samples arrive at the
+   channel's usual cadence, amber when they slow, red when they stop.
 5. Drag channels from the sidebar onto a panel. Select several and drop them
    together onto a multi-channel panel.
 6. The arrangement is saved back to `config.toml` automatically.

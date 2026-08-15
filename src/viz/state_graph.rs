@@ -4,7 +4,7 @@ use eframe::egui::{self, Align2, Color32, FontId};
 
 use crate::config::ChannelRegistry;
 use crate::store::ChannelStore;
-use crate::types::{ChannelSnapshot, SampleType, TimeWindow};
+use crate::types::{ChannelId, ChannelSnapshot, SampleType, TimeWindow};
 use crate::viz::common::{
     bind, binding_error, effective_window_s, format_time_of_day, frame_clock, label_config_row,
     opt_f64_opt, opt_label, opt_str, refresh_binding, serialize_label, window_config_row, Binding,
@@ -495,6 +495,10 @@ impl VizPanel for StateGraphPanel {
 
     fn refresh_bindings(&mut self, ctx: &RebindCtx) {
         refresh_binding(&mut self.bound, ACCEPTED, ctx);
+    }
+
+    fn data_channels(&self) -> Vec<ChannelId> {
+        self.bound.id.into_iter().collect()
     }
 }
 

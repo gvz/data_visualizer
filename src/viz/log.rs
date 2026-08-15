@@ -2,7 +2,7 @@ use eframe::egui;
 
 use crate::config::ChannelRegistry;
 use crate::store::ChannelStore;
-use crate::types::{ChannelSnapshot, SampleType, TimeWindow};
+use crate::types::{ChannelId, ChannelSnapshot, SampleType, TimeWindow};
 use crate::viz::common::{
     bind, binding_error, format_time_of_day, label_config_row, opt_i64, opt_label, opt_str_array,
     refresh_binding, serialize_label, Binding, RebindCtx,
@@ -140,6 +140,10 @@ impl VizPanel for LogPanel {
         for b in &mut self.bound {
             refresh_binding(b, ACCEPTED, ctx);
         }
+    }
+
+    fn data_channels(&self) -> Vec<ChannelId> {
+        self.bound.iter().filter_map(|b| b.id).collect()
     }
 }
 

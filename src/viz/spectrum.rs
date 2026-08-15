@@ -5,7 +5,7 @@ use rustfft::FftPlanner;
 
 use crate::config::ChannelRegistry;
 use crate::store::ChannelStore;
-use crate::types::{SampleType, TimeWindow};
+use crate::types::{ChannelId, SampleType, TimeWindow};
 use crate::viz::common::{
     bind, binding_error, label_config_row, opt_i64, opt_label, opt_str, refresh_binding,
     serialize_label, snapshot_to_f64, Binding, RebindCtx,
@@ -187,6 +187,10 @@ impl VizPanel for SpectrumPanel {
 
     fn refresh_bindings(&mut self, ctx: &RebindCtx) {
         refresh_binding(&mut self.bound, ACCEPTED, ctx);
+    }
+
+    fn data_channels(&self) -> Vec<ChannelId> {
+        self.bound.id.into_iter().collect()
     }
 }
 

@@ -96,6 +96,35 @@ impl<T: Copy + Default> SoaRing<T> {
         }
     }
 
+    /// Copies the newest up-to-`max` timestamps into `out` (cleared first),
+    /// oldest-first, without touching the value array. For data-freshness
+    /// cadence estimation, which needs only the recent timestamps. Retries if
+    /// lapped by the producer, like [`read_window`](Self::read_window).
+    pub fn recent_timestamps(&self, max: usize, out: &mut Vec<i64>) {
+        loop {
+            out.clear();
+            let head = self.head.load(Ordering::Acquire);
+            if head == 0 || max == 0 {
+                return;
+            }
+            let visible_cap = self.cap as u64 - self.margin;
+            let valid_lo = head.saturating_sub(visible_cap);
+            let want = (max as u64).min(head - valid_lo);
+            let lo = head - want;
+            for seq in lo..head {
+                // Safety: see module-level safety comment; validated after loop.
+                out.push(unsafe { *self.ts[self.slot(seq)].get() });
+            }
+            // Slots touched are all >= lo >= valid_lo, so the same overwrite
+            // check as read_window applies.
+            let head2 = self.head.load(Ordering::Acquire);
+            if head2 < valid_lo + self.cap as u64 {
+                return;
+            }
+            // Lapped mid-read — discard and retry.
+        }
+    }
+
     /// Copies all samples with ts in [window.start_ns, window.end_ns) into
     /// the output vectors (cleared first), oldest first. Assumes timestamps
     /// were pushed in non-decreasing order. Retries if lapped by producer.

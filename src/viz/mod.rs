@@ -5,7 +5,7 @@ use eframe::egui;
 
 use crate::config::{ChannelRegistry, PanelEntry};
 use crate::store::ChannelStore;
-use crate::types::SampleType;
+use crate::types::{ChannelId, SampleType};
 
 pub mod common;
 pub mod decimate;
@@ -104,6 +104,14 @@ pub trait VizPanel {
     /// `range` as the `(start, end)` timestamps in nanoseconds. Default no-op;
     /// waveform and state_graph override.
     fn freeze_time_zoom(&mut self, _range: (i64, i64)) {}
+
+    /// Resolved channel ids this panel currently reads, for the title-bar
+    /// data-freshness dot. Empty (the default) draws no dot — for channel-less
+    /// panels or ones whose binding is still unresolved. Channel-bound panels
+    /// override to list the ids they read.
+    fn data_channels(&self) -> Vec<ChannelId> {
+        Vec::new()
+    }
 }
 
 /// Builds a [`VizPanel`] from its serialized form.
