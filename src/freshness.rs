@@ -29,10 +29,10 @@ pub enum DataFreshness {
     Stalled,
 }
 
-/// Newest sample timestamps used to estimate cadence. 17 timestamps give 16
-/// inter-arrival gaps — enough to a stable median without being sensitive to
-/// one outlier.
-const SAMPLE_WINDOW: usize = 17;
+/// Newest sample timestamps used to estimate cadence. A wider window is more
+/// likely to include the channel's normal quiet periods, so event-driven
+/// sources are judged against a realistic gap rather than a burst.
+const SAMPLE_WINDOW: usize = 33;
 
 impl DataFreshness {
     /// The title-bar dot color, or `None` when no dot should be drawn.
@@ -60,23 +60,27 @@ impl DataFreshness {
 /// Classify one channel's freshness from its recent sample timestamps
 /// (oldest-first) against the current clock `now_ns`.
 ///
-/// Needs at least three timestamps: two gaps to form a median cadence, so a
-/// genuinely slow-but-steady channel is not mistaken for a stalled one. Fewer
-/// than that is [`DataFreshness::NoData`].
+/// The cadence baseline is the *longest* recent inter-arrival gap, not the
+/// median: event- and diff-driven sources (which push only on change) sit
+/// quiet between updates, so judging against their busiest interval would cry
+/// "offline" during a perfectly normal lull. Measuring against the longest
+/// normal quiet keeps the dot green through those lulls and only reddens once
+/// the silence clearly exceeds anything the channel has shown recently.
+///
+/// Needs at least three timestamps (two gaps) to have a baseline; fewer is
+/// [`DataFreshness::NoData`].
 pub fn classify(ts: &[i64], now_ns: i64) -> DataFreshness {
     if ts.len() < 3 {
         return DataFreshness::NoData;
     }
     let last = *ts.last().unwrap();
-    let mut gaps: Vec<i64> = ts.windows(2).map(|w| w[1] - w[0]).collect();
-    gaps.sort_unstable();
-    // Guard against a zero/negative median (duplicate timestamps) so the
-    // multiples below stay meaningful.
-    let median = gaps[gaps.len() / 2].max(1);
+    // Longest recent gap, clamped to ≥1 ns so duplicate timestamps can't zero
+    // out the multiples below.
+    let baseline = ts.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(1).max(1);
     let age = (now_ns - last).max(0);
-    if age < 2 * median {
+    if age < 2 * baseline {
         DataFreshness::Fresh
-    } else if age < 6 * median {
+    } else if age < 5 * baseline {
         DataFreshness::Slowing
     } else {
         DataFreshness::Stalled
@@ -110,23 +114,34 @@ mod tests {
 
     #[test]
     fn on_cadence_is_fresh() {
-        // 10 ns cadence, newest sample 5 ns ago (< 2×10).
+        // Longest gap 10 ns, newest sample 5 ns ago (< 2×10).
         let ts = [0, 10, 20, 30, 40];
         assert_eq!(classify(&ts, 45), DataFreshness::Fresh);
     }
 
     #[test]
-    fn overdue_two_to_six_intervals_is_slowing() {
-        // 10 ns cadence, newest sample 40 ns ago (2×..6×).
+    fn overdue_two_to_five_intervals_is_slowing() {
+        // Longest gap 10 ns, newest sample 40 ns ago (2×..5×).
         let ts = [0, 10, 20, 30, 40];
         assert_eq!(classify(&ts, 80), DataFreshness::Slowing);
     }
 
     #[test]
     fn long_gap_is_stalled() {
-        // 10 ns cadence, newest sample 100 ns ago (≥ 6×).
+        // Longest gap 10 ns, newest sample 100 ns ago (≥ 5×).
         let ts = [0, 10, 20, 30, 40];
         assert_eq!(classify(&ts, 140), DataFreshness::Stalled);
+    }
+
+    #[test]
+    fn bursty_on_change_source_stays_fresh_during_normal_lull() {
+        // An event-/diff-driven source: two bursts ~98 ns apart, so the longest
+        // normal gap is 98 ns. A lull shorter than 2× that must stay Fresh
+        // rather than falsely reading as stopped.
+        let ts = [0, 1, 2, 100, 101, 102, 200];
+        assert_eq!(classify(&ts, 350), DataFreshness::Fresh); // 150 ns lull
+        // Only silence well past the longest normal gap reads as stopped.
+        assert_eq!(classify(&ts, 200 + 5 * 98), DataFreshness::Stalled);
     }
 
     #[test]
