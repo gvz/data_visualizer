@@ -55,12 +55,15 @@ shown as an inline error — never a crash.
 
 1. Add a panel from the toolbar, or right-click empty canvas → **Add panel here**.
 2. Choose a panel type from the picker.
-3. Drag a panel by its title bar to move it; drag the bottom-right grip to
-   resize. Panels snap to each other's edges and sizes and block on contact, so
-   they never overlap.
-4. Drag channels from the sidebar onto a panel. Select several and drop them
+3. Drag a panel by its title bar to move it — or hold **Ctrl** (**⌘** on macOS)
+   and drag anywhere in the panel. Drag the bottom-right grip to resize. Panels
+   snap to each other's edges and sizes and block on contact, so they never
+   overlap.
+4. Right-click a panel (title bar or body) for its menu: **Settings**, **Reset
+   zoom**, and **Remove panel**. The title-bar gear and ✕ do the same.
+5. Drag channels from the sidebar onto a panel. Select several and drop them
    together onto a multi-channel panel.
-5. The arrangement is saved back to `config.toml` automatically.
+6. The arrangement is saved back to `config.toml` automatically.
 
 ## Time window
 

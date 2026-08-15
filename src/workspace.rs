@@ -683,6 +683,58 @@ channel = "demo.sine"
         );
     }
 
+    /// Right-clicking a panel's title bar opens its context menu and the
+    /// "Remove panel" item deletes it. Regression guard: the menu must be
+    /// reachable on the title bar, not only the body.
+    #[test]
+    fn title_bar_context_menu_removes_panel() {
+        use egui::{pos2, vec2, Event, PointerButton, Rect};
+        let ch = channels();
+        let reg = PanelRegistry::with_builtins();
+        let cfg = LayoutConfig::from_toml_str(
+            "[[screens.main.panels]]\ntype = \"numeric\"\nframe = [0.0,0.0,0.5,1.0]\nchannel = \"demo.sine\"\n[[screens.main.panels]]\ntype = \"numeric\"\nframe = [0.5,0.0,0.5,1.0]\nchannel = \"demo.counter\"\n",
+        )
+        .unwrap();
+        let store = LiveStore::from_registry(&ch);
+        let mut ws = Workspace::from_config(&cfg, &reg, &ch);
+        ws.active = "main".to_string();
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+        let run = |ws: &mut Workspace, events: Vec<Event>| {
+            let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| { ws.ui(ui, &store, &ch, &reg, None); });
+            });
+        };
+        run(&mut ws, vec![]);
+
+        // Right-click panel 0's title bar (left half, y within the 22px bar).
+        let open_at = pos2(120.0, 10.0);
+        let secondary = vec![
+            Event::PointerMoved(open_at),
+            Event::PointerButton { pos: open_at, button: PointerButton::Secondary, pressed: true, modifiers: Default::default() },
+            Event::PointerButton { pos: open_at, button: PointerButton::Secondary, pressed: false, modifiers: Default::default() },
+        ];
+        // Scan the opened menu's item rows for the one that removes the panel.
+        let mut removed = false;
+        for dy in (0..160).step_by(3) {
+            run(&mut ws, secondary.clone());
+            let item = pos2(open_at.x + 30.0, open_at.y + dy as f32);
+            run(&mut ws, vec![
+                Event::PointerMoved(item),
+                Event::PointerButton { pos: item, button: PointerButton::Primary, pressed: true, modifiers: Default::default() },
+            ]);
+            run(&mut ws, vec![
+                Event::PointerButton { pos: item, button: PointerButton::Primary, pressed: false, modifiers: Default::default() },
+            ]);
+            if ws.screens["main"].panels.len() < 2 {
+                removed = true;
+                break;
+            }
+        }
+        assert!(removed, "title-bar right-click menu never removed the panel");
+    }
+
     #[test]
     fn ui_renders_headless_without_panic() {
         let (ch, reg, mut ws) = build();

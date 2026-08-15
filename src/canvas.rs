@@ -414,8 +414,10 @@ pub fn show(
             }
         }
 
-        // Context menu.
-        drop_resp.context_menu(|ui| {
+        // Context menu — reachable by right-clicking anywhere on the panel, the
+        // title bar included (not just the body). Shared so both interactions
+        // open the same menu; `events` is passed in to avoid a double borrow.
+        let panel_menu = |ui: &mut egui::Ui, events: &mut Vec<CanvasEvent>| {
             if ui.button(format!("{} Settings", icon::GEAR)).clicked() {
                 events.push(CanvasEvent::Settings(i));
                 ui.close_menu();
@@ -425,11 +427,13 @@ pub fn show(
                 ui.close_menu();
             }
             ui.separator();
-            if ui.button(format!("{} Delete panel", icon::TRASH)).clicked() {
+            if ui.button(format!("{} Remove panel", icon::TRASH)).clicked() {
                 events.push(CanvasEvent::Delete(i));
                 ui.close_menu();
             }
-        });
+        };
+        title_resp.context_menu(|ui| panel_menu(ui, &mut events));
+        drop_resp.context_menu(|ui| panel_menu(ui, &mut events));
 
         // Ctrl/⌘ + drag anywhere in the panel moves it (in addition to the
         // title bar). Registered last so it sits above the body's own widgets
