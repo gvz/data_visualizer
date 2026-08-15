@@ -81,6 +81,7 @@ impl VizPanel for LogPanel {
         });
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn render(&mut self, ui: &mut egui::Ui, store: &dyn ChannelStore) {
         if self.bound.is_empty() {
             ui.label(egui::RichText::new("Drop channels here").weak());

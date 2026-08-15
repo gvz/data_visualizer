@@ -186,6 +186,7 @@ impl VizPanel for StatusPanel {
         self.states.config_ui(ui);
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn render(&mut self, ui: &mut egui::Ui, store: &dyn ChannelStore) {
         if self.bound.name.is_empty() {
             ui.label(egui::RichText::new("Drop a channel here").weak());

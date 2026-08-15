@@ -88,6 +88,7 @@ impl VizPanel for NumericPanel {
         self.colors.config_ui(ui);
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn render(&mut self, ui: &mut egui::Ui, store: &dyn ChannelStore) {
         if self.channel_name.is_empty() {
             ui.label(egui::RichText::new("Drop a channel here").weak());
