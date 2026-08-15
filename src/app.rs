@@ -605,7 +605,15 @@ impl DataVisApp {
                                 Some(_) => ("?", egui::Color32::GRAY),
                             }
                         };
-                        ui.colored_label(color, label);
+                        // Reserve a fixed width for the status word so switching
+                        // between LIVE/PAUSED/CONNECTING/TIMEOUT (different widths)
+                        // doesn't shove the pause button sideways. add_sized
+                        // justifies to the given size, so the box stays 88px wide
+                        // regardless of the word; the button after it never moves.
+                        ui.add_sized(
+                            [88.0, ui.available_height()],
+                            egui::Label::new(egui::RichText::new(label).color(color)),
+                        );
 
                         // Pause/resume the live view.
                         let (pause_icon, pause_hint) = if self.live_paused {
