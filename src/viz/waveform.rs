@@ -644,7 +644,18 @@ impl VizPanel for WaveformPanel {
 
     fn refresh_bindings(&mut self, ctx: &RebindCtx) {
         for b in &mut self.bound {
+            // `refresh_binding` replaces the whole binding when a dynamic channel
+            // finally resolves, which drops the color the ctor applied. Re-apply
+            // the saved override so a per-channel color survives that rebind (the
+            // channel names here are usually late-resolving MQTT topics).
+            let was_unresolved = b.id.is_none();
             refresh_binding(b, ACCEPTED, ctx);
+            if was_unresolved && b.id.is_some() {
+                if let Some(c) = self.color_overrides.get(&b.name) {
+                    b.color = *c;
+                    b.auto_color = false;
+                }
+            }
         }
     }
 
@@ -824,6 +835,62 @@ channels = ["demo.sine"]"#,
         });
         // Zoom range is independent of the store clock (no now_ns pinning).
         assert_eq!(p.zoom, Some((200_000_000, 400_000_000)));
+    }
+
+    #[test]
+    fn color_override_survives_dynamic_rebind() {
+        use crate::dynamic_channel::MqttTopicMap;
+        use crate::viz::common::RebindCtx;
+        use std::collections::{BTreeMap, HashMap, HashSet};
+        use std::sync::RwLock;
+
+        let reg = registry();
+        let store = LiveStore::from_registry(&reg);
+        let topic = "home/sensors/temp";
+        let override_color = Color32::from_rgb(0x40, 0xa0, 0x2b);
+
+        // A binding to an as-yet-undiscovered MQTT topic starts unresolved; the
+        // ctor still stamps the saved color onto it and into color_overrides.
+        let mut b = bind(topic, &reg, ACCEPTED);
+        b.color = override_color;
+        b.auto_color = false;
+        assert!(b.id.is_none());
+
+        let mut overrides = BTreeMap::new();
+        overrides.insert(topic.to_string(), override_color);
+        let mut p = WaveformPanel {
+            title: topic.into(),
+            label: None,
+            bound: vec![b],
+            time_window_s: None,
+            cursors: false,
+            dots: false,
+            y_unit: String::new(),
+            cursor_a_ns: None,
+            cursor_b_ns: None,
+            hidden: HashSet::new(),
+            zoom: None,
+            y_zoom: None,
+            zoom_drag_origin: None,
+            color_overrides: overrides,
+        };
+
+        // Topic now discovered → refresh resolves and registers the channel,
+        // replacing the binding.
+        let topic_map: MqttTopicMap = RwLock::new(HashMap::new());
+        let mut snap = BTreeMap::new();
+        snap.insert(topic.to_string(), "21.5".to_string());
+        p.refresh_bindings(&RebindCtx {
+            channels: &reg,
+            store: &store,
+            mqtt: Some((&topic_map, &snap)),
+        });
+
+        // Resolved AND kept the saved color. Regression: the rebind used to drop
+        // it, so the line reverted to the palette color after every restart.
+        assert!(p.bound[0].id.is_some(), "channel should resolve");
+        assert!(!p.bound[0].auto_color, "override must survive the rebind");
+        assert_eq!(p.bound[0].color, override_color);
     }
 
     #[test]
