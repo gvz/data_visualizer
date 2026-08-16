@@ -194,7 +194,12 @@ impl ScriptEngine {
             });
         }
 
-        let meta = ScriptMeta { inputs, outputs, ..Default::default() };
+        let meta = ScriptMeta {
+            inputs,
+            outputs,
+            mode: loaded.meta.mode,
+            hop_ms: loaded.meta.hop_ms,
+        };
 
         // Collision check. Output channels are now registered lazily (on their
         // first written sample), so the registry alone can't detect a clash with
@@ -385,7 +390,7 @@ pub fn discover_scripts(dir: &std::path::Path) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::script::types::{
-        CompiledScript, InputWindow, LoadedScript, OutputBatch, OutputSpec, ScriptMeta,
+        CompiledScript, InputWindow, LoadedScript, OutputBatch, OutputSpec, ScriptMeta, ScriptMode,
     };
     use crate::store::LiveStore;
     use crate::types::TimeWindow;
@@ -448,6 +453,50 @@ mod tests {
         }
     }
 
+    /// A `CompiledScript` that echoes its (only) input window verbatim,
+    /// recording how many samples it was fed on each call. Paired with
+    /// [`MapEchoLoader`] to distinguish `Map`'s cursor-fed windows (one new
+    /// sample per tick, once caught up) from `Reduce`'s trailing-window feed
+    /// (the whole window re-fed every tick).
+    struct RecordingEcho {
+        seen: Arc<Mutex<Vec<usize>>>,
+    }
+    impl CompiledScript for RecordingEcho {
+        fn run(&mut self, inputs: &[InputWindow]) -> Result<Vec<OutputBatch>, String> {
+            let w = &inputs[0];
+            self.seen.lock().unwrap().push(w.ts.len());
+            Ok(vec![OutputBatch { ts: w.ts.clone(), vals: w.vals.clone() }])
+        }
+    }
+
+    /// Declares `MODE = "map"`, so `load_into`/`build_runner` must carry that
+    /// through to the constructed `ScriptRunner`. If the mode is dropped (the
+    /// bug this test guards against), the runner silently falls back to the
+    /// `Reduce` default.
+    struct MapEchoLoader {
+        seen: Arc<Mutex<Vec<usize>>>,
+    }
+    impl ScriptLoader for MapEchoLoader {
+        fn load(&self, _source: &str, _name: &str) -> Result<LoadedScript, String> {
+            Ok(LoadedScript {
+                meta: ScriptMeta {
+                    inputs: vec!["in.a".into()],
+                    outputs: vec![OutputSpec {
+                        name: "in.a.echo".into(),
+                        sample_type: SampleType::Float,
+                        unit: String::new(),
+                    }],
+                    mode: ScriptMode::Map,
+                    hop_ms: None,
+                },
+                compiled: Box::new(RecordingEcho { seen: self.seen.clone() }),
+            })
+        }
+        fn peek_meta(&self, _source: &str, _name: &str) -> Result<ScriptMeta, String> {
+            self.load("", "").map(|l| l.meta)
+        }
+    }
+
     fn instance(id: &str, script: &str, inputs: Option<Vec<&str>>) -> crate::script::config::ScriptInstance {
         crate::script::config::ScriptInstance {
             id: id.into(),
@@ -504,6 +553,93 @@ mod tests {
         }
         let s = status.lock().unwrap();
         assert_eq!(s.iter().find(|x| x.name == "dbl").map(|x| &x.state), Some(&ScriptState::Healthy));
+    }
+
+    /// Regression test for the bug where `load_into` (via `build_runner`)
+    /// built each runner's `ScriptMeta` with `..Default::default()`, which
+    /// silently discards the script's declared `MODE`/`HOP_MS` and forces
+    /// every script to run as `Reduce` at runtime — even one that declares
+    /// `MODE = "map"`.
+    ///
+    /// This drives the real engine loop end to end (load → tick → write),
+    /// the same path `engine_ticks_and_writes_outputs` exercises, so it
+    /// proves the declared mode reaches runtime behaviour, not just that a
+    /// struct field got copied. A `Map` script is cursor-fed: once it has
+    /// caught up, each tick sees only newly-arrived input samples. A
+    /// `Reduce` script (the buggy default) is window-fed: every tick re-feeds
+    /// the whole trailing window, including samples already processed. We
+    /// distinguish the two by recording how many samples the compiled script
+    /// is handed on the tick that processes a second, later-arriving input
+    /// sample: `1` for `Map`, `2` for `Reduce` (both `in.a` samples are still
+    /// inside the trailing window).
+    #[test]
+    fn load_into_preserves_declared_map_mode_at_runtime() {
+        let reg = Arc::new(
+            ChannelRegistry::from_toml_str(
+                "[channels.\"in.a\"]\ntype = \"float\"\nmax_rate = 100\nhistory_s = 5.0\n",
+            )
+            .unwrap(),
+        );
+        let store: Arc<dyn ChannelStore> = Arc::new(LiveStore::from_registry(&reg));
+        let in_id = reg.id("in.a").unwrap();
+        store.write_numeric(in_id, store.now_ns(), NumericVal::Float(1.0));
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mapit.py"), "# fake").unwrap();
+
+        let seen = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let engine = ScriptEngine::new(
+            dir.path().to_path_buf(),
+            vec![instance("mapit", "mapit", None)],
+            10.0,
+            Box::new(MapEchoLoader { seen: seen.clone() }),
+            reg.clone(),
+            Box::new(|| Ok(())),
+        );
+        let handle = Box::new(engine).spawn(store.clone());
+        assert_eq!(handle.name, "scripts");
+
+        // Wait for the first (backfilled) input sample to be echoed.
+        let out_id = loop_until(|| reg.id("scripts/mapit"), 2000);
+        let deadline = std::time::Instant::now() + Duration::from_millis(2000);
+        loop {
+            if let ChannelSnapshot::Float { vals, .. } =
+                store.snapshot(out_id, TimeWindow { start_ns: i64::MIN, end_ns: i64::MAX })
+            {
+                if vals == vec![1.0] {
+                    break;
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "first output never written");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Feed a second, later sample and wait for it to be echoed too.
+        store.write_numeric(in_id, store.now_ns(), NumericVal::Float(2.0));
+        let deadline = std::time::Instant::now() + Duration::from_millis(2000);
+        loop {
+            if let ChannelSnapshot::Float { vals, .. } =
+                store.snapshot(out_id, TimeWindow { start_ns: i64::MIN, end_ns: i64::MAX })
+            {
+                if vals == vec![1.0, 2.0] {
+                    break;
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "second output never written");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // The tick that produced the second output must have been fed
+        // exactly ONE sample (the newly-arrived one) — proof the runner was
+        // built as `Map` (cursor-fed), not silently defaulted to `Reduce`
+        // (window-fed, which would re-feed both samples every tick).
+        assert_eq!(
+            seen.lock().unwrap().last(),
+            Some(&1),
+            "expected a Map-mode cursor feed (1 new sample) on the tick that emitted the \
+             second output; got a window re-feed instead, meaning the script's declared MODE \
+             was not propagated from load_into into the runner"
+        );
     }
 
     #[test]
