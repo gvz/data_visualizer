@@ -63,8 +63,7 @@ pub struct ScriptRunner {
     /// the first tick (which then backfills at most `window_s`).
     input_cursor: i64,
     /// Wall time of the last `Reduce` emit, for `HOP_MS` throttling; `i64::MIN`
-    /// until the first emit. Not yet read: the throttle lands in a later task.
-    #[allow(dead_code)]
+    /// until the first emit.
     last_hop_ns: i64,
     state: ScriptState,
 }
@@ -163,9 +162,17 @@ impl ScriptRunner {
             return;
         }
 
+        // Reduce throttle: skip the whole tick until HOP_MS has elapsed.
+        if self.meta.mode == ScriptMode::Reduce {
+            if let Some(hop) = self.meta.hop_ms {
+                if self.last_hop_ns != i64::MIN && now - self.last_hop_ns < hop as i64 * 1_000_000 {
+                    return;
+                }
+            }
+        }
+
         // Feed window by mode. Map: only samples newer than the cursor (first
         // tick backfills at most window_s). Reduce: the trailing window_s.
-        // (Reduce throttle lands in Task 3; segment clamp in Task 4.)
         let feed = match self.meta.mode {
             ScriptMode::Map => {
                 let start = if self.input_cursor == i64::MIN {
@@ -252,6 +259,9 @@ impl ScriptRunner {
                     if let Some(t) = windows.iter().filter_map(|w| w.ts.last().copied()).min() {
                         self.input_cursor = t;
                     }
+                }
+                if self.meta.mode == ScriptMode::Reduce {
+                    self.last_hop_ns = now;
                 }
                 self.state = ScriptState::Healthy;
             }
@@ -485,6 +495,40 @@ mod tests {
 
         let out_id = reg.id("count").unwrap();
         assert_eq!(store.latest(out_id), Some((20, Sample::Int(2))));
+    }
+
+    #[test]
+    fn reduce_hop_throttles_emit() {
+        let reg = registry_with_input();
+        let store = LiveStore::from_registry(&reg);
+        let in_id = reg.id("in.a").unwrap();
+        for t in 1..=5 { store.write_numeric(in_id, t, NumericVal::Float(t as f64)); }
+
+        let meta = ScriptMeta {
+            inputs: vec!["in.a".into()],
+            outputs: vec![out("o")],
+            mode: ScriptMode::Reduce,
+            hop_ms: Some(1),                 // 1 ms = 1_000_000 ns
+        };
+        // Count how many times compute actually runs — the throttle skips the whole
+        // tick, so a throttled tick never calls compute. (Counting output samples
+        // would not work: each run stamps the same newest input ts and the per-output
+        // dedup collapses them.)
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let calls2 = calls.clone();
+        let compiled = Box::new(FakeScript(move |inp: &[InputWindow]| {
+            *calls2.lock().unwrap() += 1;
+            Ok(vec![OutputBatch { ts: vec![*inp[0].ts.last().unwrap()], vals: vec![0.0] }])
+        }));
+        let mut runner = ScriptRunner::new("r".into(), meta, compiled, &store, &reg);
+
+        // `now` must be >= the newest sample so the window is non-empty.
+        let win = 1_000_000_000;
+        runner.tick(&store, &reg, 5, win);               // runs (last_hop = 5)
+        runner.tick(&store, &reg, 5 + 500_000, win);     // 0.5 ms later: throttled, no run
+        runner.tick(&store, &reg, 5 + 1_000_000, win);   // 1 ms later: runs again
+
+        assert_eq!(*calls.lock().unwrap(), 2);           // middle tick was skipped
     }
 
     #[test]
