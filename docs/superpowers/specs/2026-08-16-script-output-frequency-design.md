@@ -185,6 +185,17 @@ the `map` path must beat: cursor-feeding the two elementwise scripts should cut
 their per-call cost by ~2 orders of magnitude and let the tick reach 62 Hz;
 `HOP_MS` bounds the remaining `reduce` recompute.
 
+**After** (2026-08-16, `scripts/output-frequency` branch, same load; `channel_diff`
+and `sine_squared` declared `map`, `sine_rms` `reduce`): `tick_rec` drops to
+**1.90 ms and 5.0 MB per call** (from 11.7 ms / 21.9 MB) — a 6.2× time and 4.4×
+allocation reduction. The engine loop's effective rate rises from ~19 Hz to
+**~46 Hz** and the script thread falls from **67.7 % of a core to 16.0 %**. The
+two `map` scripts are now near-free per call; the residual is `sine_rms`, still
+correctly windowed over `window_s`. (A one-line integration defect surfaced
+during this measurement — `load_into` rebuilt the runner's `ScriptMeta` with
+`..Default::default()`, dropping the declared mode so every script ran as
+`reduce`; fixed by carrying `loaded.meta.mode`/`hop_ms`, with a regression test.)
+
 ## Tick rate vs output rate
 
 With `map` decoupled from the tick, the 16 ms tick becomes purely a
