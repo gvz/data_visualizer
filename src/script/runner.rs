@@ -182,7 +182,15 @@ impl ScriptRunner {
                 };
                 TimeWindow { start_ns: start, end_ns: now + 1 }
             }
-            ScriptMode::Reduce => TimeWindow { start_ns: now - window_s_ns, end_ns: now + 1 },
+            ScriptMode::Reduce => {
+                let mut start = now - window_s_ns;
+                // Never average across a recording join: start no earlier than
+                // the most recent break at or before `now`.
+                if let Some(&b) = store.break_times().iter().rev().find(|&&b| b <= now) {
+                    start = start.max(b);
+                }
+                TimeWindow { start_ns: start, end_ns: now + 1 }
+            }
         };
 
         let mut windows = Vec::with_capacity(self.input_ids.len());
@@ -297,6 +305,42 @@ mod tests {
 
     fn out(name: &str) -> OutputSpec {
         OutputSpec { name: name.into(), sample_type: SampleType::Float, unit: String::new() }
+    }
+
+    /// A thin `ChannelStore` wrapper that reports a fixed set of break times
+    /// (a stand-in for `PlaybackStore`'s recording-join boundaries) while
+    /// delegating everything else to an inner `LiveStore`.
+    struct BreakStore {
+        inner: LiveStore,
+        breaks: Vec<i64>,
+    }
+    impl ChannelStore for BreakStore {
+        fn write_numeric(&self, c: ChannelId, ts: i64, v: NumericVal) {
+            self.inner.write_numeric(c, ts, v)
+        }
+        fn write_text(&self, c: ChannelId, ts: i64, l: String) {
+            self.inner.write_text(c, ts, l)
+        }
+        fn snapshot(&self, c: ChannelId, w: TimeWindow) -> ChannelSnapshot {
+            self.inner.snapshot(c, w)
+        }
+        fn latest(&self, c: ChannelId) -> Option<(i64, Sample)> {
+            self.inner.latest(c)
+        }
+        fn channel_meta(&self, c: ChannelId) -> &crate::types::ChannelMeta {
+            self.inner.channel_meta(c)
+        }
+        fn break_times(&self) -> &[i64] {
+            &self.breaks
+        }
+        // Not in the brief's fake: `tick_rec` registers a new output channel
+        // via `store.add_channel` on its first sample. The trait default is a
+        // no-op, so without delegating here the inner LiveStore's slot vector
+        // never grows and the subsequent `write_numeric` panics ("channel id
+        // out of range").
+        fn add_channel(&self, meta: crate::types::ChannelMeta) {
+            self.inner.add_channel(meta)
+        }
     }
 
     const ALL: TimeWindow = TimeWindow { start_ns: i64::MIN, end_ns: i64::MAX };
@@ -529,6 +573,35 @@ mod tests {
         runner.tick(&store, &reg, 5 + 1_000_000, win);   // 1 ms later: runs again
 
         assert_eq!(*calls.lock().unwrap(), 2);           // middle tick was skipped
+    }
+
+    #[test]
+    fn reduce_window_clamps_at_break() {
+        let reg = registry_with_input();
+        let store = BreakStore { inner: LiveStore::from_registry(&reg), breaks: vec![100] };
+        let in_id = reg.id("in.a").unwrap();
+        // Samples straddling the break at 100.
+        store.write_numeric(in_id, 90, NumericVal::Float(1.0));
+        store.write_numeric(in_id, 110, NumericVal::Float(2.0));
+
+        let meta = ScriptMeta {
+            inputs: vec!["in.a".into()],
+            outputs: vec![out("o")],
+            mode: ScriptMode::Reduce,
+            ..Default::default()
+        };
+        // Report how many samples the reduce sees.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let seen2 = seen.clone();
+        let compiled = Box::new(FakeScript(move |inp: &[InputWindow]| {
+            *seen2.lock().unwrap() = inp[0].ts.len();
+            Ok(vec![OutputBatch { ts: vec![*inp[0].ts.last().unwrap()], vals: vec![0.0] }])
+        }));
+        let mut runner = ScriptRunner::new("r".into(), meta, compiled, &store, &reg);
+
+        // window_s spans both samples, but the break at 100 must exclude ts=90.
+        runner.tick(&store, &reg, 120, 1_000_000_000);
+        assert_eq!(*seen.lock().unwrap(), 1); // only the post-break sample (110)
     }
 
     #[test]
