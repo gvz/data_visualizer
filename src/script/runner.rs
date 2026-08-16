@@ -5,7 +5,7 @@ use crossbeam_channel::Sender;
 use crate::config::ChannelRegistry;
 use crate::record::mqtt_schema::DynamicProtoRegistry;
 use crate::record::RecordMsg;
-use crate::script::types::{CompiledScript, InputWindow, ScriptMeta};
+use crate::script::types::{CompiledScript, InputWindow, ScriptMeta, ScriptMode};
 use crate::store::ChannelStore;
 use crate::types::{ChannelId, ChannelSnapshot, NumericVal, SampleType, TimeWindow};
 
@@ -59,6 +59,13 @@ pub struct ScriptRunner {
     input_ids: Vec<Option<ChannelId>>,
     /// Last timestamp written per output, aligned to `meta.outputs`.
     last_written: Vec<i64>,
+    /// Newest input timestamp already fed to `Map` compute; `i64::MIN` before
+    /// the first tick (which then backfills at most `window_s`).
+    input_cursor: i64,
+    /// Wall time of the last `Reduce` emit, for `HOP_MS` throttling; `i64::MIN`
+    /// until the first emit. Not yet read: the throttle lands in a later task.
+    #[allow(dead_code)]
+    last_hop_ns: i64,
     state: ScriptState,
 }
 
@@ -96,7 +103,17 @@ impl ScriptRunner {
         let output_ids = vec![None; meta.outputs.len()];
         let input_ids = vec![None; meta.inputs.len()];
         let last_written = vec![i64::MIN; meta.outputs.len()];
-        Self { name, meta, compiled, output_ids, input_ids, last_written, state: ScriptState::Healthy }
+        Self {
+            name,
+            meta,
+            compiled,
+            output_ids,
+            input_ids,
+            last_written,
+            input_cursor: i64::MIN,
+            last_hop_ns: i64::MIN,
+            state: ScriptState::Healthy,
+        }
     }
 
     pub fn name(&self) -> &str {
@@ -112,9 +129,10 @@ impl ScriptRunner {
         &mut self,
         store: &dyn ChannelStore,
         registry: &ChannelRegistry,
-        window: TimeWindow,
+        now: i64,
+        window_s_ns: i64,
     ) {
-        self.tick_rec(store, registry, window, None);
+        self.tick_rec(store, registry, now, window_s_ns, None);
     }
 
     /// Run one tick: resolve inputs, gather windows, call the compiled script,
@@ -125,7 +143,8 @@ impl ScriptRunner {
         &mut self,
         store: &dyn ChannelStore,
         registry: &ChannelRegistry,
-        window: TimeWindow,
+        now: i64,
+        window_s_ns: i64,
         mut rec: Option<&mut ScriptRecorder>,
     ) {
         if let ScriptState::Failed(_) = self.state {
@@ -144,10 +163,24 @@ impl ScriptRunner {
             return;
         }
 
-        // Gather each input's window.
+        // Feed window by mode. Map: only samples newer than the cursor (first
+        // tick backfills at most window_s). Reduce: the trailing window_s.
+        // (Reduce throttle lands in Task 3; segment clamp in Task 4.)
+        let feed = match self.meta.mode {
+            ScriptMode::Map => {
+                let start = if self.input_cursor == i64::MIN {
+                    now - window_s_ns
+                } else {
+                    self.input_cursor + 1
+                };
+                TimeWindow { start_ns: start, end_ns: now + 1 }
+            }
+            ScriptMode::Reduce => TimeWindow { start_ns: now - window_s_ns, end_ns: now + 1 },
+        };
+
         let mut windows = Vec::with_capacity(self.input_ids.len());
         for id in self.input_ids.iter().map(|o| o.unwrap()) {
-            let (ts, vals) = snapshot_to_f64(store.snapshot(id, window));
+            let (ts, vals) = snapshot_to_f64(store.snapshot(id, feed));
             windows.push(InputWindow { ts, vals });
         }
         if windows.iter().any(|w| w.ts.is_empty()) {
@@ -212,6 +245,14 @@ impl ScriptRunner {
                         }
                     }
                 }
+                if self.meta.mode == ScriptMode::Map {
+                    // Advance to the *oldest* input's newest fed timestamp so a lagging
+                    // input never has samples skipped; faster inputs get a small re-fed
+                    // overlap that the per-output dedup (`last_written`) absorbs.
+                    if let Some(t) = windows.iter().filter_map(|w| w.ts.last().copied()).min() {
+                        self.input_cursor = t;
+                    }
+                }
                 self.state = ScriptState::Healthy;
             }
             Err(e) => self.state = ScriptState::Failed(e),
@@ -251,6 +292,44 @@ mod tests {
     const ALL: TimeWindow = TimeWindow { start_ns: i64::MIN, end_ns: i64::MAX };
 
     #[test]
+    fn map_feeds_only_new_samples_and_matches_input_frequency() {
+        let reg = registry_with_input();
+        let store = LiveStore::from_registry(&reg);
+        let in_id = reg.id("in.a").unwrap();
+
+        // A map script echoes each input sample at its own timestamp.
+        let meta = ScriptMeta {
+            inputs: vec!["in.a".into()],
+            outputs: vec![out("in.a.echo")],
+            mode: ScriptMode::Map,
+            ..Default::default()
+        };
+        // Assert the fed window never re-includes an already-processed sample:
+        // record the number of samples handed to compute on each tick.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let seen2 = seen.clone();
+        let compiled = Box::new(FakeScript(move |inp: &[InputWindow]| {
+            seen2.lock().unwrap().push(inp[0].ts.len());
+            Ok(vec![OutputBatch { ts: inp[0].ts.clone(), vals: inp[0].vals.clone() }])
+        }));
+        let mut runner = ScriptRunner::new("echo".into(), meta, compiled, &store, &reg);
+
+        // window_s large enough that the first-tick cap includes everything so far.
+        let win = 1_000_000_000; // 1s in ns
+        store.write_numeric(in_id, 10, NumericVal::Float(1.0));
+        runner.tick(&store, &reg, 10, win); // tick 1: sees [10]
+        store.write_numeric(in_id, 20, NumericVal::Float(2.0));
+        store.write_numeric(in_id, 30, NumericVal::Float(3.0));
+        runner.tick(&store, &reg, 30, win); // tick 2: sees [20,30] only
+
+        assert_eq!(*seen.lock().unwrap(), vec![1, 2]); // never re-fed sample 10
+        // Output frequency == input frequency: 3 inputs -> 3 outputs.
+        let out_id = reg.id("in.a.echo").unwrap();
+        let snap = store.snapshot(out_id, TimeWindow { start_ns: i64::MIN, end_ns: i64::MAX });
+        assert_eq!(snap.len(), 3);
+    }
+
+    #[test]
     fn registers_output_and_writes_element_wise() {
         let reg = registry_with_input();
         let store = LiveStore::from_registry(&reg);
@@ -273,7 +352,7 @@ mod tests {
         }));
         let mut runner = ScriptRunner::new("dbl".into(), meta, compiled, &store, &reg);
 
-        runner.tick(&store, &reg, ALL);
+        runner.tick(&store, &reg, 20, 1_000_000_000);
         assert_eq!(runner.state(), &ScriptState::Healthy);
 
         let out_id = reg.id("in.a.double").unwrap();
@@ -308,7 +387,7 @@ mod tests {
         let (tx, rx) = crate::record::record_channel();
         let mut proto = DynamicProtoRegistry::new();
         let mut rec = ScriptRecorder::new(&mut proto, &tx);
-        runner.tick_rec(&store, &reg, ALL, Some(&mut rec));
+        runner.tick_rec(&store, &reg, 20, 1_000_000_000, Some(&mut rec));
         assert_eq!(runner.state(), &ScriptState::Healthy);
 
         // Both new output samples were queued as DynamicProto frames on the
@@ -342,9 +421,9 @@ mod tests {
         let mut runner = ScriptRunner::new("id".into(), meta, compiled, &store, &reg);
 
         store.write_numeric(in_id, 1, NumericVal::Float(1.0));
-        runner.tick(&store, &reg, ALL); // writes ts=1 (registers "o" lazily here)
+        runner.tick(&store, &reg, 1, 1_000_000_000); // writes ts=1 (registers "o" lazily here)
         store.write_numeric(in_id, 2, NumericVal::Float(2.0));
-        runner.tick(&store, &reg, ALL); // window is {1,2}; only ts=2 is new
+        runner.tick(&store, &reg, 2, 1_000_000_000); // window is {1,2}; only ts=2 is new
 
         let out_id = reg.id("o").unwrap(); // registered by the first tick's write
         match store.snapshot(out_id, ALL) {
@@ -364,7 +443,7 @@ mod tests {
         };
         let compiled = Box::new(FakeScript(|_: &[InputWindow]| Ok(vec![])));
         let mut runner = ScriptRunner::new("w".into(), meta, compiled, &store, &reg);
-        runner.tick(&store, &reg, ALL);
+        runner.tick(&store, &reg, 0, 1_000_000_000);
         assert_eq!(runner.state(), &ScriptState::Waiting("not.there".to_string()));
     }
 
@@ -375,7 +454,7 @@ mod tests {
         let meta = ScriptMeta { inputs: vec!["in.a".into()], outputs: vec![out("o")], ..Default::default() };
         let compiled = Box::new(FakeScript(|_: &[InputWindow]| Ok(vec![])));
         let mut runner = ScriptRunner::new("w".into(), meta, compiled, &store, &reg);
-        runner.tick(&store, &reg, ALL);
+        runner.tick(&store, &reg, 0, 1_000_000_000);
         assert_eq!(runner.state(), &ScriptState::Waiting("data".to_string()));
     }
 
@@ -402,7 +481,7 @@ mod tests {
             Ok(vec![OutputBatch { ts: vec![*w.ts.last().unwrap()], vals: vec![w.ts.len() as f64] }])
         }));
         let mut runner = ScriptRunner::new("c".into(), meta, compiled, &store, &reg);
-        runner.tick(&store, &reg, ALL);
+        runner.tick(&store, &reg, 20, 1_000_000_000);
 
         let out_id = reg.id("count").unwrap();
         assert_eq!(store.latest(out_id), Some((20, Sample::Int(2))));
@@ -417,7 +496,7 @@ mod tests {
         let meta = ScriptMeta { inputs: vec!["in.a".into()], outputs: vec![out("o")], ..Default::default() };
         let compiled = Box::new(FakeScript(|_: &[InputWindow]| Ok(vec![]))); // 0 != 1
         let mut runner = ScriptRunner::new("f".into(), meta, compiled, &store, &reg);
-        runner.tick(&store, &reg, ALL);
+        runner.tick(&store, &reg, 1, 1_000_000_000);
         assert!(matches!(runner.state(), ScriptState::Failed(_)));
     }
 
@@ -430,7 +509,7 @@ mod tests {
         let meta = ScriptMeta { inputs: vec!["in.a".into()], outputs: vec![out("o")], ..Default::default() };
         let compiled = Box::new(FakeScript(|_: &[InputWindow]| Err("boom".to_string())));
         let mut runner = ScriptRunner::new("f".into(), meta, compiled, &store, &reg);
-        runner.tick(&store, &reg, ALL);
+        runner.tick(&store, &reg, 1, 1_000_000_000);
         assert_eq!(runner.state(), &ScriptState::Failed("boom".to_string()));
     }
 
@@ -464,7 +543,7 @@ mod tests {
         };
 
         let mut runner1 = ScriptRunner::new("s".into(), make_meta(), make_script(), &store, &reg);
-        runner1.tick(&store, &reg, ALL);
+        runner1.tick(&store, &reg, 10, 1_000_000_000);
         assert_eq!(runner1.state(), &ScriptState::Healthy);
         let o1_id = reg.id("o1").unwrap();
         assert!(store.latest(o1_id).is_some(), "o1 slot must be populated after first tick");

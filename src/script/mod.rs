@@ -37,7 +37,6 @@ use crate::script::types::{
     expand_output_name, parse_sample_type, validate_meta, OutputSpec, ScriptLoader, ScriptMeta,
 };
 use crate::store::ChannelStore;
-use crate::types::TimeWindow;
 
 /// One script's status for the GUI.
 #[derive(Debug, Clone, PartialEq)]
@@ -327,11 +326,11 @@ impl ScriptEngine {
             // Tick all runners. While recording, each new output sample is also
             // queued to the recorder as a self-describing DynamicProto frame.
             let now = store.now_ns();
-            let window = TimeWindow::last((self.window_s * 1e9) as i64, now);
+            let window_s_ns = (self.window_s * 1e9) as i64;
             let guard = record_sender.lock().unwrap();
             let mut rec = guard.as_ref().map(|tx| ScriptRecorder::new(&mut proto, tx));
             for runner in &mut runners {
-                runner.tick_rec(store.as_ref(), &self.registry, window, rec.as_mut());
+                runner.tick_rec(store.as_ref(), &self.registry, now, window_s_ns, rec.as_mut());
             }
             drop(guard);
             Self::publish_status(&self.status, &runners, &failed);
@@ -389,6 +388,7 @@ mod tests {
         CompiledScript, InputWindow, LoadedScript, OutputBatch, OutputSpec, ScriptMeta,
     };
     use crate::store::LiveStore;
+    use crate::types::TimeWindow;
     use crate::types::{ChannelSnapshot, NumericVal, SampleType};
 
     struct DoublerLoader;
@@ -494,7 +494,7 @@ mod tests {
         let out_id = loop_until(|| reg.id("scripts/dbl"), 2000);
         let deadline = std::time::Instant::now() + Duration::from_millis(2000);
         loop {
-            if let ChannelSnapshot::Float { vals, .. } = store.snapshot(out_id, super::TimeWindow { start_ns: i64::MIN, end_ns: i64::MAX }) {
+            if let ChannelSnapshot::Float { vals, .. } = store.snapshot(out_id, TimeWindow { start_ns: i64::MIN, end_ns: i64::MAX }) {
                 if vals == vec![4.0] {
                     break;
                 }
@@ -570,7 +570,7 @@ mod tests {
         assert!(engine.owned_outputs.lock().unwrap()["first"].iter().any(|n| n == "in.b.double"));
         assert!(reg.id("in.b.double").is_none()); // not registered until first value
         store.write_numeric(reg.id("in.b").unwrap(), store.now_ns(), NumericVal::Float(2.0));
-        runner.tick(store.as_ref(), &reg, TimeWindow::last(10_000_000_000, store.now_ns()));
+        runner.tick(store.as_ref(), &reg, store.now_ns(), 10_000_000_000);
         assert!(reg.id("in.b.double").is_some()); // appears after the first written value
     }
 
