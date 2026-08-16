@@ -601,6 +601,7 @@ mod tests {
                 sample_type: SampleType::Float,
                 unit: "g".into(),
             }],
+            ..Default::default()
         };
         let staged = staged_from_instance(&inst, Some(&meta));
         assert_eq!(staged.inputs, vec!["load/ch0".to_string()]);
@@ -625,7 +626,8 @@ mod tests {
             }]),
             enabled: true,
         };
-        let meta = ScriptMeta { inputs: vec!["default".into()], outputs: vec![] };
+        let meta =
+            ScriptMeta { inputs: vec!["default".into()], outputs: vec![], ..Default::default() };
         let staged = staged_from_instance(&inst, Some(&meta));
         assert_eq!(staged.inputs, vec!["a/b".to_string()]);
         assert_eq!(staged.outputs[0].name, "explicit");

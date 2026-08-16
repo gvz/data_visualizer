@@ -54,7 +54,25 @@ fn extract_meta(module: &Bound<'_, PyModule>) -> Result<ScriptMeta, String> {
         let unit: String = item.get_item("unit").and_then(|v| v.extract()).unwrap_or_default();
         outputs.push(OutputSpec { name: out_name, sample_type: output_sample_type(&ty)?, unit });
     }
-    Ok(ScriptMeta { inputs, outputs })
+
+    use crate::script::types::ScriptMode;
+    let mode = match module.getattr("MODE").ok() {
+        None => ScriptMode::Reduce,
+        Some(v) => match v.extract::<String>() {
+            Ok(s) if s == "map" => ScriptMode::Map,
+            Ok(s) if s == "reduce" => ScriptMode::Reduce,
+            Ok(other) => return Err(format!("MODE must be \"map\" or \"reduce\", got {other:?}")),
+            Err(e) => return Err(format!("MODE must be a string: {e}")),
+        },
+    };
+    let hop_ms = match module.getattr("HOP_MS").ok() {
+        None => None,
+        Some(v) => Some(
+            v.extract::<u64>()
+                .map_err(|e| format!("HOP_MS must be a positive integer: {e}"))?,
+        ),
+    };
+    Ok(ScriptMeta { inputs, outputs, mode, hop_ms })
 }
 
 impl ScriptLoader for PyScriptLoader {
@@ -304,6 +322,31 @@ def compute(ts, vals):
         assert_eq!(meta.outputs.len(), 1);
         assert_eq!(meta.outputs[0].name, "{in0.stem}.rms"); // template kept verbatim
         assert_eq!(meta.outputs[0].unit, "g");
+    }
+
+    #[test]
+    fn extract_meta_reads_mode_and_hop() {
+        Python::with_gil(|py| {
+            // Distinct module names per call: `PyImport_ExecCodeModuleEx` (what
+            // `from_code_bound` uses) caches modules in `sys.modules` by name and
+            // reuses the existing dict on a repeat name, so re-execing under the
+            // same name leaks globals (e.g. `MODE`) from the prior call.
+            let src = "INPUTS=['a']\nOUTPUTS=[{'name':'o','type':'float'}]\nMODE='map'\nHOP_MS=200\n";
+            let m = PyModule::from_code_bound(py, src, "t1.py", "t1").unwrap();
+            let meta = extract_meta(&m).unwrap();
+            assert_eq!(meta.mode, crate::script::types::ScriptMode::Map);
+            assert_eq!(meta.hop_ms, Some(200));
+
+            let src2 = "INPUTS=['a']\nOUTPUTS=[{'name':'o','type':'float'}]\n";
+            let m2 = PyModule::from_code_bound(py, src2, "t2.py", "t2").unwrap();
+            let d = extract_meta(&m2).unwrap();
+            assert_eq!(d.mode, crate::script::types::ScriptMode::Reduce);
+            assert_eq!(d.hop_ms, None);
+
+            let bad = "INPUTS=['a']\nOUTPUTS=[{'name':'o','type':'float'}]\nMODE='nope'\n";
+            let mb = PyModule::from_code_bound(py, bad, "t3.py", "t3").unwrap();
+            assert!(extract_meta(&mb).is_err());
+        });
     }
 
     #[test]

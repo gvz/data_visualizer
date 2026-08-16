@@ -195,7 +195,7 @@ impl ScriptEngine {
             });
         }
 
-        let meta = ScriptMeta { inputs, outputs };
+        let meta = ScriptMeta { inputs, outputs, ..Default::default() };
 
         // Collision check. Output channels are now registered lazily (on their
         // first written sample), so the registry alone can't detect a clash with
@@ -409,6 +409,7 @@ mod tests {
                         sample_type: SampleType::Float,
                         unit: String::new(),
                     }],
+                    ..Default::default()
                 },
                 compiled: Box::new(Doubler),
             })
@@ -421,6 +422,7 @@ mod tests {
                     sample_type: SampleType::Float,
                     unit: String::new(),
                 }],
+                ..Default::default()
             })
         }
     }
@@ -436,6 +438,7 @@ mod tests {
                         sample_type: SampleType::Float,
                         unit: String::new(),
                     }],
+                    ..Default::default()
                 },
                 compiled: Box::new(Doubler),
             })

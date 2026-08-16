@@ -258,7 +258,11 @@ mod tests {
         store.write_numeric(in_id, 10, NumericVal::Float(2.0));
         store.write_numeric(in_id, 20, NumericVal::Float(3.0));
 
-        let meta = ScriptMeta { inputs: vec!["in.a".into()], outputs: vec![out("in.a.double")] };
+        let meta = ScriptMeta {
+            inputs: vec!["in.a".into()],
+            outputs: vec![out("in.a.double")],
+            ..Default::default()
+        };
         // Element-wise: double each value, keep timestamps.
         let compiled = Box::new(FakeScript(|inp: &[InputWindow]| {
             let w = &inp[0];
@@ -290,7 +294,11 @@ mod tests {
         store.write_numeric(in_id, 10, NumericVal::Float(2.0));
         store.write_numeric(in_id, 20, NumericVal::Float(3.0));
 
-        let meta = ScriptMeta { inputs: vec!["in.a".into()], outputs: vec![out("calc.out")] };
+        let meta = ScriptMeta {
+            inputs: vec!["in.a".into()],
+            outputs: vec![out("calc.out")],
+            ..Default::default()
+        };
         let compiled = Box::new(FakeScript(|inp: &[InputWindow]| {
             let w = &inp[0];
             Ok(vec![OutputBatch { ts: w.ts.clone(), vals: w.vals.clone() }])
@@ -326,7 +334,7 @@ mod tests {
         let reg = registry_with_input();
         let store = LiveStore::from_registry(&reg);
         let in_id = reg.id("in.a").unwrap();
-        let meta = ScriptMeta { inputs: vec!["in.a".into()], outputs: vec![out("o")] };
+        let meta = ScriptMeta { inputs: vec!["in.a".into()], outputs: vec![out("o")], ..Default::default() };
         let compiled = Box::new(FakeScript(|inp: &[InputWindow]| {
             let w = &inp[0];
             Ok(vec![OutputBatch { ts: w.ts.clone(), vals: w.vals.clone() }])
@@ -349,7 +357,11 @@ mod tests {
     fn waits_for_unregistered_input() {
         let reg = registry_with_input();
         let store = LiveStore::from_registry(&reg);
-        let meta = ScriptMeta { inputs: vec!["not.there".into()], outputs: vec![out("o")] };
+        let meta = ScriptMeta {
+            inputs: vec!["not.there".into()],
+            outputs: vec![out("o")],
+            ..Default::default()
+        };
         let compiled = Box::new(FakeScript(|_: &[InputWindow]| Ok(vec![])));
         let mut runner = ScriptRunner::new("w".into(), meta, compiled, &store, &reg);
         runner.tick(&store, &reg, ALL);
@@ -360,7 +372,7 @@ mod tests {
     fn waits_when_input_has_no_data() {
         let reg = registry_with_input();
         let store = LiveStore::from_registry(&reg);
-        let meta = ScriptMeta { inputs: vec!["in.a".into()], outputs: vec![out("o")] };
+        let meta = ScriptMeta { inputs: vec!["in.a".into()], outputs: vec![out("o")], ..Default::default() };
         let compiled = Box::new(FakeScript(|_: &[InputWindow]| Ok(vec![])));
         let mut runner = ScriptRunner::new("w".into(), meta, compiled, &store, &reg);
         runner.tick(&store, &reg, ALL);
@@ -382,6 +394,7 @@ mod tests {
                 sample_type: SampleType::Int,
                 unit: String::new(),
             }],
+            ..Default::default()
         };
         // Reduction: one sample at the latest ts, value = count of samples.
         let compiled = Box::new(FakeScript(|inp: &[InputWindow]| {
@@ -401,7 +414,7 @@ mod tests {
         let store = LiveStore::from_registry(&reg);
         let in_id = reg.id("in.a").unwrap();
         store.write_numeric(in_id, 1, NumericVal::Float(1.0));
-        let meta = ScriptMeta { inputs: vec!["in.a".into()], outputs: vec![out("o")] };
+        let meta = ScriptMeta { inputs: vec!["in.a".into()], outputs: vec![out("o")], ..Default::default() };
         let compiled = Box::new(FakeScript(|_: &[InputWindow]| Ok(vec![]))); // 0 != 1
         let mut runner = ScriptRunner::new("f".into(), meta, compiled, &store, &reg);
         runner.tick(&store, &reg, ALL);
@@ -414,7 +427,7 @@ mod tests {
         let store = LiveStore::from_registry(&reg);
         let in_id = reg.id("in.a").unwrap();
         store.write_numeric(in_id, 1, NumericVal::Float(1.0));
-        let meta = ScriptMeta { inputs: vec!["in.a".into()], outputs: vec![out("o")] };
+        let meta = ScriptMeta { inputs: vec!["in.a".into()], outputs: vec![out("o")], ..Default::default() };
         let compiled = Box::new(FakeScript(|_: &[InputWindow]| Err("boom".to_string())));
         let mut runner = ScriptRunner::new("f".into(), meta, compiled, &store, &reg);
         runner.tick(&store, &reg, ALL);
@@ -441,6 +454,7 @@ mod tests {
         let make_meta = || ScriptMeta {
             inputs: vec!["in.a".into()],
             outputs: vec![out("o1")],
+            ..Default::default()
         };
         let make_script = || {
             Box::new(FakeScript(|inp: &[InputWindow]| {

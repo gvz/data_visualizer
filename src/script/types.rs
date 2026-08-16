@@ -63,11 +63,27 @@ pub struct OutputSpec {
     pub unit: String,
 }
 
+/// How a script is fed and how often it emits.
+/// - `Map`: cursor-fed with only the samples arrived since the last tick; the
+///   script emits one output per input sample, so output rate == input rate.
+/// - `Reduce`: fed a trailing `window_s` window; emits per tick (or per `HOP_MS`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScriptMode {
+    Map,
+    #[default]
+    Reduce,
+}
+
 /// A script's self-declared bindings, read from its `INPUTS`/`OUTPUTS` globals.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ScriptMeta {
     pub inputs: Vec<String>,
     pub outputs: Vec<OutputSpec>,
+    /// Feed/emit mode. Absent `MODE` global ⇒ `Reduce` (back-compatible).
+    pub mode: ScriptMode,
+    /// Optional emit throttle for `Reduce` scripts, in milliseconds. `None` ⇒
+    /// emit every engine tick. Ignored for `Map`.
+    pub hop_ms: Option<u64>,
 }
 
 /// One input channel's window: parallel timestamp and value arrays.
@@ -147,32 +163,38 @@ mod tests {
 
     #[test]
     fn accepts_valid_meta() {
-        let meta = ScriptMeta { inputs: vec!["a".into()], outputs: vec![spec("out")] };
+        let meta =
+            ScriptMeta { inputs: vec!["a".into()], outputs: vec![spec("out")], ..Default::default() };
         assert!(validate_meta(&meta, |_| false).is_ok());
     }
 
     #[test]
     fn rejects_empty_inputs() {
-        let meta = ScriptMeta { inputs: vec![], outputs: vec![spec("out")] };
+        let meta =
+            ScriptMeta { inputs: vec![], outputs: vec![spec("out")], ..Default::default() };
         assert!(validate_meta(&meta, |_| false).is_err());
     }
 
     #[test]
     fn rejects_empty_outputs() {
-        let meta = ScriptMeta { inputs: vec!["a".into()], outputs: vec![] };
+        let meta = ScriptMeta { inputs: vec!["a".into()], outputs: vec![], ..Default::default() };
         assert!(validate_meta(&meta, |_| false).is_err());
     }
 
     #[test]
     fn rejects_duplicate_output_names() {
-        let meta =
-            ScriptMeta { inputs: vec!["a".into()], outputs: vec![spec("o"), spec("o")] };
+        let meta = ScriptMeta {
+            inputs: vec!["a".into()],
+            outputs: vec![spec("o"), spec("o")],
+            ..Default::default()
+        };
         assert!(validate_meta(&meta, |_| false).is_err());
     }
 
     #[test]
     fn rejects_collision_with_existing_channel() {
-        let meta = ScriptMeta { inputs: vec!["a".into()], outputs: vec![spec("taken")] };
+        let meta =
+            ScriptMeta { inputs: vec!["a".into()], outputs: vec![spec("taken")], ..Default::default() };
         let err = validate_meta(&meta, |n| n == "taken").unwrap_err();
         assert!(err.contains("collides"));
     }
@@ -218,5 +240,12 @@ mod tests {
     fn expand_output_name_stem_of_unslashed_is_whole() {
         let inputs = vec!["plain".to_string()];
         assert_eq!(expand_output_name("{in0.stem}", &inputs).unwrap(), "plain");
+    }
+
+    #[test]
+    fn script_mode_defaults_to_reduce() {
+        let m = ScriptMeta::default();
+        assert_eq!(m.mode, ScriptMode::Reduce);
+        assert_eq!(m.hop_ms, None);
     }
 }
