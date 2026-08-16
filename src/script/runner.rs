@@ -120,6 +120,7 @@ impl ScriptRunner {
     /// Run one tick: resolve inputs, gather windows, call the compiled script,
     /// and append new output samples (dedup by timestamp). When `rec` is set,
     /// each newly-written sample is also queued to the recorder.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn tick_rec(
         &mut self,
         store: &dyn ChannelStore,
