@@ -325,6 +325,20 @@ def compute(ts, vals):
     }
 
     #[test]
+    fn shipped_scripts_declare_expected_modes() {
+        use crate::script::types::ScriptMode;
+        for (file, want) in [
+            ("scripts/channel_diff.py", ScriptMode::Map),
+            ("scripts/sine_squared.py", ScriptMode::Map),
+            ("scripts/sine_rms.py", ScriptMode::Reduce),
+        ] {
+            let src = std::fs::read_to_string(file).unwrap();
+            let stem = std::path::Path::new(file).file_stem().unwrap().to_str().unwrap();
+            assert_eq!(PyScriptLoader.peek_meta(&src, stem).unwrap().mode, want, "{file}");
+        }
+    }
+
+    #[test]
     fn extract_meta_reads_mode_and_hop() {
         Python::with_gil(|py| {
             // Distinct module names per call: `PyImport_ExecCodeModuleEx` (what

@@ -9,6 +9,7 @@ import numba
 
 INPUTS = ["load/ch0"]
 OUTPUTS = [{"name": "scripts.{in0.stem}_squared", "type": "float", "unit": ""}]
+MODE = "map"   # one output per input sample, at input timestamps
 
 
 @numba.njit

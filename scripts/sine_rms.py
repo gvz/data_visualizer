@@ -10,6 +10,7 @@ import numba
 
 INPUTS = ["load/ch0"]
 OUTPUTS = [{"name": "scripts.{in0.stem}_rms", "type": "float", "unit": ""}]
+MODE = "reduce"   # windowed aggregate; emit per tick (optionally throttled)
 
 
 @numba.njit

@@ -11,6 +11,7 @@ import numba
 
 INPUTS = ["load/ch0", "load/ch1"]
 OUTPUTS = [{"name": "scripts.{in0.stem}_minus_{in1.stem}", "type": "float", "unit": ""}]
+MODE = "map"   # one output per input sample, at input timestamps
 
 
 @numba.njit
