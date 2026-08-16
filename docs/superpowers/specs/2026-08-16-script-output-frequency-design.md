@@ -172,9 +172,18 @@ Under the reference load (`channel_diff` as `map`), the per-tick input snapshot
 drops from `window_s` × rate (10 s ≈ millions of samples) to one tick's arrivals
 (~a few thousand), and the redundant reprocessing of already-emitted samples
 disappears. This mirrors the snapshot-bounding win already measured on the
-spectrum panel. Exact numbers to be captured by profiling with scripting on
-(`NO_DEFAULT=0`) before and after — we have **no** current measurement of the
-script thread, since every profile this cycle ran with scripting disabled.
+spectrum panel.
+
+**Measured baseline** (2026-08-16, scripting on, 8 ch @ 100 kHz, 3 runners:
+`sine_squared`, `sine_rms`, `channel_diff`): `ScriptEngine::tick_rec` runs at
+**11.7 ms and 21.9 MB per call** (p95 23.5 ms), consuming **67.7 % of a core**
+and 22 % of all allocation. Because each tick waits 16 ms then runs all three
+runners (~50 ms total), the loop completes only **~19 times/second** — the
+full-window recompute starves its own 16 ms timer, so computed channels update
+well below both the tick rate and their input rate. This is the before-number
+the `map` path must beat: cursor-feeding the two elementwise scripts should cut
+their per-call cost by ~2 orders of magnitude and let the tick reach 62 Hz;
+`HOP_MS` bounds the remaining `reduce` recompute.
 
 ## Tick rate vs output rate
 
