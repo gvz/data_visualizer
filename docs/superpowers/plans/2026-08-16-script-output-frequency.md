@@ -377,29 +377,32 @@ fn reduce_hop_throttles_emit() {
         mode: ScriptMode::Reduce,
         hop_ms: Some(1),                 // 1 ms = 1_000_000 ns
     };
-    // Emit one value stamped at the newest input time each time it runs.
-    let compiled = Box::new(FakeScript(|inp: &[InputWindow]| {
-        let t = *inp[0].ts.last().unwrap();
-        Ok(vec![OutputBatch { ts: vec![t], vals: vec![0.0] }])
+    // Count how many times compute actually runs — the throttle skips the whole
+    // tick, so a throttled tick never calls compute. (Counting output samples
+    // would not work: each run stamps the same newest input ts and the per-output
+    // dedup collapses them.)
+    let calls = std::rc::Rc::new(std::cell::RefCell::new(0usize));
+    let calls2 = calls.clone();
+    let compiled = Box::new(FakeScript(move |inp: &[InputWindow]| {
+        *calls2.borrow_mut() += 1;
+        Ok(vec![OutputBatch { ts: vec![*inp[0].ts.last().unwrap()], vals: vec![0.0] }])
     }));
     let mut runner = ScriptRunner::new("r".into(), meta, compiled, &store, &reg);
 
+    // `now` must be >= the newest sample so the window is non-empty.
     let win = 1_000_000_000;
-    runner.tick(&store, &reg, 0, win);               // emits (last_hop = 0)
-    runner.tick(&store, &reg, 500_000, win);         // 0.5 ms later: throttled, no run
-    runner.tick(&store, &reg, 1_000_000, win);       // 1 ms later: emits again
+    runner.tick(&store, &reg, 5, win);               // runs (last_hop = 5)
+    runner.tick(&store, &reg, 5 + 500_000, win);     // 0.5 ms later: throttled, no run
+    runner.tick(&store, &reg, 5 + 1_000_000, win);   // 1 ms later: runs again
 
-    let out_id = reg.id("o").unwrap();
-    // Two distinct emit times despite three ticks.
-    let snap = store.snapshot(out_id, TimeWindow { start_ns: i64::MIN, end_ns: i64::MAX });
-    assert_eq!(snap.len(), 2);
+    assert_eq!(*calls.borrow(), 2);                  // middle tick was skipped
 }
 ```
 
 - [ ] **Step 2: Run it to verify it fails**
 
 Run: `cargo test --no-default-features script::runner::tests::reduce_hop_throttles_emit`
-Expected: FAIL — no throttle yet; all three ticks emit (but note ts dedup means the middle tick with the same newest-ts would be deduped; the assertion still distinguishes throttle from no-throttle because without the gate the second tick still runs `compute`). If flaky on dedup, the gate is what makes the count deterministic.
+Expected: FAIL — no throttle yet, so all three ticks call `compute` (`calls == 3`).
 
 - [ ] **Step 3: Add the hop gate**
 
