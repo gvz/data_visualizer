@@ -15,6 +15,14 @@ use crate::types::{ChannelMeta, SampleType, TimeWindow};
 
 use super::decode_buf::{ChunkDecodeBuf, DecodedChunk};
 
+/// Batch MCAP messages carry one `log_time` (the batch's last sample), so the
+/// first batch's chunk-index start bound can sit up to one batch span AFTER the
+/// chunk's true earliest sample. Pad the start check by that span so no
+/// in-window chunk is skipped; per-sample clipping inside the chunk still
+/// returns exact results. Kept at the max batch span (500 ms) so it does not
+/// over-select on files with tightly spaced chunks.
+const SPAN_PAD_NS: i64 = 500_000_000;
+
 /// The fully-qualified name of the single message defined by an embedded schema,
 /// e.g. "mqtt.HomeSensorsTemperature". None if the set defines no message.
 pub(crate) fn first_message_name(schema_bytes: &[u8]) -> Option<String> {
@@ -252,11 +260,14 @@ impl RecordingSource {
     }
 
     pub fn overlapping(&self, window: TimeWindow) -> Vec<usize> {
-        // A span intersects [start, end) iff span.start < window.end && span.end >= window.start.
+        // The index start can trail the true earliest sample by ≤ SPAN_PAD_NS, so a
+        // span may contain in-window samples iff (start - pad) < window.end && end >= window.start.
         self.spans
             .iter()
             .enumerate()
-            .filter(|(_, s)| s.start_ns < window.end_ns && s.end_ns >= window.start_ns)
+            .filter(|(_, s)| {
+                s.start_ns.saturating_sub(SPAN_PAD_NS) < window.end_ns && s.end_ns >= window.start_ns
+            })
             .map(|(i, _)| i)
             .collect()
     }
@@ -486,6 +497,33 @@ type = "float"
                 assert_eq!(ts, vec![1_000_000_000, 2_000_000_000, 3_000_000_000]);
                 assert!((vals[0] - 21.5).abs() < 1e-4 && (vals[2] - 23.5).abs() < 1e-4);
             }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn narrow_window_at_batch_leading_edge_returns_samples() {
+        let registry = ChannelRegistry::from_toml_str(r#"
+[channels."accel.x"]
+topic = "accel"
+proto_path = "AccelBatch.samples.x"
+ts_path = "AccelBatch.samples.t_ns"
+type = "float"
+"#).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edge.mcap");
+        // One batch; log_time = last sample (300). Chunk index start_ns becomes 300,
+        // but samples exist at 100/200/300.
+        write_batched_mqtt_mcap(&path, "home/temp", &[
+            (100, "1.0"), (200, "2.0"), (300, "3.0"),
+        ]);
+        let store = crate::record::playback::PlaybackStore::load(&path, &registry).unwrap();
+        let id = registry.id("home/temp").unwrap();
+        // Window [100,150) covers only the first sample, which sits before the
+        // coarsened chunk start — without the pad this returns empty.
+        let w = TimeWindow { start_ns: 100, end_ns: 150 };
+        match crate::store::ChannelStore::snapshot(store.as_ref(), id, w) {
+            ChannelSnapshot::Float { ts, .. } => assert_eq!(ts, vec![100]),
             other => panic!("wrong variant: {other:?}"),
         }
     }
