@@ -14,7 +14,7 @@ const BOOL_FALSE: &[&str] = &["0", "false", "False", "FALSE", "off", "OFF", "no"
 
 struct TopicEntry {
     sample_type: SampleType,
-    descriptor: MessageDescriptor,
+    sample_descriptor: MessageDescriptor, // the nested Sample message
     /// Self-contained FileDescriptorSet (this topic's one file) used as the MCAP
     /// protobuf schema payload.
     schema_bytes: Arc<[u8]>,
@@ -110,14 +110,14 @@ impl DynamicProtoRegistry {
         if self.pool.add_file_descriptor_proto(file.clone()).is_err() {
             return None;
         }
-        let fq = format!("mqtt.{msg_name}");
-        let descriptor = self.pool.get_message_by_name(&fq)?;
+        let fq = format!("mqtt.{msg_name}.Sample");
+        let sample_descriptor = self.pool.get_message_by_name(&fq)?;
         let schema_bytes: Arc<[u8]> = FileDescriptorSet { file: vec![file] }
             .encode_to_vec()
             .into();
         self.entries.insert(
             topic.to_string(),
-            TopicEntry { sample_type, descriptor, schema_bytes },
+            TopicEntry { sample_type, sample_descriptor, schema_bytes },
         );
         self.used_names.insert(msg_name);
         Some(())
@@ -138,7 +138,7 @@ impl DynamicProtoRegistry {
 
 /// Encode a `(t_ns, value)` message against a topic's cached descriptor.
 fn encode(entry: &TopicEntry, ts_ns: i64, value: Value) -> (Arc<[u8]>, Vec<u8>) {
-    let mut msg = DynamicMessage::new(entry.descriptor.clone());
+    let mut msg = DynamicMessage::new(entry.sample_descriptor.clone());
     msg.set_field_by_name("t_ns", Value::I64(ts_ns));
     msg.set_field_by_name("value", value);
     (entry.schema_bytes.clone(), msg.encode_to_vec())
@@ -185,8 +185,10 @@ fn sanitize(topic: &str) -> String {
     out
 }
 
-/// Hand-build a proto3 file with one message `<msg_name>` holding `t_ns` (int64)
-/// and a typed `value` field.
+/// Hand-build a proto3 file with a batch container message `<msg_name>` holding
+/// `repeated Sample samples = 1;`, where the nested `Sample` message holds
+/// `t_ns` (int64) and a typed `value` field — the same field numbers as the
+/// former flat message, so encoding a `Sample` is byte-identical to before.
 fn build_file_descriptor(msg_name: &str, sample_type: SampleType) -> FileDescriptorProto {
     let value_type = match sample_type {
         SampleType::Float => Type::Double,
@@ -194,11 +196,28 @@ fn build_file_descriptor(msg_name: &str, sample_type: SampleType) -> FileDescrip
         SampleType::Bool => Type::Bool,
         SampleType::Text => Type::String,
     };
-    let field = |name: &str, number: i32, ty: Type| FieldDescriptorProto {
+    let field = |name: &str, number: i32, ty: Type, type_name: Option<&str>| FieldDescriptorProto {
         name: Some(name.to_string()),
         number: Some(number),
         label: Some(Label::Optional as i32),
         r#type: Some(ty as i32),
+        type_name: type_name.map(|s| s.to_string()),
+        ..Default::default()
+    };
+    let sample = DescriptorProto {
+        name: Some("Sample".to_string()),
+        field: vec![
+            field("t_ns", 1, Type::Int64, None),
+            field("value", 2, value_type, None),
+        ],
+        ..Default::default()
+    };
+    let samples = FieldDescriptorProto {
+        name: Some("samples".to_string()),
+        number: Some(1),
+        label: Some(Label::Repeated as i32),
+        r#type: Some(Type::Message as i32),
+        type_name: Some(format!(".mqtt.{msg_name}.Sample")),
         ..Default::default()
     };
     FileDescriptorProto {
@@ -207,7 +226,8 @@ fn build_file_descriptor(msg_name: &str, sample_type: SampleType) -> FileDescrip
         syntax: Some("proto3".to_string()),
         message_type: vec![DescriptorProto {
             name: Some(msg_name.to_string()),
-            field: vec![field("t_ns", 1, Type::Int64), field("value", 2, value_type)],
+            field: vec![samples],
+            nested_type: vec![sample],
             ..Default::default()
         }],
         ..Default::default()
@@ -252,7 +272,7 @@ mod tests {
     fn record_frame_float_roundtrip() {
         let mut reg = DynamicProtoRegistry::new();
         let (schema, data) = reg.record_frame("sensors/x", 111, "2.5").unwrap();
-        let msg = decode_back(&schema, &data, "mqtt.SensorsX");
+        let msg = decode_back(&schema, &data, "mqtt.SensorsX.Sample");
         assert_eq!(msg.get_field_by_name("t_ns").unwrap().as_i64(), Some(111));
         assert_eq!(msg.get_field_by_name("value").unwrap().as_f64(), Some(2.5));
     }
@@ -261,14 +281,14 @@ mod tests {
     fn record_frame_int_bool_text() {
         let mut reg = DynamicProtoRegistry::new();
         let (s1, d1) = reg.record_frame("a/count", 1, "7").unwrap();
-        assert_eq!(decode_back(&s1, &d1, "mqtt.ACount").get_field_by_name("value").unwrap().as_i64(), Some(7));
+        assert_eq!(decode_back(&s1, &d1, "mqtt.ACount.Sample").get_field_by_name("value").unwrap().as_i64(), Some(7));
 
         let (s2, d2) = reg.record_frame("a/flag", 2, "true").unwrap();
-        assert_eq!(decode_back(&s2, &d2, "mqtt.AFlag").get_field_by_name("value").unwrap().as_bool(), Some(true));
+        assert_eq!(decode_back(&s2, &d2, "mqtt.AFlag.Sample").get_field_by_name("value").unwrap().as_bool(), Some(true));
 
         let (s3, d3) = reg.record_frame("a/msg", 3, "hi").unwrap();
         assert_eq!(
-            decode_back(&s3, &d3, "mqtt.AMsg").get_field_by_name("value").unwrap().as_str(),
+            decode_back(&s3, &d3, "mqtt.AMsg.Sample").get_field_by_name("value").unwrap().as_str(),
             Some("hi")
         );
     }
@@ -281,7 +301,7 @@ mod tests {
         let (s, d) = reg
             .record_numeric("calc/out", 5, SampleType::Float, NumericVal::Float(5.0))
             .unwrap();
-        let msg = decode_back(&s, &d, "mqtt.CalcOut");
+        let msg = decode_back(&s, &d, "mqtt.CalcOut.Sample");
         assert_eq!(msg.get_field_by_name("t_ns").unwrap().as_i64(), Some(5));
         assert_eq!(msg.get_field_by_name("value").unwrap().as_f64(), Some(5.0));
         // Type is locked to Float: an Int sample on the same topic is rejected.
@@ -306,7 +326,33 @@ mod tests {
         assert!(reg.record_frame("t/b", 1, "on").is_some());
         // Later numeric 1/0 still encodes as bool.
         let (s, d) = reg.record_frame("t/b", 2, "0").unwrap();
-        assert_eq!(decode_back(&s, &d, "mqtt.TB").get_field_by_name("value").unwrap().as_bool(), Some(false));
+        assert_eq!(decode_back(&s, &d, "mqtt.TB.Sample").get_field_by_name("value").unwrap().as_bool(), Some(false));
+    }
+
+    #[test]
+    fn schema_is_batch_and_sample_bytes_roundtrip() {
+        use prost_reflect::{DescriptorPool, DynamicMessage, Value};
+        let mut reg = DynamicProtoRegistry::new();
+        let (schema, sample_bytes) = reg.record_frame("sensors/x", 111, "2.5").unwrap();
+
+        // Top message has a repeated `samples` field of a Sample submessage.
+        let pool = DescriptorPool::decode(schema.as_ref()).unwrap();
+        let batch = pool.get_message_by_name("mqtt.SensorsX").unwrap();
+        let samples_f = batch.get_field_by_name("samples").unwrap();
+        assert_eq!(samples_f.number(), 1);
+        assert!(samples_f.is_list());
+        let sample_desc = match samples_f.kind() {
+            prost_reflect::Kind::Message(m) => m,
+            k => panic!("samples not a message: {k:?}"),
+        };
+        assert_eq!(sample_desc.get_field_by_name("t_ns").unwrap().number(), 1);
+        assert_eq!(sample_desc.get_field_by_name("value").unwrap().number(), 2);
+
+        // sample_bytes decode as a Sample with t_ns=111, value=2.5.
+        let s = DynamicMessage::decode(sample_desc, sample_bytes.as_slice()).unwrap();
+        assert_eq!(s.get_field_by_name("t_ns").unwrap().as_i64(), Some(111));
+        assert_eq!(s.get_field_by_name("value").unwrap().as_f64(), Some(2.5));
+        let _ = Value::Bool(false);
     }
 
     #[test]
