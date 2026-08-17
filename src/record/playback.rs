@@ -769,8 +769,12 @@ type = "float"
         assert_eq!(store.break_times(), &[5_000_000_000]);
     }
 
-    /// Write a single-message MCAP for one MQTT topic using the recorder's own
-    /// schema generator, so the embedded schema matches production exactly.
+    /// Write a single Batch-shaped MCAP message for one MQTT topic using the
+    /// recorder's own schema generator, so the embedded schema matches
+    /// production exactly. All `(ts, payload)` samples are wrapped as repeated
+    /// `Sample` elements (tag 0x0A, varint length, bytes) in one message whose
+    /// `log_time` is the last sample's ts — the reader can only decode a Batch
+    /// schema's payload as a repeated field, not a bare `Sample`.
     fn write_mqtt_mcap(path: &std::path::Path, topic: &str, payloads: &[(i64, &str)]) {
         use crate::record::mqtt_schema::DynamicProtoRegistry;
         use std::borrow::Cow;
@@ -778,31 +782,41 @@ type = "float"
         use std::sync::Arc;
 
         let mut reg = DynamicProtoRegistry::new();
+        let mut schema_bytes: Option<Arc<[u8]>> = None;
+        let mut batch: Vec<u8> = Vec::new();
+        let mut last_ts = 0i64;
+        for (ts, payload) in payloads {
+            let (schema, sample_bytes) = reg.record_frame(topic, *ts, payload).unwrap();
+            schema_bytes.get_or_insert(schema);
+            // repeated Sample samples = 1  →  tag 0x0A, len, bytes
+            batch.push(0x0A);
+            let mut len = sample_bytes.len();
+            loop {
+                let mut b = (len & 0x7f) as u8;
+                len >>= 7;
+                if len != 0 { b |= 0x80; }
+                batch.push(b);
+                if len == 0 { break; }
+            }
+            batch.extend_from_slice(&sample_bytes);
+            last_ts = *ts;
+        }
+        let channel = Arc::new(mcap::Channel {
+            topic: topic.to_string(),
+            schema: Some(Arc::new(mcap::Schema {
+                name: topic.to_string(),
+                encoding: "protobuf".to_string(),
+                data: Cow::Owned(schema_bytes.unwrap().to_vec()),
+            })),
+            message_encoding: "protobuf".to_string(),
+            metadata: BTreeMap::new(),
+        });
         let file = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
         let mut writer = mcap::Writer::new(file).unwrap();
-        let mut channel: Option<Arc<mcap::Channel>> = None;
-        for (ts, payload) in payloads {
-            let (schema_bytes, data) = reg.record_frame(topic, *ts, payload).unwrap();
-            let ch = channel.get_or_insert_with(|| {
-                Arc::new(mcap::Channel {
-                    topic: topic.to_string(),
-                    schema: Some(Arc::new(mcap::Schema {
-                        name: topic.to_string(),
-                        encoding: "protobuf".to_string(),
-                        data: Cow::Owned(schema_bytes.to_vec()),
-                    })),
-                    message_encoding: "protobuf".to_string(),
-                    metadata: BTreeMap::new(),
-                })
-            });
-            writer.write(&mcap::Message {
-                channel: ch.clone(),
-                sequence: 0,
-                log_time: *ts as u64,
-                publish_time: *ts as u64,
-                data: Cow::Owned(data),
-            }).unwrap();
-        }
+        writer.write(&mcap::Message {
+            channel, sequence: 0, log_time: last_ts as u64, publish_time: last_ts as u64,
+            data: Cow::Owned(batch),
+        }).unwrap();
         writer.finish().unwrap();
     }
 
@@ -896,10 +910,22 @@ type = "float"
             log_time: 1_000_000_000, publish_time: 1_000_000_000,
             data: Cow::Owned(batch.encode_to_vec()),
         }).unwrap();
+        // Wrap the bare Sample into a one-element Batch (tag 0x0A, len, bytes) —
+        // the embedded schema is Batch-shaped, so the payload must be too.
+        let mut mqtt_batch = vec![0x0A];
+        let mut len = mqtt_data.len();
+        loop {
+            let mut b = (len & 0x7f) as u8;
+            len >>= 7;
+            if len != 0 { b |= 0x80; }
+            mqtt_batch.push(b);
+            if len == 0 { break; }
+        }
+        mqtt_batch.extend_from_slice(&mqtt_data);
         writer.write(&mcap::Message {
             channel: mqtt_channel, sequence: 0,
             log_time: 1_500_000_000, publish_time: 1_500_000_000,
-            data: Cow::Owned(mqtt_data),
+            data: Cow::Owned(mqtt_batch),
         }).unwrap();
         writer.finish().unwrap();
 
@@ -925,9 +951,12 @@ type = "float"
     fn value_sample_type_maps_kinds() {
         use crate::record::lazy::source::{first_message_name, value_sample_type};
         use crate::record::mqtt_schema::DynamicProtoRegistry;
+        use prost_reflect::{Cardinality, Kind};
         let mut reg = DynamicProtoRegistry::new();
         // Each first payload locks a distinct type; grab the generated descriptor
-        // back out via the merged pool and check value_sample_type.
+        // back out via the merged pool. The top-level message is now the Batch
+        // (repeated Sample, no `value` field of its own), so navigate to the
+        // nested Sample descriptor before checking value_sample_type.
         for (topic, payload, expected) in [
             ("t/f", "3.14", SampleType::Float),
             ("t/i", "7", SampleType::Int),
@@ -937,8 +966,15 @@ type = "float"
             let (schema_bytes, _data) = reg.record_frame(topic, 1, payload).unwrap();
             let full = first_message_name(&schema_bytes).unwrap();
             let merged = ProtoSchema::from_descriptor_sets(&[&schema_bytes]);
-            let desc = merged.message_by_name(&full).unwrap();
-            assert_eq!(value_sample_type(&desc), Some(expected), "topic {topic}");
+            let batch_desc = merged.message_by_name(&full).unwrap();
+            let sample_desc = batch_desc
+                .fields()
+                .find_map(|f| match (f.cardinality(), f.kind()) {
+                    (Cardinality::Repeated, Kind::Message(m)) => Some(m),
+                    _ => None,
+                })
+                .expect("batch message has a repeated Sample field");
+            assert_eq!(value_sample_type(&sample_desc), Some(expected), "topic {topic}");
         }
     }
 
@@ -994,6 +1030,91 @@ type = "float"
                 );
             }
             other => panic!("expected Float snapshot, got {other:?}"),
+        }
+    }
+
+    /// Old (pre-batch) recordings embedded a flat schema: a top-level message
+    /// with `t_ns`/`value` and no repeated field. Proves `plan_file`'s flat
+    /// branch still fires and the file decodes, guarding full backward
+    /// compatibility after the Task 3 batch-schema change.
+    #[test]
+    fn old_flat_file_still_reads() {
+        use prost_reflect::prost::Message as _;
+        use prost_reflect::{DescriptorPool, DynamicMessage, Value};
+        use prost_types::field_descriptor_proto::{Label, Type};
+        use prost_types::{DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet};
+        use std::borrow::Cow;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let field = |name: &str, number: i32, ty: Type| FieldDescriptorProto {
+            name: Some(name.to_string()),
+            number: Some(number),
+            label: Some(Label::Optional as i32),
+            r#type: Some(ty as i32),
+            ..Default::default()
+        };
+        let file = FileDescriptorProto {
+            name: Some("mqtt/HomeTemp.proto".to_string()),
+            package: Some("mqtt".to_string()),
+            syntax: Some("proto3".to_string()),
+            message_type: vec![DescriptorProto {
+                name: Some("HomeTemp".to_string()),
+                field: vec![field("t_ns", 1, Type::Int64), field("value", 2, Type::Double)],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let schema_bytes = FileDescriptorSet { file: vec![file.clone()] }.encode_to_vec();
+
+        let mut pool = DescriptorPool::new();
+        pool.add_file_descriptor_proto(file).unwrap();
+        let desc = pool.get_message_by_name("mqtt.HomeTemp").unwrap();
+        let mut msg = DynamicMessage::new(desc);
+        msg.set_field_by_name("t_ns", Value::I64(1_000_000_000));
+        msg.set_field_by_name("value", Value::F64(21.5));
+        let data = msg.encode_to_vec();
+
+        let registry = ChannelRegistry::from_toml_str(r#"
+[channels."accel.x"]
+topic = "accel"
+proto_path = "AccelBatch.samples.x"
+ts_path = "AccelBatch.samples.t_ns"
+type = "float"
+"#).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flat.mcap");
+        let channel = Arc::new(mcap::Channel {
+            topic: "home/temp".to_string(),
+            schema: Some(Arc::new(mcap::Schema {
+                name: "home/temp".to_string(),
+                encoding: "protobuf".to_string(),
+                data: Cow::Owned(schema_bytes),
+            })),
+            message_encoding: "protobuf".to_string(),
+            metadata: BTreeMap::new(),
+        });
+        let f = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+        let mut writer = mcap::Writer::new(f).unwrap();
+        writer.write(&mcap::Message {
+            channel,
+            sequence: 0,
+            log_time: 1_000_000_000,
+            publish_time: 1_000_000_000,
+            data: Cow::Owned(data),
+        }).unwrap();
+        writer.finish().unwrap();
+
+        let store = PlaybackStore::load(&path, &registry).unwrap();
+        let id = registry.id("home/temp").expect("flat topic reconstructed");
+        assert_eq!(registry.meta(id).sample_type, SampleType::Float);
+        let all = TimeWindow { start_ns: i64::MIN, end_ns: i64::MAX };
+        match store.snapshot(id, all) {
+            ChannelSnapshot::Float { ts, vals } => {
+                assert_eq!(ts, vec![1_000_000_000]);
+                assert!((vals[0] - 21.5).abs() < 1e-9);
+            }
+            other => panic!("wrong variant: {other:?}"),
         }
     }
 }

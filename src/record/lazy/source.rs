@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::Context;
 use memmap2::Mmap;
-use prost_reflect::{Kind, MessageDescriptor};
+use prost_reflect::{Cardinality, Kind, MessageDescriptor};
 
 use crate::config::ChannelRegistry;
 use crate::ingest::decode::decode_batch;
@@ -114,10 +114,28 @@ pub(crate) fn plan_file(
         }
         let Some(full) = first_message_name(schema_bytes) else { continue };
         let Some(desc) = merged.message_by_name(&full) else { continue };
-        if desc.get_field_by_name("t_ns").is_none() {
+
+        // Determine shape: flat (top-level t_ns+value) or batch (repeated Sample).
+        let (leaf_desc, val_path, ts_path) = if desc.get_field_by_name("t_ns").is_some()
+            && desc.get_field_by_name("value").is_some()
+        {
+            (desc.clone(), vec!["value".to_string()], vec!["t_ns".to_string()])
+        } else if let Some((rep_name, sub)) = desc.fields().find_map(|f| {
+            if f.cardinality() == Cardinality::Repeated {
+                if let Kind::Message(m) = f.kind() {
+                    if m.get_field_by_name("t_ns").is_some() && m.get_field_by_name("value").is_some() {
+                        return Some((f.name().to_string(), m));
+                    }
+                }
+            }
+            None
+        }) {
+            (sub, vec![rep_name.clone(), "value".to_string()], vec![rep_name, "t_ns".to_string()])
+        } else {
             continue;
-        }
-        let Some(sample_type) = value_sample_type(&desc) else { continue };
+        };
+
+        let Some(sample_type) = value_sample_type(&leaf_desc) else { continue };
         let id = registry.add_dynamic(topic, topic, sample_type);
         if registry.meta(id).sample_type != sample_type {
             eprintln!(
@@ -133,12 +151,11 @@ pub(crate) fn plan_file(
             vec![ChannelBinding {
                 id,
                 fast: crate::ingest::decode::FastPlan::build(
-                    &desc, &["value".to_string()], &["t_ns".to_string()],
-                    sample_type, 1.0, 0.0, id,
+                    &desc, &val_path, &ts_path, sample_type, 1.0, 0.0, id,
                 ),
                 msg_desc: desc,
-                val_path: vec!["value".to_string()],
-                ts_path: vec!["t_ns".to_string()],
+                val_path,
+                ts_path,
                 eu_scale: 1.0,
                 eu_offset: 0.0,
                 sample_type,
@@ -395,6 +412,80 @@ type = "float"
         let snap = chunk.window(id.0 as usize, TimeWindow { start_ns: i64::MIN, end_ns: i64::MAX });
         match snap {
             ChannelSnapshot::Float { ts, .. } => assert!(!ts.is_empty()),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// Write a batched MCAP: many Samples per topic in one repeated-field message.
+    fn write_batched_mqtt_mcap(path: &std::path::Path, topic: &str, samples: &[(i64, &str)]) {
+        use crate::record::mqtt_schema::DynamicProtoRegistry;
+        use std::borrow::Cow;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let mut reg = DynamicProtoRegistry::new();
+        let mut schema_bytes: Option<Arc<[u8]>> = None;
+        let mut batch: Vec<u8> = Vec::new();
+        let mut last_ts = 0i64;
+        for (ts, payload) in samples {
+            let (schema, sample_bytes) = reg.record_frame(topic, *ts, payload).unwrap();
+            schema_bytes.get_or_insert(schema);
+            // repeated Sample samples = 1  →  tag 0x0A, len, bytes
+            batch.push(0x0A);
+            let mut len = sample_bytes.len();
+            loop {
+                let mut b = (len & 0x7f) as u8;
+                len >>= 7;
+                if len != 0 { b |= 0x80; }
+                batch.push(b);
+                if len == 0 { break; }
+            }
+            batch.extend_from_slice(&sample_bytes);
+            last_ts = *ts;
+        }
+        let channel = Arc::new(mcap::Channel {
+            topic: topic.to_string(),
+            schema: Some(Arc::new(mcap::Schema {
+                name: topic.to_string(),
+                encoding: "protobuf".to_string(),
+                data: Cow::Owned(schema_bytes.unwrap().to_vec()),
+            })),
+            message_encoding: "protobuf".to_string(),
+            metadata: BTreeMap::new(),
+        });
+        let file = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+        let mut writer = mcap::Writer::new(file).unwrap();
+        writer.write(&mcap::Message {
+            channel, sequence: 0, log_time: last_ts as u64, publish_time: last_ts as u64,
+            data: Cow::Owned(batch),
+        }).unwrap();
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn batched_topic_reconstructs_and_decodes_all_samples() {
+        let registry = ChannelRegistry::from_toml_str(r#"
+[channels."accel.x"]
+topic = "accel"
+proto_path = "AccelBatch.samples.x"
+ts_path = "AccelBatch.samples.t_ns"
+type = "float"
+"#).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("batched.mcap");
+        write_batched_mqtt_mcap(&path, "home/temp", &[
+            (1_000_000_000, "21.5"),
+            (2_000_000_000, "22.0"),
+            (3_000_000_000, "23.5"),
+        ]);
+        let src = RecordingSource::open(&path, &registry).unwrap();
+        let id = registry.id("home/temp").expect("batched topic reconstructed");
+        let chunk = src.decode_chunk(0, &metas_of(&registry));
+        match chunk.window(id.0 as usize, TimeWindow { start_ns: i64::MIN, end_ns: i64::MAX }) {
+            ChannelSnapshot::Float { ts, vals } => {
+                assert_eq!(ts, vec![1_000_000_000, 2_000_000_000, 3_000_000_000]);
+                assert!((vals[0] - 21.5).abs() < 1e-4 && (vals[2] - 23.5).abs() < 1e-4);
+            }
             other => panic!("wrong variant: {other:?}"),
         }
     }
