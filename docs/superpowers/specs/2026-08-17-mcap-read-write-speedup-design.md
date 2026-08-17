@@ -210,23 +210,27 @@ batch binding; Part A's `FastPlan` accelerates it.
 
 ### Timeline correctness under batching
 
-A batch MCAP message carries one `log_time` (the batch's last sample ts), so
-mcap chunk-index bounds coarsen by up to one batch span (≤500 ms) at each
-chunk's leading edge. To guarantee no in-window chunk is ever skipped,
-`RecordingSource::overlapping(window)` pads the selection window by a constant
-`SPAN_PAD_NS` (≥ the max batch span; use 1 s for headroom):
+A batch MCAP message carries one `log_time` (the batch's last sample ts). The
+first batch in a chunk therefore stamps the chunk-index **start** bound up to
+one batch span (≤500 ms) *after* the chunk's true earliest sample; the **end**
+bound stays accurate (the last batch's log_time is the true max). To guarantee
+no in-window chunk is skipped, `RecordingSource::overlapping(window)` pads only
+the coarsened **start** comparison by `SPAN_PAD_NS`:
 
 ```rust
-let lo = window.start_ns.saturating_sub(SPAN_PAD_NS);
-// span intersects iff span.start_ns < window.end_ns && span.end_ns >= lo
+// span may hold in-window samples iff (start - pad) < window.end && end >= window.start
+s.start_ns.saturating_sub(SPAN_PAD_NS) < window.end_ns && s.end_ns >= window.start_ns
 ```
 
-Padding only widens **chunk selection**; the per-sample clip in
-`DecodedChunk::window` still returns exactly the samples inside the true
-`window`. Worst case decodes one extra neighbouring chunk at a boundary. Old
-files (per-sample log_time) are unaffected by the pad. `latest_at`'s candidate
-scan (`span.start_ns <= end_ns`) is already conservative (it scans all earlier
-spans) and needs no change.
+`SPAN_PAD_NS = 500_000_000` (exactly the max batch span). It must not exceed the
+existing `overlapping_selects_intersecting_spans` test's 5e8 gap (a larger pad
+would over-select there), and the max batch span is 500 ms, so 500 ms is both
+the floor for correctness and the ceiling for that test. Padding only widens
+**chunk selection**; the per-sample clip in `DecodedChunk::window` still returns
+exactly the samples inside the true `window`. Worst case decodes one extra
+neighbouring chunk at a boundary. Old files (per-sample log_time) are unaffected.
+`latest_at`'s candidate scan (`span.start_ns <= end_ns`) is already conservative
+and needs no change.
 
 ## File structure
 
