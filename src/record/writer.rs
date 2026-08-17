@@ -35,12 +35,31 @@ impl RecorderCfg {
     }
 }
 
+/// Samples buffered per flush before they're forced out as one MCAP message.
+const DYN_BATCH_SAMPLES: usize = 1024;
+/// Max time a topic's buffer may sit unflushed.
+const DYN_BATCH_MS: u64 = 500;
+
+/// Per-topic buffer for `DynamicProto` (MQTT) samples: accumulates the
+/// concatenated `repeated Sample` wire bytes and flushes as one MCAP message
+/// on size or time, instead of one MCAP message per sample.
+struct DynBuf {
+    channel_id: u16,
+    /// Concatenated repeated-Sample elements (tag + varint len + sample bytes).
+    samples: Vec<u8>,
+    count: usize,
+    /// Flush at-or-after this instant.
+    deadline: Instant,
+    last_log_time: i64,
+}
+
 struct McapRecorder {
     writer: mcap::Writer<'static, BufWriter<File>>,
     /// ZMQ/Proto channels: pre-seeded from the ChannelRegistry at startup.
     channel_ids: HashMap<String, u16>,
-    /// DynamicProto (MQTT) channels: registered on first sight, separate namespace.
-    dynamic_channel_ids: HashMap<String, u16>,
+    /// DynamicProto (MQTT) per-topic batch buffers: registered on first sight,
+    /// separate namespace from `channel_ids`.
+    dynamic: HashMap<String, DynBuf>,
     last_flush: Instant,
     sequence: u32,
     path: PathBuf,
@@ -76,7 +95,7 @@ impl McapRecorder {
         Ok(Self {
             writer,
             channel_ids,
-            dynamic_channel_ids: HashMap::new(),
+            dynamic: HashMap::new(),
             last_flush: Instant::now(),
             sequence: 0,
             path,
@@ -135,17 +154,21 @@ impl McapRecorder {
         self.write_to_channel(channel_id, data, log_time_ns)
     }
 
-    /// Write a message whose protobuf schema is supplied inline. Registers a new
-    /// MCAP channel (with its own schema) the first time a topic is seen.
-    /// Uses `dynamic_channel_ids` exclusively — never shares namespace with `channel_ids`.
+    /// Buffer a message whose protobuf schema is supplied inline. Registers a
+    /// new MCAP channel (with its own schema) the first time a topic is seen,
+    /// then appends the sample as one `repeated Sample` element. Uses
+    /// `dynamic` exclusively — never shares namespace with `channel_ids`.
+    /// Flushes the topic's buffer as a single MCAP message once it reaches
+    /// `DYN_BATCH_SAMPLES`; the rest are flushed by time (`flush_due_dynamic`)
+    /// or on `finish`/rotate (`flush_all_dynamic`).
     fn write_dynamic(
         &mut self,
         topic: &str,
         schema_bytes: &[u8],
-        data: &[u8],
+        sample_bytes: &[u8],
         log_time_ns: i64,
     ) -> anyhow::Result<()> {
-        if !self.dynamic_channel_ids.contains_key(topic) {
+        if !self.dynamic.contains_key(topic) {
             let schema = Arc::new(mcap::Schema {
                 name: topic.to_string(),
                 encoding: "protobuf".to_string(),
@@ -158,16 +181,90 @@ impl McapRecorder {
                 metadata: BTreeMap::new(),
             };
             let channel_id = self.writer.add_channel(&channel)?;
-            self.dynamic_channel_ids.insert(topic.to_string(), channel_id);
+            self.dynamic.insert(
+                topic.to_string(),
+                DynBuf {
+                    channel_id,
+                    samples: Vec::new(),
+                    count: 0,
+                    deadline: Instant::now() + Duration::from_millis(DYN_BATCH_MS),
+                    last_log_time: log_time_ns,
+                },
+            );
         }
-        let &channel_id = self.dynamic_channel_ids.get(topic).unwrap();
-        self.write_to_channel(channel_id, data, log_time_ns)
+        let buf = self.dynamic.get_mut(topic).unwrap();
+        if buf.count == 0 {
+            buf.deadline = Instant::now() + Duration::from_millis(DYN_BATCH_MS);
+        }
+        // repeated Sample samples = 1  →  tag 0x0A, varint len, bytes.
+        buf.samples.push(0x0A);
+        write_varint(&mut buf.samples, sample_bytes.len() as u64);
+        buf.samples.extend_from_slice(sample_bytes);
+        buf.count += 1;
+        buf.last_log_time = log_time_ns;
+        if buf.count >= DYN_BATCH_SAMPLES {
+            self.flush_dynamic(topic)?;
+        }
+        Ok(())
+    }
+
+    /// Flush one topic's buffered batch as a single MCAP message.
+    fn flush_dynamic(&mut self, topic: &str) -> anyhow::Result<()> {
+        let Some(buf) = self.dynamic.get_mut(topic) else { return Ok(()) };
+        if buf.count == 0 {
+            return Ok(());
+        }
+        let channel_id = buf.channel_id;
+        let log_time = buf.last_log_time;
+        let data = std::mem::take(&mut buf.samples);
+        buf.count = 0;
+        self.write_to_channel(channel_id, &data, log_time)
+    }
+
+    /// Flush every dynamic buffer whose deadline has passed.
+    fn flush_due_dynamic(&mut self) -> anyhow::Result<()> {
+        let now = Instant::now();
+        let due: Vec<String> = self
+            .dynamic
+            .iter()
+            .filter(|(_, b)| b.count > 0 && now >= b.deadline)
+            .map(|(t, _)| t.clone())
+            .collect();
+        for topic in due {
+            self.flush_dynamic(&topic)?;
+        }
+        Ok(())
+    }
+
+    /// Flush all dynamic buffers (used on finish/rotate).
+    fn flush_all_dynamic(&mut self) -> anyhow::Result<()> {
+        let topics: Vec<String> = self.dynamic.keys().cloned().collect();
+        for topic in topics {
+            self.flush_dynamic(&topic)?;
+        }
+        Ok(())
     }
 
     fn finish(mut self) -> anyhow::Result<()> {
+        self.flush_all_dynamic()?;
         self.writer.flush()?;
         self.writer.finish()?;
         Ok(())
+    }
+}
+
+/// Encode `v` as a protobuf LEB128 varint, appended to `buf`.
+fn write_varint(buf: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let mut b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v != 0 {
+            b |= 0x80;
+        }
+        buf.push(b);
+        if v == 0 {
+            break;
+        }
     }
 }
 
@@ -197,18 +294,28 @@ fn recorder_loop(
     stop_rx: crossbeam_channel::Receiver<()>,
 ) -> anyhow::Result<()> {
     let mut part: u32 = 0;
+    let ticker = crossbeam_channel::tick(Duration::from_millis(100));
     loop {
         crossbeam_channel::select! {
             recv(record_rx) -> result => match result {
                 Ok(msg) => {
                     write_record(&mut recorder, msg)?;
                     if recorder.over_limit {
+                        recorder.flush_all_dynamic()?; // don't lose buffered samples across rotate
                         part += 1;
                         recorder = rotate(recorder, &cfg, part)?;
                     }
                 }
                 Err(_) => break,
             },
+            recv(ticker) -> _ => {
+                recorder.flush_due_dynamic()?;
+                if recorder.over_limit {
+                    recorder.flush_all_dynamic()?;
+                    part += 1;
+                    recorder = rotate(recorder, &cfg, part)?;
+                }
+            }
             recv(stop_rx) -> _ => break,
         }
     }
@@ -280,6 +387,7 @@ mod tests {
     use crate::config::ChannelRegistry;
     use crate::record::queue::record_channel;
     use crate::record::start_recording;
+    use crate::types::{ChannelSnapshot, TimeWindow};
 
     fn minimal_registry() -> ChannelRegistry {
         ChannelRegistry::from_toml_str(
@@ -411,15 +519,19 @@ type = "float"
             .collect::<Result<_, _>>()
             .unwrap();
 
-        assert_eq!(messages.len(), 3);
+        // Two topics, each buffered and flushed once by `finish` → two messages
+        // total; the two "home/temp" writes batch into a single flushed message.
+        assert_eq!(messages.len(), 2);
         // Two distinct topics → two distinct channels, each with its own schema.
         let temp = messages.iter().find(|m| m.channel.topic == "home/temp").unwrap();
         let door = messages.iter().find(|m| m.channel.topic == "home/door").unwrap();
         assert_eq!(temp.channel.schema.as_ref().unwrap().data.as_ref(), b"schema_A");
         assert_eq!(door.channel.schema.as_ref().unwrap().data.as_ref(), b"schema_B");
-        // The repeated topic reused the first channel.
+        // The repeated topic reused the first channel: one flushed message
+        // carrying both buffered samples as concatenated repeated-Sample elements.
         let temp_count = messages.iter().filter(|m| m.channel.topic == "home/temp").count();
-        assert_eq!(temp_count, 2);
+        assert_eq!(temp_count, 1);
+        assert_eq!(temp.data.as_ref(), &[0x0A, 0x01, 0x0A, 0x0A, 0x01, 0x0C]);
     }
 
     #[test]
@@ -461,7 +573,9 @@ type = "float"
         // Exactly one message was written (the DynamicProto one; no ZMQ "accel" messages sent).
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].channel.topic, "accel");
-        assert_eq!(messages[0].data.as_ref(), &[0xDE_u8, 0xAD]);
+        // The buffered flush wraps the sample as one repeated-Sample element:
+        // tag 0x0A, varint len 2, then the raw sample bytes.
+        assert_eq!(messages[0].data.as_ref(), &[0x0A, 0x02, 0xDE_u8, 0xAD]);
         // The channel must carry the MQTT schema, not the empty shared ZMQ schema.
         let schema_data = messages[0].channel.schema.as_ref().unwrap().data.as_ref();
         assert_eq!(schema_data, mqtt_schema, "DynamicProto message was recorded under the wrong schema");
@@ -515,5 +629,153 @@ type = "float"
         all_ts.sort_unstable();
         assert_eq!(all_ts.first(), Some(&1));
         assert_eq!(all_ts.last(), Some(&(n as u64)));
+    }
+
+    #[test]
+    fn dynamic_samples_are_batched_and_replay_exactly() {
+        use crate::config::ChannelRegistry;
+        use crate::record::mqtt_schema::DynamicProtoRegistry;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Minimal registry (no MQTT topic pre-registered).
+        let registry = ChannelRegistry::from_toml_str(
+            r#"
+[channels."accel.x"]
+topic = "accel"
+proto_path = "M.samples.x"
+ts_path = "M.samples.t_ns"
+type = "float"
+"#,
+        )
+        .unwrap();
+
+        // Open a recorder directly on a known path (no rotation).
+        let cfg = RecorderCfg {
+            output_dir: dir.path().to_path_buf(),
+            session_secs: 12345,
+            schema_bytes: b"".to_vec(),
+            zmq_topics: vec![],
+            max_bytes: None,
+        };
+        let mut rec = McapRecorder::open(&cfg, 0).unwrap();
+
+        // 3000 single samples on one MQTT topic → should batch to 3 messages.
+        let mut proto = DynamicProtoRegistry::new();
+        let n = 3000i64;
+        for i in 1..=n {
+            let (schema, data) = proto
+                .record_numeric(
+                    "home/temp",
+                    i,
+                    crate::types::SampleType::Float,
+                    crate::types::NumericVal::Float(i as f64),
+                )
+                .unwrap();
+            rec.write_dynamic("home/temp", &schema, &data, i).unwrap();
+        }
+        let path = cfg.part_path(0);
+        rec.finish().unwrap(); // must flush the partial buffer
+
+        // Count MCAP messages: ceil(3000/1024) = 3.
+        let bytes = std::fs::read(&path).unwrap();
+        let msg_count = mcap::MessageStream::new(&bytes).unwrap().count();
+        assert_eq!(msg_count, 3, "3000 samples must batch to 3 messages, got {msg_count}");
+
+        // Replay returns all 3000 samples with exact ts/value.
+        let store = crate::record::playback::PlaybackStore::load(&path, &registry).unwrap();
+        let id = registry.id("home/temp").unwrap();
+        let all = TimeWindow { start_ns: i64::MIN, end_ns: i64::MAX };
+        match crate::store::ChannelStore::snapshot(store.as_ref(), id, all) {
+            ChannelSnapshot::Float { ts, vals } => {
+                assert_eq!(ts.len(), 3000);
+                assert_eq!(ts[0], 1);
+                assert_eq!(*ts.last().unwrap(), 3000);
+                assert!((vals[2999] - 3000.0).abs() < 1e-6);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dynamic_buffer_flushes_on_time_deadline() {
+        // Unit-level: drive McapRecorder directly (no recorder thread) so we
+        // can call `flush_due_dynamic` deterministically and inspect buffer
+        // state. An MCAP file isn't readable until `finish` writes the
+        // footer, so this doesn't try to read the file mid-stream.
+        use crate::record::mqtt_schema::DynamicProtoRegistry;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = RecorderCfg {
+            output_dir: dir.path().to_path_buf(),
+            session_secs: 99999,
+            schema_bytes: b"".to_vec(),
+            zmq_topics: vec![],
+            max_bytes: None,
+        };
+        let mut rec = McapRecorder::open(&cfg, 0).unwrap();
+
+        let mut proto = DynamicProtoRegistry::new();
+        // Well under DYN_BATCH_SAMPLES: only a time-based flush moves this.
+        for i in 1..=5i64 {
+            let (schema, data) = proto
+                .record_numeric("home/temp", i, crate::types::SampleType::Float, crate::types::NumericVal::Float(i as f64))
+                .unwrap();
+            rec.write_dynamic("home/temp", &schema, &data, i).unwrap();
+        }
+
+        // Before the deadline: flush_due_dynamic must be a no-op.
+        rec.flush_due_dynamic().unwrap();
+        assert_eq!(rec.dynamic.get("home/temp").unwrap().count, 5, "flush_due_dynamic fired before the deadline");
+
+        // Past DYN_BATCH_MS: flush_due_dynamic must drain the buffer.
+        std::thread::sleep(Duration::from_millis(DYN_BATCH_MS + 100));
+        rec.flush_due_dynamic().unwrap();
+        assert_eq!(rec.dynamic.get("home/temp").unwrap().count, 0, "flush_due_dynamic did not fire once the deadline passed");
+
+        let path = cfg.part_path(0);
+        rec.finish().unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let messages: Vec<_> = mcap::MessageStream::new(&bytes).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(messages.len(), 1, "the deadline-triggered flush should have produced exactly one message");
+    }
+
+    #[test]
+    fn finish_flushes_partial_dynamic_buffer() {
+        use crate::record::mqtt_schema::DynamicProtoRegistry;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = RecorderCfg {
+            output_dir: dir.path().to_path_buf(),
+            session_secs: 54321,
+            schema_bytes: b"".to_vec(),
+            zmq_topics: vec![],
+            max_bytes: None,
+        };
+        let mut rec = McapRecorder::open(&cfg, 0).unwrap();
+
+        let mut proto = DynamicProtoRegistry::new();
+        // Far fewer than DYN_BATCH_SAMPLES; only `finish` flushes this partial buffer.
+        for i in 1..=7i64 {
+            let (schema, data) = proto
+                .record_numeric(
+                    "home/temp",
+                    i,
+                    crate::types::SampleType::Float,
+                    crate::types::NumericVal::Float(i as f64),
+                )
+                .unwrap();
+            rec.write_dynamic("home/temp", &schema, &data, i).unwrap();
+        }
+        let path = cfg.part_path(0);
+        rec.finish().unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let messages: Vec<_> = mcap::MessageStream::new(&bytes)
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(messages.len(), 1, "the partial buffer must be flushed by finish");
+        assert_eq!(messages[0].log_time, 7u64, "flushed message's log_time must be the last buffered sample's ts");
     }
 }
