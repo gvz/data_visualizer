@@ -193,7 +193,7 @@ type = "float"
         match rx.try_recv().unwrap() {
             RecordMsg::DynamicProto { schema, data, .. } => {
                 let pool = prost_reflect::DescriptorPool::decode(schema.as_ref()).unwrap();
-                let desc = pool.get_message_by_name("mqtt.AB").unwrap();
+                let desc = pool.get_message_by_name("mqtt.AB.Sample").unwrap();
                 let msg = prost_reflect::DynamicMessage::decode(desc, data.as_ref()).unwrap();
                 assert_eq!(msg.get_field_by_name("value").unwrap().as_i64(), Some(5));
             }

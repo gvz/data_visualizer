@@ -455,7 +455,7 @@ mod tests {
             assert_eq!(topic.as_ref(), "calc.out");
             assert_eq!(*ts, want_ts);
             let pool = prost_reflect::DescriptorPool::decode(schema.as_ref()).unwrap();
-            let desc = pool.get_message_by_name("mqtt.CalcOut").unwrap();
+            let desc = pool.get_message_by_name("mqtt.CalcOut.Sample").unwrap();
             let msg = prost_reflect::DynamicMessage::decode(desc, data.as_ref()).unwrap();
             assert_eq!(msg.get_field_by_name("t_ns").unwrap().as_i64(), Some(want_ts));
             assert_eq!(msg.get_field_by_name("value").unwrap().as_f64(), Some(want_val));
