@@ -132,6 +132,10 @@ pub(crate) fn plan_file(
             topic.clone(),
             vec![ChannelBinding {
                 id,
+                fast: crate::ingest::decode::FastPlan::build(
+                    &desc, &["value".to_string()], &["t_ns".to_string()],
+                    sample_type, 1.0, 0.0, id,
+                ),
                 msg_desc: desc,
                 val_path: vec!["value".to_string()],
                 ts_path: vec!["t_ns".to_string()],

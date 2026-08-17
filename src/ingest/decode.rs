@@ -23,9 +23,9 @@ pub(crate) fn read_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum ValKind { F64, F32, I64, I32, U64, U32, Bool, Str }
+pub enum ValKind { F64, F32, I64, I32, U64, U32, Bool, Str }
 
-pub(crate) struct FastPlan {
+pub struct FastPlan {
     pub repeated_field: Option<u32>,
     pub ts_field: u32,
     pub val_field: u32,
@@ -51,7 +51,7 @@ fn kind_to_valkind(kind: &Kind) -> Option<ValKind> {
 }
 
 impl FastPlan {
-    pub(crate) fn build(
+    pub fn build(
         msg_desc: &MessageDescriptor,
         val_path: &[String],
         ts_path: &[String],
@@ -97,21 +97,161 @@ impl FastPlan {
     }
 }
 
+/// Wire types.
+const WT_VARINT: u8 = 0;
+const WT_I64: u8 = 1;
+const WT_LEN: u8 = 2;
+const WT_I32: u8 = 5;
+
+/// Skip one field's payload given its wire type. Returns false on truncation.
+fn skip_field(buf: &[u8], pos: &mut usize, wire: u8) -> bool {
+    match wire {
+        WT_VARINT => read_varint(buf, pos).is_some(),
+        WT_I64 => { *pos += 8; *pos <= buf.len() }
+        WT_I32 => { *pos += 4; *pos <= buf.len() }
+        WT_LEN => {
+            let Some(len) = read_varint(buf, pos) else { return false };
+            *pos += len as usize;
+            *pos <= buf.len()
+        }
+        _ => false,
+    }
+}
+
+/// Read a fixed 8-byte little-endian at pos, advancing. None on truncation.
+fn read_f64(buf: &[u8], pos: &mut usize) -> Option<f64> {
+    let end = pos.checked_add(8)?;
+    let slice = buf.get(*pos..end)?;
+    *pos = end;
+    Some(f64::from_le_bytes(slice.try_into().ok()?))
+}
+fn read_f32(buf: &[u8], pos: &mut usize) -> Option<f32> {
+    let end = pos.checked_add(4)?;
+    let slice = buf.get(*pos..end)?;
+    *pos = end;
+    Some(f32::from_le_bytes(slice.try_into().ok()?))
+}
+
+/// Scan one message (flat, or one repeated element) for the plan's ts + value
+/// fields, returning `(ts_opt, raw_or_text)`. `text` is Some only for Str kind.
+fn scan_one(buf: &[u8], plan: &FastPlan) -> Option<(Option<i64>, Option<f64>, Option<String>)> {
+    let mut pos = 0;
+    let mut ts: Option<i64> = None;
+    let mut raw: Option<f64> = None;
+    let mut text: Option<String> = None;
+    while pos < buf.len() {
+        let key = read_varint(buf, &mut pos)?;
+        let field = (key >> 3) as u32;
+        let wire = (key & 0x7) as u8;
+        if field == plan.ts_field && wire == WT_VARINT {
+            ts = Some(read_varint(buf, &mut pos)? as i64);
+        } else if field == plan.val_field {
+            match plan.val_kind {
+                ValKind::F64 if wire == WT_I64 => raw = Some(read_f64(buf, &mut pos)?),
+                ValKind::F32 if wire == WT_I32 => raw = Some(read_f32(buf, &mut pos)? as f64),
+                // Match reflection's `*v as f64` per kind exactly (sign matters
+                // for large u64 and for negative i32/i64).
+                ValKind::I64 if wire == WT_VARINT =>
+                    raw = Some(read_varint(buf, &mut pos)? as i64 as f64),
+                ValKind::U64 if wire == WT_VARINT =>
+                    raw = Some(read_varint(buf, &mut pos)? as f64),
+                ValKind::I32 if wire == WT_VARINT =>
+                    raw = Some(read_varint(buf, &mut pos)? as u32 as i32 as f64),
+                ValKind::U32 if wire == WT_VARINT =>
+                    raw = Some(read_varint(buf, &mut pos)? as u32 as f64),
+                ValKind::Bool if wire == WT_VARINT =>
+                    raw = Some(if read_varint(buf, &mut pos)? != 0 { 1.0 } else { 0.0 }),
+                ValKind::Str if wire == WT_LEN => {
+                    let len = read_varint(buf, &mut pos)? as usize;
+                    let end = pos.checked_add(len)?;
+                    let s = buf.get(pos..end)?;
+                    pos = end;
+                    text = Some(std::str::from_utf8(s).ok()?.to_string());
+                }
+                _ => { if !skip_field(buf, &mut pos, wire) { return None; } }
+            }
+        } else if !skip_field(buf, &mut pos, wire) {
+            return None;
+        }
+    }
+    Some((ts, raw, text))
+}
+
+fn emit(plan: &FastPlan, ts_opt: Option<i64>, raw: Option<f64>, text: Option<String>, store: &dyn ChannelStore) -> bool {
+    // resolve_ts already maps non-positive/None → now_ns().
+    let ts = resolve_ts(ts_opt);
+    match plan.sample_type {
+        SampleType::Text => match text {
+            Some(s) => { store.write_text(plan.id, ts, s); true }
+            None => false,
+        },
+        st => match raw {
+            Some(r) => {
+                let scaled = r * plan.eu_scale + plan.eu_offset;
+                let nv = match st {
+                    SampleType::Float => NumericVal::Float(scaled),
+                    SampleType::Int => NumericVal::Int(scaled as i64),
+                    SampleType::Bool => NumericVal::Bool(r != 0.0),
+                    SampleType::Text => return false,
+                };
+                store.write_numeric(plan.id, ts, nv);
+                true
+            }
+            None => false,
+        },
+    }
+}
+
+fn decode_fast(data: &[u8], plan: &FastPlan, store: &dyn ChannelStore) -> usize {
+    match plan.repeated_field {
+        None => {
+            match scan_one(data, plan) {
+                Some((ts, raw, text)) => usize::from(emit(plan, ts, raw, text, store)),
+                None => 0,
+            }
+        }
+        Some(rep) => {
+            let mut pos = 0;
+            let mut count = 0;
+            while pos < data.len() {
+                let Some(key) = read_varint(data, &mut pos) else { break };
+                let field = (key >> 3) as u32;
+                let wire = (key & 0x7) as u8;
+                if field == rep && wire == WT_LEN {
+                    let Some(len) = read_varint(data, &mut pos) else { break };
+                    let end = match pos.checked_add(len as usize) { Some(e) => e, None => break };
+                    let Some(elem) = data.get(pos..end) else { break };
+                    pos = end;
+                    if let Some((ts, raw, text)) = scan_one(elem, plan) {
+                        if emit(plan, ts, raw, text, store) { count += 1; }
+                    }
+                } else if !skip_field(data, &mut pos, wire) {
+                    break;
+                }
+            }
+            count
+        }
+    }
+}
+
 pub fn decode_batch(data: &[u8], bindings: &[ChannelBinding], store: &dyn ChannelStore) -> usize {
     if bindings.is_empty() {
         return 0;
     }
-    let msg_desc = &bindings[0].msg_desc;
-    let msg = match DynamicMessage::decode(msg_desc.clone(), data) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("ingest: proto decode error: {e}");
-            return 0;
-        }
-    };
     let mut total = 0;
+    let mut reflected: Option<DynamicMessage> = None;
     for binding in bindings {
-        total += decode_channel(&msg, binding, store);
+        if let Some(plan) = &binding.fast {
+            total += decode_fast(data, plan, store);
+        } else {
+            if reflected.is_none() {
+                match DynamicMessage::decode(bindings[0].msg_desc.clone(), data) {
+                    Ok(m) => reflected = Some(m),
+                    Err(e) => { eprintln!("ingest: proto decode error: {e}"); return total; }
+                }
+            }
+            total += decode_channel(reflected.as_ref().unwrap(), binding, store);
+        }
     }
     total
 }
@@ -415,5 +555,40 @@ eu_offset = 1.0
             &b.msg_desc, &deep, &deep, b.sample_type, 1.0, 0.0, b.id,
         )
         .is_none());
+    }
+
+    #[test]
+    fn fast_path_matches_reflection_batch_float() {
+        let (schema, _dir, registry) = make_schema_and_registry(); // eu_scale 2.0, eu_offset 1.0
+        let router = TopicRouter::build(&registry, &schema);
+        let bindings = router.bindings_for("accel");
+        assert!(bindings[0].fast.is_some(), "AccelBatch must take the fast path");
+        // t_ns = 0 exercises resolve_ts→now; use positive stamps for determinism.
+        let data = encode_accel_batch(&schema, &[(1_000_000_000, 2.0), (2_000_000_000, 3.5)]);
+
+        let store = LiveStore::from_registry(&registry);
+        let n = decode_batch(&data, bindings, &store);
+        assert_eq!(n, 2);
+        let ch = registry.id("accel.x").unwrap();
+        match store.snapshot(ch, ALL) {
+            ChannelSnapshot::Float { ts, vals } => {
+                assert_eq!(ts, vec![1_000_000_000, 2_000_000_000]);
+                // EU: raw*2+1 → 5.0, 8.0
+                assert!((vals[0] - 5.0).abs() < 1e-6 && (vals[1] - 8.0).abs() < 1e-6);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fast_path_truncated_bytes_no_panic() {
+        let (schema, _dir, registry) = make_schema_and_registry();
+        let router = TopicRouter::build(&registry, &schema);
+        let bindings = router.bindings_for("accel");
+        let mut data = encode_accel_batch(&schema, &[(1_000_000_000, 2.0)]);
+        data.truncate(data.len() - 1); // chop the last byte
+        let store = LiveStore::from_registry(&registry);
+        // Must not panic; may write 0 or a partial-but-bounded result.
+        let _ = decode_batch(&data, bindings, &store);
     }
 }

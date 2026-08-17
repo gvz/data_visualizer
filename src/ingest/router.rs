@@ -8,6 +8,7 @@ use crate::types::{ChannelId, SampleType};
 
 pub struct ChannelBinding {
     pub id: ChannelId,
+    pub fast: Option<crate::ingest::decode::FastPlan>,
     pub msg_desc: MessageDescriptor,
     pub val_path: Vec<String>,
     pub ts_path: Vec<String>,
@@ -39,14 +40,19 @@ impl TopicRouter {
             };
             match schema.resolve(proto_path, ts_path) {
                 Ok(desc) => {
+                    let sample_type = meta.sample_type;
                     let binding = ChannelBinding {
                         id,
+                        fast: crate::ingest::decode::FastPlan::build(
+                            &desc.msg_desc, &desc.val_path, &desc.ts_path,
+                            sample_type, cfg.eu_scale, cfg.eu_offset, id,
+                        ),
                         msg_desc: desc.msg_desc,
                         val_path: desc.val_path,
                         ts_path: desc.ts_path,
                         eu_scale: cfg.eu_scale,
                         eu_offset: cfg.eu_offset,
-                        sample_type: meta.sample_type,
+                        sample_type,
                     };
                     map.entry(topic.clone()).or_default().push(binding);
                 }
