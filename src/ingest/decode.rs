@@ -36,18 +36,28 @@ pub struct FastPlan {
     pub id: ChannelId,
 }
 
+// Only claim kinds `scan_one` decodes bit-for-bit correctly. Sint32/Sint64 are
+// zigzag-encoded (plain varint read would be wrong) and Sfixed32/Sfixed64/
+// Fixed32/Fixed64 arrive as wire type 1/5, not the varint this scanner reads
+// for integer kinds — both must fall back to the (correct) reflection path.
 fn kind_to_valkind(kind: &Kind) -> Option<ValKind> {
     Some(match kind {
         Kind::Double => ValKind::F64,
         Kind::Float => ValKind::F32,
-        Kind::Int64 | Kind::Sint64 | Kind::Sfixed64 => ValKind::I64,
-        Kind::Int32 | Kind::Sint32 | Kind::Sfixed32 => ValKind::I32,
-        Kind::Uint64 | Kind::Fixed64 => ValKind::U64,
-        Kind::Uint32 | Kind::Fixed32 => ValKind::U32,
+        Kind::Int64 => ValKind::I64,
+        Kind::Int32 => ValKind::I32,
+        Kind::Uint64 => ValKind::U64,
+        Kind::Uint32 => ValKind::U32,
         Kind::Bool => ValKind::Bool,
         Kind::String => ValKind::Str,
         _ => return None,
     })
+}
+
+/// True for the plain-varint integer kinds `scan_one`/`extract_ts` read
+/// correctly as a timestamp. Fixed/zigzag kinds must fall back to reflection.
+fn is_ts_kind(kind: &Kind) -> bool {
+    matches!(kind, Kind::Int64 | Kind::Int32 | Kind::Uint64 | Kind::Uint32)
 }
 
 impl FastPlan {
@@ -66,6 +76,9 @@ impl FastPlan {
             (1, 1) => {
                 let val_f = msg_desc.get_field_by_name(&val_path[0])?;
                 let ts_f = msg_desc.get_field_by_name(&ts_path[0])?;
+                if !is_ts_kind(&ts_f.kind()) {
+                    return None;
+                }
                 Some(FastPlan {
                     repeated_field: None,
                     ts_field: ts_f.number(),
@@ -84,6 +97,9 @@ impl FastPlan {
                 // ts leaf: batch ts_path is [repeated, ts_leaf] or [ts_leaf].
                 let ts_leaf = ts_path.get(1).or_else(|| ts_path.first())?;
                 let ts_f = sub.get_field_by_name(ts_leaf)?;
+                if !is_ts_kind(&ts_f.kind()) {
+                    return None;
+                }
                 Some(FastPlan {
                     repeated_field: Some(rep.number()),
                     ts_field: ts_f.number(),
@@ -111,8 +127,10 @@ fn skip_field(buf: &[u8], pos: &mut usize, wire: u8) -> bool {
         WT_I32 => { *pos += 4; *pos <= buf.len() }
         WT_LEN => {
             let Some(len) = read_varint(buf, pos) else { return false };
-            *pos += len as usize;
-            *pos <= buf.len()
+            match pos.checked_add(len as usize) {
+                Some(p) => { *pos = p; *pos <= buf.len() }
+                None => false,
+            }
         }
         _ => false,
     }
@@ -590,5 +608,195 @@ eu_offset = 1.0
         let store = LiveStore::from_registry(&registry);
         // Must not panic; may write 0 or a partial-but-bounded result.
         let _ = decode_batch(&data, bindings, &store);
+    }
+
+    /// Append a base-128 varint encoding of `v` to `buf`.
+    fn push_varint(buf: &mut Vec<u8>, mut v: u64) {
+        loop {
+            let byte = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                buf.push(byte);
+                break;
+            }
+            buf.push(byte | 0x80);
+        }
+    }
+
+    #[test]
+    fn fast_path_huge_unknown_field_length_no_panic() {
+        // Finding 1: an unknown trailing field (wire type LEN) whose length
+        // varint encodes u64::MAX must not overflow `usize` in `skip_field`.
+        let (schema, _dir, registry) = make_schema_and_registry();
+        let router = TopicRouter::build(&registry, &schema);
+        let bindings = router.bindings_for("accel");
+        assert!(bindings[0].fast.is_some(), "AccelBatch must take the fast path");
+
+        // One Sample: valid t_ns (field 1, varint) + x (field 2, fixed32),
+        // followed by an unknown field 99 (wire type LEN) with a huge length.
+        let mut sample = Vec::new();
+        sample.push(0x08); // (1 << 3) | WT_VARINT
+        push_varint(&mut sample, 1_000_000_000u64);
+        sample.push(0x15); // (2 << 3) | WT_I32
+        sample.extend_from_slice(&2.0f32.to_le_bytes());
+        let unknown_tag: u64 = (99 << 3) | 2; // field 99, WT_LEN
+        push_varint(&mut sample, unknown_tag);
+        push_varint(&mut sample, u64::MAX); // huge length, no payload follows
+
+        // Wrap as the `samples` repeated field (field 1, WT_LEN) of AccelBatch.
+        let mut data = Vec::new();
+        data.push(0x0A); // (1 << 3) | WT_LEN
+        push_varint(&mut data, sample.len() as u64);
+        data.extend_from_slice(&sample);
+
+        let store = LiveStore::from_registry(&registry);
+        // Must not panic. The corrupt trailing field aborts this sample, so
+        // nothing gets written — but crucially, no overflow panic.
+        let n = decode_batch(&data, bindings, &store);
+        assert_eq!(n, 0);
+    }
+
+    fn make_sfixed_schema_and_registry() -> (ProtoSchema, tempfile::TempDir, ChannelRegistry) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_sfixed.proto");
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(f, r#"
+syntax = "proto3";
+message SFixedBatch {{
+  repeated Sample samples = 1;
+  message Sample {{
+    int64 t_ns = 1;
+    sfixed64 z = 2;
+  }}
+}}
+"#).unwrap();
+        let schema = ProtoSchema::from_path(&path).unwrap();
+        let registry = ChannelRegistry::from_toml_str(r#"
+[channels."accel.z"]
+topic = "accelz"
+proto_path = "SFixedBatch.samples.z"
+ts_path = "SFixedBatch.samples.t_ns"
+type = "int"
+"#).unwrap();
+        (schema, dir, registry)
+    }
+
+    fn encode_sfixed_batch(schema: &ProtoSchema, samples: &[(i64, i64)]) -> Vec<u8> {
+        let pool = schema.pool_for_test();
+        let batch_desc = pool.get_message_by_name("SFixedBatch").unwrap();
+        let sample_desc = pool.get_message_by_name("SFixedBatch.Sample").unwrap();
+        let t_field = sample_desc.get_field_by_name("t_ns").unwrap();
+        let z_field = sample_desc.get_field_by_name("z").unwrap();
+        let samples_field = batch_desc.get_field_by_name("samples").unwrap();
+
+        let list: Vec<Value> = samples
+            .iter()
+            .map(|(t, z)| {
+                let mut s = DynamicMessage::new(sample_desc.clone());
+                s.set_field(&t_field, Value::I64(*t));
+                s.set_field(&z_field, Value::I64(*z));
+                Value::Message(s)
+            })
+            .collect();
+        let mut batch = DynamicMessage::new(batch_desc);
+        batch.set_field(&samples_field, Value::List(list));
+        batch.encode_to_vec()
+    }
+
+    #[test]
+    fn unsupported_val_kind_falls_back_to_reflection() {
+        // Finding 2: sfixed64 must not be claimed by the fast scanner (it
+        // arrives as wire type I64, not the varint the scanner reads for
+        // integer kinds) — it must route to reflection and decode correctly.
+        let (schema, _dir, registry) = make_sfixed_schema_and_registry();
+        let router = TopicRouter::build(&registry, &schema);
+        let bindings = router.bindings_for("accelz");
+        assert!(bindings[0].fast.is_none(), "sfixed64 value kind must not take the fast path");
+
+        let data = encode_sfixed_batch(&schema, &[(1_000_000_000, 42)]);
+        let store = LiveStore::from_registry(&registry);
+        let n = decode_batch(&data, bindings, &store);
+        assert_eq!(n, 1);
+
+        let ch = registry.id("accel.z").unwrap();
+        match store.snapshot(ch, ALL) {
+            ChannelSnapshot::Int { ts, vals } => {
+                assert_eq!(ts, vec![1_000_000_000]);
+                assert_eq!(vals, vec![42]);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    fn make_badts_schema_and_registry() -> (ProtoSchema, tempfile::TempDir, ChannelRegistry) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_badts.proto");
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(f, r#"
+syntax = "proto3";
+message BadTsBatch {{
+  repeated Sample samples = 1;
+  message Sample {{
+    sfixed64 t_ns = 1;
+    float x = 2;
+  }}
+}}
+"#).unwrap();
+        let schema = ProtoSchema::from_path(&path).unwrap();
+        let registry = ChannelRegistry::from_toml_str(r#"
+[channels."badts.x"]
+topic = "badts"
+proto_path = "BadTsBatch.samples.x"
+ts_path = "BadTsBatch.samples.t_ns"
+type = "float"
+"#).unwrap();
+        (schema, dir, registry)
+    }
+
+    fn encode_badts_batch(schema: &ProtoSchema, samples: &[(i64, f32)]) -> Vec<u8> {
+        let pool = schema.pool_for_test();
+        let batch_desc = pool.get_message_by_name("BadTsBatch").unwrap();
+        let sample_desc = pool.get_message_by_name("BadTsBatch.Sample").unwrap();
+        let t_field = sample_desc.get_field_by_name("t_ns").unwrap();
+        let x_field = sample_desc.get_field_by_name("x").unwrap();
+        let samples_field = batch_desc.get_field_by_name("samples").unwrap();
+
+        let list: Vec<Value> = samples
+            .iter()
+            .map(|(t, x)| {
+                let mut s = DynamicMessage::new(sample_desc.clone());
+                s.set_field(&t_field, Value::I64(*t));
+                s.set_field(&x_field, Value::F32(*x));
+                Value::Message(s)
+            })
+            .collect();
+        let mut batch = DynamicMessage::new(batch_desc);
+        batch.set_field(&samples_field, Value::List(list));
+        batch.encode_to_vec()
+    }
+
+    #[test]
+    fn unsupported_ts_kind_falls_back_to_reflection() {
+        // Finding 3: a ts field of a kind `scan_one`/`extract_ts` can't read
+        // as a plain varint int (sfixed64 here) must not take the fast path,
+        // even though the value field (float) is otherwise fully supported.
+        let (schema, _dir, registry) = make_badts_schema_and_registry();
+        let router = TopicRouter::build(&registry, &schema);
+        let bindings = router.bindings_for("badts");
+        assert!(bindings[0].fast.is_none(), "sfixed64 ts kind must not take the fast path");
+
+        let data = encode_badts_batch(&schema, &[(1_000_000_000, 7.5)]);
+        let store = LiveStore::from_registry(&registry);
+        let n = decode_batch(&data, bindings, &store);
+        assert_eq!(n, 1);
+
+        let ch = registry.id("badts.x").unwrap();
+        match store.snapshot(ch, ALL) {
+            ChannelSnapshot::Float { ts, vals } => {
+                assert_eq!(ts, vec![1_000_000_000]);
+                assert!((vals[0] - 7.5).abs() < 1e-6);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 }
