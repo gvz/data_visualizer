@@ -1,8 +1,101 @@
-use prost_reflect::{DynamicMessage, ReflectMessage, Value};
+use prost_reflect::{Cardinality, DynamicMessage, Kind, MessageDescriptor, ReflectMessage, Value};
 
 use crate::ingest::router::ChannelBinding;
 use crate::store::ChannelStore;
-use crate::types::{now_ns, NumericVal, SampleType};
+use crate::types::{now_ns, ChannelId, NumericVal, SampleType};
+
+/// Read a base-128 varint at `*pos`, advancing `pos`. None on truncation.
+pub(crate) fn read_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut result: u64 = 0;
+    let mut shift = 0;
+    loop {
+        let byte = *buf.get(*pos)?;
+        *pos += 1;
+        result |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Some(result);
+        }
+        shift += 7;
+        if shift >= 64 {
+            return None; // overlong varint
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ValKind { F64, F32, I64, I32, U64, U32, Bool, Str }
+
+pub(crate) struct FastPlan {
+    pub repeated_field: Option<u32>,
+    pub ts_field: u32,
+    pub val_field: u32,
+    pub val_kind: ValKind,
+    pub sample_type: SampleType,
+    pub eu_scale: f64,
+    pub eu_offset: f64,
+    pub id: ChannelId,
+}
+
+fn kind_to_valkind(kind: &Kind) -> Option<ValKind> {
+    Some(match kind {
+        Kind::Double => ValKind::F64,
+        Kind::Float => ValKind::F32,
+        Kind::Int64 | Kind::Sint64 | Kind::Sfixed64 => ValKind::I64,
+        Kind::Int32 | Kind::Sint32 | Kind::Sfixed32 => ValKind::I32,
+        Kind::Uint64 | Kind::Fixed64 => ValKind::U64,
+        Kind::Uint32 | Kind::Fixed32 => ValKind::U32,
+        Kind::Bool => ValKind::Bool,
+        Kind::String => ValKind::Str,
+        _ => return None,
+    })
+}
+
+impl FastPlan {
+    pub(crate) fn build(
+        msg_desc: &MessageDescriptor,
+        val_path: &[String],
+        ts_path: &[String],
+        sample_type: SampleType,
+        eu_scale: f64,
+        eu_offset: f64,
+        id: ChannelId,
+    ) -> Option<FastPlan> {
+        // Resolve the leaf value/ts field descriptors and, for the batch shape,
+        // the repeated container field number.
+        match (val_path.len(), ts_path.len()) {
+            (1, 1) => {
+                let val_f = msg_desc.get_field_by_name(&val_path[0])?;
+                let ts_f = msg_desc.get_field_by_name(&ts_path[0])?;
+                Some(FastPlan {
+                    repeated_field: None,
+                    ts_field: ts_f.number(),
+                    val_field: val_f.number(),
+                    val_kind: kind_to_valkind(&val_f.kind())?,
+                    sample_type, eu_scale, eu_offset, id,
+                })
+            }
+            (2, _) => {
+                let rep = msg_desc.get_field_by_name(&val_path[0])?;
+                if rep.cardinality() != Cardinality::Repeated {
+                    return None;
+                }
+                let Kind::Message(sub) = rep.kind() else { return None };
+                let val_f = sub.get_field_by_name(&val_path[1])?;
+                // ts leaf: batch ts_path is [repeated, ts_leaf] or [ts_leaf].
+                let ts_leaf = ts_path.get(1).or_else(|| ts_path.first())?;
+                let ts_f = sub.get_field_by_name(ts_leaf)?;
+                Some(FastPlan {
+                    repeated_field: Some(rep.number()),
+                    ts_field: ts_f.number(),
+                    val_field: val_f.number(),
+                    val_kind: kind_to_valkind(&val_f.kind())?,
+                    sample_type, eu_scale, eu_offset, id,
+                })
+            }
+            _ => None,
+        }
+    }
+}
 
 pub fn decode_batch(data: &[u8], bindings: &[ChannelBinding], store: &dyn ChannelStore) -> usize {
     if bindings.is_empty() {
@@ -289,5 +382,38 @@ eu_offset = 1.0
         // Empty batch: 0 samples.
         let data = encode_accel_batch(&schema, &[]);
         assert_eq!(decode_batch(&data, bindings, &store), 0);
+    }
+
+    #[test]
+    fn read_varint_reads_multibyte_and_advances() {
+        // 300 = 0xAC 0x02 in protobuf varint.
+        let buf = [0xACu8, 0x02, 0xFF];
+        let mut pos = 0;
+        assert_eq!(super::read_varint(&buf, &mut pos), Some(300));
+        assert_eq!(pos, 2);
+        // Truncated varint (continuation bit set, no next byte) → None.
+        let mut pos2 = 0;
+        assert_eq!(super::read_varint(&[0x80], &mut pos2), None);
+    }
+
+    #[test]
+    fn fast_plan_build_flat_and_unsupported() {
+        let (schema, _dir, registry) = make_schema_and_registry();
+        let router = TopicRouter::build(&registry, &schema);
+        let b = &router.bindings_for("accel")[0]; // val_path ["samples","x"], batch shape
+        let plan = super::FastPlan::build(
+            &b.msg_desc, &b.val_path, &b.ts_path, b.sample_type, b.eu_scale, b.eu_offset, b.id,
+        )
+        .expect("AccelBatch is a supported batch shape");
+        assert!(plan.repeated_field.is_some());
+        assert_eq!(plan.ts_field, 1); // t_ns = 1
+        assert_eq!(plan.val_field, 2); // x = 2 in the Sample message
+
+        // Unsupported: a 3-deep val_path returns None (fallback path).
+        let deep = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert!(super::FastPlan::build(
+            &b.msg_desc, &deep, &deep, b.sample_type, 1.0, 0.0, b.id,
+        )
+        .is_none());
     }
 }
