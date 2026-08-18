@@ -7,7 +7,7 @@ use memmap2::Mmap;
 use prost_reflect::{Cardinality, Kind, MessageDescriptor};
 
 use crate::config::ChannelRegistry;
-use crate::ingest::decode::decode_batch;
+use crate::ingest::decode::decode_batch_at;
 use crate::ingest::loader::ProtoSchema;
 use crate::ingest::router::{ChannelBinding, TopicRouter};
 use crate::store::ChannelStore;
@@ -124,7 +124,7 @@ pub(crate) fn decode_message(
     } else {
         zmq
     };
-    decode_batch(&msg.data, bindings, store);
+    decode_batch_at(&msg.data, bindings, store, msg.log_time as i64);
 }
 
 /// Learn one embedded schema per topic and build the routing bindings for a
@@ -193,6 +193,34 @@ pub(crate) fn plan_file(
         }) {
             (sub, vec![rep_name.clone(), "value".to_string()], vec![rep_name, "t_ns".to_string()])
         } else {
+            // Foreign structured message: not datavis's {t_ns, value} shape.
+            // Flatten every scalar leaf into its own channel, timestamped by the
+            // MCAP record log_time (these messages carry no embedded ts).
+            let mut bindings = Vec::new();
+            for (path, sample_type) in enumerate_leaves(&desc) {
+                let name = format!("{topic}/{}", path.join("/"));
+                let id = registry.add_dynamic(&name, topic, sample_type);
+                if registry.meta(id).sample_type != sample_type {
+                    eprintln!(
+                        "replay: channel {name:?} already registered as {:?}, but this file records it as {:?}; skipping",
+                        registry.meta(id).sample_type, sample_type
+                    );
+                    continue;
+                }
+                bindings.push(ChannelBinding {
+                    id,
+                    fast: None,
+                    msg_desc: desc.clone(),
+                    val_path: path,
+                    ts_path: Vec::new(),
+                    eu_scale: 1.0,
+                    eu_offset: 0.0,
+                    sample_type,
+                });
+            }
+            if !bindings.is_empty() {
+                reconstructed.insert(topic.clone(), bindings);
+            }
             continue;
         };
 
@@ -644,6 +672,99 @@ type = "float"
         match crate::store::ChannelStore::snapshot(store.as_ref(), id, w) {
             ChannelSnapshot::Float { ts, .. } => assert_eq!(ts, vec![100]),
             other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    fn write_foreign_mcap(path: &std::path::Path, msgs: &[(i64, i64, i64)]) {
+        use crate::ingest::loader::ProtoSchema;
+        use prost_reflect::prost::Message as _;
+        use prost_reflect::{DynamicMessage, Value};
+        use std::borrow::Cow;
+        use std::collections::BTreeMap;
+        use std::io::Write;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ppath = dir.path().join("foreign.proto");
+        let mut f = std::fs::File::create(&ppath).unwrap();
+        write!(f, r#"
+syntax = "proto3";
+message Health {{
+  int64 code = 1;
+  Inner cmd = 2;
+  repeated uint64 samples = 3;
+  message Inner {{
+    int64 depth_val = 1;
+  }}
+}}
+"#).unwrap();
+        let schema = ProtoSchema::from_path(&ppath).unwrap();
+        let pool = schema.pool_for_test();
+        let health = pool.get_message_by_name("Health").unwrap();
+        let inner = pool.get_message_by_name("Health.Inner").unwrap();
+
+        let mcap_schema = Arc::new(mcap::Schema {
+            name: "Health".to_string(),
+            encoding: "protobuf".to_string(),
+            data: Cow::Owned(schema.schema_bytes().to_vec()),
+        });
+        let channel = Arc::new(mcap::Channel {
+            topic: "S1/HEALTH".to_string(),
+            schema: Some(mcap_schema),
+            message_encoding: "protobuf".to_string(),
+            metadata: BTreeMap::new(),
+        });
+        let file = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+        let mut writer = mcap::Writer::new(file).unwrap();
+        for (log_time, code, depth_val) in msgs {
+            let mut im = DynamicMessage::new(inner.clone());
+            im.set_field(&inner.get_field_by_name("depth_val").unwrap(), Value::I64(*depth_val));
+            let mut hm = DynamicMessage::new(health.clone());
+            hm.set_field(&health.get_field_by_name("code").unwrap(), Value::I64(*code));
+            hm.set_field(&health.get_field_by_name("cmd").unwrap(), Value::Message(im));
+            let data = hm.encode_to_vec();
+            writer.write(&mcap::Message {
+                channel: channel.clone(),
+                sequence: 0,
+                log_time: *log_time as u64,
+                publish_time: *log_time as u64,
+                data: Cow::Owned(data),
+            }).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn foreign_topic_flattens_into_leaf_channels_stamped_by_log_time() {
+        let registry = ChannelRegistry::from_toml_str("").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("foreign.mcap");
+        write_foreign_mcap(&path, &[(1_000_000_000, 7, 11), (2_000_000_000, 8, 22)]);
+
+        let src = RecordingSource::open(&path, &registry).unwrap();
+
+        // Channels registered: two scalar leaves; the repeated `samples` skipped.
+        let code_id = registry.id("S1/HEALTH/code").expect("code leaf channel");
+        let depth_id = registry.id("S1/HEALTH/cmd/depth_val").expect("nested leaf channel");
+        assert!(registry.id("S1/HEALTH/samples").is_none(), "repeated field must not become a channel");
+
+        // Decode and check samples stamped by log_time.
+        let metas = metas_of(&registry);
+        let chunk = src.decode_chunk(0, &metas);
+        let all = TimeWindow { start_ns: i64::MIN, end_ns: i64::MAX };
+        match chunk.window(code_id.0 as usize, all) {
+            ChannelSnapshot::Int { ts, vals } => {
+                assert_eq!(ts, vec![1_000_000_000, 2_000_000_000]);
+                assert_eq!(vals, vec![7, 8]);
+            }
+            other => panic!("wrong variant for code: {other:?}"),
+        }
+        match chunk.window(depth_id.0 as usize, all) {
+            ChannelSnapshot::Int { ts, vals } => {
+                assert_eq!(ts, vec![1_000_000_000, 2_000_000_000]);
+                assert_eq!(vals, vec![11, 22]);
+            }
+            other => panic!("wrong variant for depth_val: {other:?}"),
         }
     }
 
