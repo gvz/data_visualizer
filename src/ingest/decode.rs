@@ -34,6 +34,13 @@ pub struct FastPlan {
     pub eu_scale: f64,
     pub eu_offset: f64,
     pub id: ChannelId,
+    /// Foreign-flatten mode: `Some(chain)` of singular-submessage field numbers
+    /// to descend before reading the scalar leaf `val_field`. An empty chain
+    /// means the leaf is top-level. In this mode there is no embedded timestamp
+    /// field — each sample is stamped with the caller's `log_time`, matching the
+    /// reflection path's `decode_deep_channel`. `None` for the embedded
+    /// single/batch shapes, which read `ts_field` instead.
+    pub flatten_path: Option<Vec<u32>>,
 }
 
 // Only claim kinds `scan_one` decodes bit-for-bit correctly. Sint32/Sint64 are
@@ -70,11 +77,12 @@ impl FastPlan {
         eu_offset: f64,
         id: ChannelId,
     ) -> Option<FastPlan> {
-        // Flatten bindings (empty ts_path) are reflection-only: their value comes from
-        // the MCAP log_time, not an embedded field, and their path may be arbitrary
-        // singular-message depth that the fast scanner does not walk.
+        // Flatten bindings (empty ts_path) take the value from the MCAP log_time,
+        // not an embedded field, and walk an arbitrary singular-message depth to
+        // the leaf. Build a flatten plan for the leaf kinds the scanner decodes
+        // bit-for-bit; unsupported kinds return None and fall back to reflection.
         if ts_path.is_empty() {
-            return None;
+            return Self::build_flatten(msg_desc, val_path, sample_type, eu_scale, eu_offset, id);
         }
         // Resolve the leaf value/ts field descriptors and, for the batch shape,
         // the repeated container field number.
@@ -91,6 +99,7 @@ impl FastPlan {
                     val_field: val_f.number(),
                     val_kind: kind_to_valkind(&val_f.kind())?,
                     sample_type, eu_scale, eu_offset, id,
+                    flatten_path: None,
                 })
             }
             (2, _) => {
@@ -112,10 +121,54 @@ impl FastPlan {
                     val_field: val_f.number(),
                     val_kind: kind_to_valkind(&val_f.kind())?,
                     sample_type, eu_scale, eu_offset, id,
+                    flatten_path: None,
                 })
             }
             _ => None,
         }
+    }
+
+    /// Build a flatten plan: resolve `val_path` (leaf names) to the chain of
+    /// singular-submessage field numbers plus the scalar leaf field. Returns
+    /// None — routing the channel to reflection — if any hop is missing,
+    /// repeated, or not a message, or the leaf kind is one the scanner does not
+    /// decode bit-for-bit (fixed/zigzag/enum/bytes). Mirrors the reflection
+    /// walk in `decode_deep_channel`.
+    fn build_flatten(
+        msg_desc: &MessageDescriptor,
+        val_path: &[String],
+        sample_type: SampleType,
+        eu_scale: f64,
+        eu_offset: f64,
+        id: ChannelId,
+    ) -> Option<FastPlan> {
+        let (leaf_name, parents) = val_path.split_last()?;
+        let mut chain = Vec::with_capacity(parents.len());
+        let mut cur = msg_desc.clone();
+        for name in parents {
+            let f = cur.get_field_by_name(name)?;
+            if f.cardinality() == Cardinality::Repeated {
+                return None;
+            }
+            let Kind::Message(sub) = f.kind() else { return None };
+            chain.push(f.number());
+            cur = sub;
+        }
+        let leaf = cur.get_field_by_name(leaf_name)?;
+        if leaf.cardinality() == Cardinality::Repeated {
+            return None;
+        }
+        Some(FastPlan {
+            repeated_field: None,
+            ts_field: 0,
+            val_field: leaf.number(),
+            val_kind: kind_to_valkind(&leaf.kind())?,
+            sample_type,
+            eu_scale,
+            eu_offset,
+            id,
+            flatten_path: Some(chain),
+        })
     }
 }
 
@@ -229,7 +282,107 @@ fn emit(plan: &FastPlan, ts_opt: Option<i64>, raw: Option<f64>, text: Option<Str
     }
 }
 
-fn decode_fast(data: &[u8], plan: &FastPlan, store: &dyn ChannelStore) -> usize {
+/// Find the payload of the last length-delimited field numbered `field` in
+/// `buf`. "Last wins" matches proto scalar merge semantics; foreign messages
+/// carry each submessage once, so this is unambiguous in practice. Returns the
+/// inner bytes, or None if the field is absent or the buffer is truncated.
+fn find_last_len_field(buf: &[u8], field: u32) -> Option<&[u8]> {
+    let mut pos = 0;
+    let mut found = None;
+    while pos < buf.len() {
+        let Some(key) = read_varint(buf, &mut pos) else { break };
+        let f = (key >> 3) as u32;
+        let wire = (key & 0x7) as u8;
+        if f == field && wire == WT_LEN {
+            let Some(len) = read_varint(buf, &mut pos) else { break };
+            let Some(end) = pos.checked_add(len as usize) else { break };
+            let Some(slice) = buf.get(pos..end) else { break };
+            pos = end;
+            found = Some(slice);
+        } else if !skip_field(buf, &mut pos, wire) {
+            break;
+        }
+    }
+    found
+}
+
+/// Read the scalar leaf `field` of kind `kind` from `buf` (last occurrence
+/// wins). Returns `(numeric, text)`; both None means the field was absent, so
+/// the caller emits the proto3 default — exactly as reflection does. Mirrors
+/// the value branch of `scan_one`.
+fn read_leaf(buf: &[u8], field: u32, kind: ValKind) -> (Option<f64>, Option<String>) {
+    let mut pos = 0;
+    let mut raw: Option<f64> = None;
+    let mut text: Option<String> = None;
+    while pos < buf.len() {
+        let Some(key) = read_varint(buf, &mut pos) else { break };
+        let f = (key >> 3) as u32;
+        let wire = (key & 0x7) as u8;
+        if f == field {
+            match kind {
+                ValKind::F64 if wire == WT_I64 => raw = read_f64(buf, &mut pos),
+                ValKind::F32 if wire == WT_I32 => raw = read_f32(buf, &mut pos).map(|v| v as f64),
+                ValKind::I64 if wire == WT_VARINT =>
+                    raw = read_varint(buf, &mut pos).map(|v| v as i64 as f64),
+                ValKind::U64 if wire == WT_VARINT =>
+                    raw = read_varint(buf, &mut pos).map(|v| v as f64),
+                ValKind::I32 if wire == WT_VARINT =>
+                    raw = read_varint(buf, &mut pos).map(|v| v as u32 as i32 as f64),
+                ValKind::U32 if wire == WT_VARINT =>
+                    raw = read_varint(buf, &mut pos).map(|v| v as u32 as f64),
+                ValKind::Bool if wire == WT_VARINT =>
+                    raw = read_varint(buf, &mut pos).map(|v| if v != 0 { 1.0 } else { 0.0 }),
+                ValKind::Str if wire == WT_LEN => {
+                    if let Some(len) = read_varint(buf, &mut pos) {
+                        if let Some(end) = pos.checked_add(len as usize) {
+                            if let Some(s) = buf.get(pos..end).and_then(|s| std::str::from_utf8(s).ok()) {
+                                text = Some(s.to_string());
+                            }
+                            pos = end.min(buf.len());
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                _ => if !skip_field(buf, &mut pos, wire) { break },
+            }
+        } else if !skip_field(buf, &mut pos, wire) {
+            break;
+        }
+    }
+    (raw, text)
+}
+
+/// Foreign-flatten decode: descend the singular-submessage chain, read the
+/// scalar leaf, and emit exactly one sample stamped with `log_time`. Always
+/// emits (proto3 default when a hop or the leaf is absent), matching
+/// `decode_deep_channel`.
+fn decode_flatten(
+    data: &[u8],
+    plan: &FastPlan,
+    chain: &[u32],
+    log_time: i64,
+    store: &dyn ChannelStore,
+) -> usize {
+    let mut buf = data;
+    for &field in chain {
+        match find_last_len_field(buf, field) {
+            Some(inner) => buf = inner,
+            // Intermediate absent → proto3 default (empty submessage) → default
+            // leaf value; reflection writes a default sample here, so we do too.
+            None => return usize::from(emit(plan, Some(log_time), None, None, store)),
+        }
+    }
+    let (raw, text) = read_leaf(buf, plan.val_field, plan.val_kind);
+    usize::from(emit(plan, Some(log_time), raw, text, store))
+}
+
+fn decode_fast(data: &[u8], plan: &FastPlan, log_time: i64, store: &dyn ChannelStore) -> usize {
+    if let Some(chain) = &plan.flatten_path {
+        return decode_flatten(data, plan, chain, log_time, store);
+    }
     match plan.repeated_field {
         None => {
             match scan_one(data, plan) {
@@ -280,7 +433,7 @@ pub fn decode_batch_at(
     let mut reflected: Option<DynamicMessage> = None;
     for binding in bindings {
         if let Some(plan) = &binding.fast {
-            total += decode_fast(data, plan, store);
+            total += decode_fast(data, plan, log_time, store);
         } else {
             if reflected.is_none() {
                 match DynamicMessage::decode(bindings[0].msg_desc.clone(), data) {
@@ -931,12 +1084,22 @@ message Health {{
     }
 
     #[test]
-    fn fast_plan_build_none_for_empty_ts_path() {
+    fn flatten_fast_plan_built_for_scalar_leaf_none_for_nonscalar() {
         let (schema, _d) = make_foreign_schema();
         let desc = schema.message_by_name("Health").unwrap();
+        // Scalar int64 leaf with empty ts_path → flatten fast plan.
+        let scalar = super::FastPlan::build(
+            &desc, &["code".to_string()], &[], SampleType::Int, 1.0, 0.0, ChannelId(0),
+        );
+        assert!(scalar.is_some(), "scalar leaf must build a flatten fast plan");
         assert!(
-            super::FastPlan::build(&desc, &["code".to_string()], &[], SampleType::Int, 1.0, 0.0, ChannelId(0)).is_none(),
-            "empty ts_path must never take the fast path"
+            scalar.as_ref().unwrap().flatten_path.is_some(),
+            "empty ts_path must produce a flatten (not embedded) plan"
+        );
+        // `cmd` is a submessage, not a scalar → no fast plan, falls back to reflection.
+        assert!(
+            super::FastPlan::build(&desc, &["cmd".to_string()], &[], SampleType::Int, 1.0, 0.0, ChannelId(0)).is_none(),
+            "a non-scalar (message) leaf must not take the fast path"
         );
     }
 
@@ -986,6 +1149,122 @@ message Health {{
         match store.snapshot(id, ALL) {
             ChannelSnapshot::Int { ts, vals } => { assert_eq!(ts, vec![42]); assert_eq!(vals, vec![0]); }
             other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// A foreign message with a leaf of every scanner-supported kind at depths
+    /// 1–3, so the flatten fast path exercises each `read_leaf` branch.
+    fn make_rich_schema() -> (ProtoSchema, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rich.proto");
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(f, r#"
+syntax = "proto3";
+message Rich {{
+  Inner inner = 1;
+  int64 top = 2;
+  message Inner {{
+    double d = 1;
+    float f = 2;
+    int32 i32 = 3;
+    uint32 u32 = 4;
+    bool b = 5;
+    string s = 6;
+    Deep deep = 7;
+    message Deep {{ int64 v = 1; }}
+  }}
+}}
+"#).unwrap();
+        (ProtoSchema::from_path(&path).unwrap(), dir)
+    }
+
+    fn encode_rich(schema: &ProtoSchema, with_inner: bool, top: i64) -> Vec<u8> {
+        let pool = schema.pool_for_test();
+        let rich = pool.get_message_by_name("Rich").unwrap();
+        let inner_d = pool.get_message_by_name("Rich.Inner").unwrap();
+        let deep_d = pool.get_message_by_name("Rich.Inner.Deep").unwrap();
+        let mut m = DynamicMessage::new(rich.clone());
+        m.set_field(&rich.get_field_by_name("top").unwrap(), Value::I64(top));
+        if with_inner {
+            let mut deep = DynamicMessage::new(deep_d.clone());
+            deep.set_field(&deep_d.get_field_by_name("v").unwrap(), Value::I64(-99));
+            let mut inner = DynamicMessage::new(inner_d.clone());
+            inner.set_field(&inner_d.get_field_by_name("d").unwrap(), Value::F64(3.5));
+            inner.set_field(&inner_d.get_field_by_name("f").unwrap(), Value::F32(-2.25));
+            inner.set_field(&inner_d.get_field_by_name("i32").unwrap(), Value::I32(-7));
+            inner.set_field(&inner_d.get_field_by_name("u32").unwrap(), Value::U32(4_000_000_000));
+            inner.set_field(&inner_d.get_field_by_name("b").unwrap(), Value::Bool(true));
+            inner.set_field(&inner_d.get_field_by_name("s").unwrap(), Value::String("hi".into()));
+            inner.set_field(&inner_d.get_field_by_name("deep").unwrap(), Value::Message(deep));
+            m.set_field(&rich.get_field_by_name("inner").unwrap(), Value::Message(inner));
+        }
+        m.encode_to_vec()
+    }
+
+    /// Decode `data` for one leaf both via the fast plan and via reflection
+    /// (fast disabled) and assert the resulting sample is identical. Also asserts
+    /// the fast plan was actually built (else the "fast" side is silently
+    /// reflection too, and the test proves nothing).
+    fn assert_flatten_fast_eq_reflection(
+        schema: &ProtoSchema,
+        msg_name: &str,
+        path: &[&str],
+        st: SampleType,
+        data: &[u8],
+        log_time: i64,
+    ) {
+        let desc = schema.message_by_name(msg_name).unwrap();
+        let registry = ChannelRegistry::from_toml_str("").unwrap();
+        let id = registry.add_dynamic(&path.join("/"), "t", st);
+        let vp: Vec<String> = path.iter().map(|s| s.to_string()).collect();
+        let fast = FastPlan::build(&desc, &vp, &[], st, 1.0, 0.0, id);
+        assert!(fast.is_some(), "fast plan must build for {path:?} ({st:?})");
+        let mk = |fast: Option<FastPlan>| ChannelBinding {
+            id, fast, msg_desc: desc.clone(), val_path: vp.clone(),
+            ts_path: Vec::new(), eu_scale: 1.0, eu_offset: 0.0, sample_type: st,
+        };
+        let (sf, sr) = (LiveStore::from_registry(&registry), LiveStore::from_registry(&registry));
+        let nf = super::decode_batch_at(data, std::slice::from_ref(&mk(fast)), &sf, log_time);
+        let nr = super::decode_batch_at(data, std::slice::from_ref(&mk(None)), &sr, log_time);
+        assert_eq!(nf, nr, "sample count differs for {path:?}");
+        assert_eq!(
+            format!("{:?}", sf.snapshot(id, ALL)),
+            format!("{:?}", sr.snapshot(id, ALL)),
+            "fast vs reflection mismatch for leaf {path:?}",
+        );
+    }
+
+    #[test]
+    fn flatten_fast_matches_reflection_every_kind_and_depth() {
+        let (schema, _d) = make_rich_schema();
+        let leaves: &[(&[&str], SampleType)] = &[
+            (&["inner", "d"], SampleType::Float),
+            (&["inner", "f"], SampleType::Float),
+            (&["inner", "i32"], SampleType::Int),
+            (&["inner", "u32"], SampleType::Int),
+            (&["inner", "b"], SampleType::Bool),
+            (&["inner", "s"], SampleType::Text),
+            (&["inner", "deep", "v"], SampleType::Int), // depth 3
+            (&["top"], SampleType::Int),                // depth 1
+        ];
+        // Full message, and a message with `inner` absent (proto3 defaults).
+        for with_inner in [true, false] {
+            let data = encode_rich(&schema, with_inner, 123_456);
+            for (path, st) in leaves {
+                assert_flatten_fast_eq_reflection(&schema, "Rich", path, *st, &data, 7_000_000_000);
+            }
+        }
+    }
+
+    #[test]
+    fn flatten_fast_matches_reflection_on_health_schema() {
+        // Reuse the existing foreign schema: depth-1 int64 and depth-2 int64,
+        // plus the missing-submessage default case.
+        let (schema, _d) = make_foreign_schema();
+        for (code, depth) in [(3i64, 5i64), (0, 0)] {
+            let data = encode_health(&schema, code, depth);
+            assert_flatten_fast_eq_reflection(&schema, "Health", &["code"], SampleType::Int, &data, 42);
+            assert_flatten_fast_eq_reflection(&schema, "Health", &["cmd", "depth_val"], SampleType::Int, &data, 42);
         }
     }
 }
