@@ -323,16 +323,25 @@ impl ChannelStore for PlaybackStore {
             let e = lines.partition_point(|(t, _)| *t < window.end_ns);
             return ChannelSnapshot::Text { lines: lines[s..e].to_vec() };
         }
-        // Numeric: gather overlapping chunks across sources, sorted by start time.
+        // Overview when the window truly overlaps too many chunks to decode
+        // exactly. This decision uses the UNPADDED overlap count: the batched-file
+        // start pad in `overlapping` only widens the detail decode set below, and
+        // must not inflate the count and force a finely-chunked unbatched file
+        // onto the decimated overview (a fidelity regression at some zooms).
+        let true_overlaps: usize =
+            self.sources.iter().map(|src| src.overlapping_true_count(window)).sum();
+        if true_overlaps > self.chunk_budget {
+            return self.snapshot_overview(ch, window);
+        }
+        // Detail: gather the padded overlapping chunks across sources, sorted by
+        // start time. The pad adds edge chunks so a batched file's coarsened
+        // chunk-start bound cannot hide in-window samples; per-sample clipping in
+        // `chunk.window` keeps the result exact.
         let mut overlaps: Vec<(i64, usize, usize)> = Vec::new(); // (start_ns, source, span_idx)
         for (si, src) in self.sources.iter().enumerate() {
             for span_idx in src.overlapping(window) {
                 overlaps.push((src.spans()[span_idx].start_ns, si, span_idx));
             }
-        }
-        // Overview when the window is too wide to decode exactly.
-        if overlaps.len() > self.chunk_budget {
-            return self.snapshot_overview(ch, window);
         }
         overlaps.sort_by_key(|(t, _, _)| *t);
         let mut acc = SnapshotAcc::new();
@@ -361,7 +370,11 @@ impl ChannelStore for PlaybackStore {
         let mut candidates: Vec<(usize, usize, i64)> = Vec::new(); // (source, span_idx, start_ns)
         for (si, src) in self.sources.iter().enumerate() {
             for (k, span) in src.spans().iter().enumerate() {
-                if span.start_ns <= end_ns {
+                // Pad the start bound: a batched file's chunk-index start can sit
+                // up to SPAN_PAD_NS after the chunk's true earliest sample, so a
+                // chunk holding a sample <= end_ns can have start_ns > end_ns.
+                // `last_le` re-checks actual samples, so extra candidates are safe.
+                if span.start_ns.saturating_sub(crate::record::lazy::source::SPAN_PAD_NS) <= end_ns {
                     candidates.push((si, k, span.start_ns));
                 }
             }
@@ -571,6 +584,36 @@ type = "float"
         match s {
             Sample::Float(v) => assert!((v - 3499.0).abs() < 1e-6),
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn narrow_window_on_finely_chunked_file_returns_exact_detail() {
+        // Regression: the SPAN_PAD in `overlapping` must not inflate the
+        // overview/budget decision. On a finely-chunked UNBATCHED file the pad
+        // pulls in every chunk (all starts sit within 500 ms of each other), so
+        // the padded overlap count blows past chunk_budget even for a tiny
+        // window. The budget decision must use the TRUE (unpadded) overlap
+        // count, so this narrow read still returns exact per-sample detail
+        // rather than the decimated envelope overview.
+        let (schema, _d, registry) = make_proto_and_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fine.mcap");
+        // 8000 samples 1 ns apart, tiny chunks → far more than chunk_budget
+        // chunks, all within an 8 us total span (<< 500 ms pad).
+        let msgs: Vec<(i64, f32)> = (0..8000).map(|i| (i as i64 + 1, i as f32)).collect();
+        write_test_mcap_chunked(&path, &schema, &msgs, 4096);
+        let caps = Caps { cache_bytes: 64 * 1024 * 1024, envelope_buckets: 64, chunk_budget: 16 };
+        let store = PlaybackStore::load_many_with(&[&path], &registry, caps).unwrap();
+        let id = registry.id("accel.x").unwrap();
+        // Window [1, 30) truly overlaps only the first chunk (well under budget),
+        // but the pad makes every chunk "overlap". Exact detail → ts 1..=29.
+        let snap = store.snapshot(id, TimeWindow { start_ns: 1, end_ns: 30 });
+        match snap {
+            ChannelSnapshot::Float { ts, .. } => {
+                assert_eq!(ts, (1..30).collect::<Vec<i64>>(), "must return exact samples, not overview");
+            }
+            other => panic!("wrong variant: {other:?}"),
         }
     }
 

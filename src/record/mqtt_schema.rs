@@ -331,7 +331,7 @@ mod tests {
 
     #[test]
     fn schema_is_batch_and_sample_bytes_roundtrip() {
-        use prost_reflect::{DescriptorPool, DynamicMessage, Value};
+        use prost_reflect::{DescriptorPool, DynamicMessage};
         let mut reg = DynamicProtoRegistry::new();
         let (schema, sample_bytes) = reg.record_frame("sensors/x", 111, "2.5").unwrap();
 
@@ -352,7 +352,6 @@ mod tests {
         let s = DynamicMessage::decode(sample_desc, sample_bytes.as_slice()).unwrap();
         assert_eq!(s.get_field_by_name("t_ns").unwrap().as_i64(), Some(111));
         assert_eq!(s.get_field_by_name("value").unwrap().as_f64(), Some(2.5));
-        let _ = Value::Bool(false);
     }
 
     #[test]

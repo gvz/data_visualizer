@@ -198,25 +198,28 @@ fn scan_one(buf: &[u8], plan: &FastPlan) -> Option<(Option<i64>, Option<f64>, Op
 fn emit(plan: &FastPlan, ts_opt: Option<i64>, raw: Option<f64>, text: Option<String>, store: &dyn ChannelStore) -> bool {
     // resolve_ts already maps non-positive/None → now_ns().
     let ts = resolve_ts(ts_opt);
+    // A proto3 scalar equal to its type default (0 / 0.0 / false / "") is omitted
+    // on the wire, so the scanner sees no value field. The reflection fallback
+    // returns the default and writes the sample, so we must too — dropping it
+    // here would silently lose every default-valued sample (a common case:
+    // a 0.0 reading, a `false` flag, a 0 counter), diverging from reflection.
     match plan.sample_type {
-        SampleType::Text => match text {
-            Some(s) => { store.write_text(plan.id, ts, s); true }
-            None => false,
-        },
-        st => match raw {
-            Some(r) => {
-                let scaled = r * plan.eu_scale + plan.eu_offset;
-                let nv = match st {
-                    SampleType::Float => NumericVal::Float(scaled),
-                    SampleType::Int => NumericVal::Int(scaled as i64),
-                    SampleType::Bool => NumericVal::Bool(r != 0.0),
-                    SampleType::Text => return false,
-                };
-                store.write_numeric(plan.id, ts, nv);
-                true
-            }
-            None => false,
-        },
+        SampleType::Text => {
+            store.write_text(plan.id, ts, text.unwrap_or_default());
+            true
+        }
+        st => {
+            let r = raw.unwrap_or(0.0);
+            let scaled = r * plan.eu_scale + plan.eu_offset;
+            let nv = match st {
+                SampleType::Float => NumericVal::Float(scaled),
+                SampleType::Int => NumericVal::Int(scaled as i64),
+                SampleType::Bool => NumericVal::Bool(r != 0.0),
+                SampleType::Text => return false,
+            };
+            store.write_numeric(plan.id, ts, nv);
+            true
+        }
     }
 }
 
@@ -701,6 +704,49 @@ type = "int"
         let mut batch = DynamicMessage::new(batch_desc);
         batch.set_field(&samples_field, Value::List(list));
         batch.encode_to_vec()
+    }
+
+    #[test]
+    fn fast_path_keeps_default_value_sample_like_reflection() {
+        // Parity regression: a proto3 value equal to its default (0.0 here) is
+        // omitted on the wire. The fast scanner must still emit the sample with
+        // the default value, exactly as the reflection fallback does — dropping
+        // it would silently lose every 0.0 / 0 / false / "" sample.
+        let (schema, _dir, registry) = make_schema_and_registry(); // eu_scale 2.0, offset 1.0
+        let router = TopicRouter::build(&registry, &schema);
+        let bindings = router.bindings_for("accel");
+        assert!(bindings[0].fast.is_some(), "AccelBatch must take the fast path");
+        let data = encode_accel_batch(&schema, &[(1_000_000_000, 0.0)]);
+
+        // Fast path.
+        let store_fast = LiveStore::from_registry(&registry);
+        assert_eq!(decode_batch(&data, bindings, &store_fast), 1, "fast path must keep the default-valued sample");
+
+        // Reflection path: identical binding with fast disabled.
+        let b = ChannelBinding {
+            id: bindings[0].id,
+            fast: None,
+            msg_desc: bindings[0].msg_desc.clone(),
+            val_path: bindings[0].val_path.clone(),
+            ts_path: bindings[0].ts_path.clone(),
+            eu_scale: bindings[0].eu_scale,
+            eu_offset: bindings[0].eu_offset,
+            sample_type: bindings[0].sample_type,
+        };
+        let store_refl = LiveStore::from_registry(&registry);
+        assert_eq!(decode_batch(&data, std::slice::from_ref(&b), &store_refl), 1);
+
+        // Both must have written the SAME value: 0.0 * 2.0 + 1.0 = 1.0.
+        let ch = registry.id("accel.x").unwrap();
+        for store in [&store_fast, &store_refl] {
+            match store.snapshot(ch, ALL) {
+                ChannelSnapshot::Float { ts, vals } => {
+                    assert_eq!(ts, vec![1_000_000_000]);
+                    assert!((vals[0] - 1.0).abs() < 1e-9, "expected EU-scaled default 1.0, got {}", vals[0]);
+                }
+                other => panic!("wrong variant: {other:?}"),
+            }
+        }
     }
 
     #[test]

@@ -21,7 +21,7 @@ use super::decode_buf::{ChunkDecodeBuf, DecodedChunk};
 /// in-window chunk is skipped; per-sample clipping inside the chunk still
 /// returns exact results. Kept at the max batch span (500 ms) so it does not
 /// over-select on files with tightly spaced chunks.
-const SPAN_PAD_NS: i64 = 500_000_000;
+pub(crate) const SPAN_PAD_NS: i64 = 500_000_000;
 
 /// The fully-qualified name of the single message defined by an embedded schema,
 /// e.g. "mqtt.HomeSensorsTemperature". None if the set defines no message.
@@ -270,6 +270,18 @@ impl RecordingSource {
             })
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// Count of spans that *truly* intersect the window, using the exact index
+    /// bounds with no start pad. This drives the overview-vs-detail budget
+    /// decision: the [`SPAN_PAD_NS`] slop in [`overlapping`] must only widen the
+    /// detail decode set for batched files, never inflate the overlap count and
+    /// push a finely-chunked unbatched file onto the decimated overview path.
+    pub fn overlapping_true_count(&self, window: TimeWindow) -> usize {
+        self.spans
+            .iter()
+            .filter(|s| s.start_ns < window.end_ns && s.end_ns >= window.start_ns)
+            .count()
     }
 
     pub(crate) fn decode_into(&self, span: &ChunkSpan, sink: &dyn ChannelStore) -> anyhow::Result<()> {
