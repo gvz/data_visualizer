@@ -15,6 +15,28 @@ const ENVELOPE_BUCKETS: usize = 16384;
 const CACHE_BYTES: usize = 512 * 1024 * 1024;
 const CHUNK_BUDGET: usize = 16;
 
+/// Ceiling on the envelope grid (`nchannels × buckets`) so foreign recordings
+/// that flatten into thousands of channels don't allocate a dense grid that
+/// OOMs. At 40 B/cell this caps one envelope near 320 MiB; the load pass builds
+/// one per worker thread + one main, so the real peak is that times threads+1.
+/// Below this ceiling the requested bucket count is used unchanged (small
+/// recordings keep full 16384-bucket overview resolution).
+const ENVELOPE_CELL_BUDGET: usize = 8 * 1024 * 1024;
+/// Floor on buckets so even a pathological channel count keeps a usable
+/// overview rather than collapsing to a handful of buckets.
+const ENVELOPE_MIN_BUCKETS: usize = 512;
+
+/// Effective bucket count: the requested value, reduced so the dense
+/// `nchannels × buckets` grid stays within [`ENVELOPE_CELL_BUDGET`], but never
+/// below [`ENVELOPE_MIN_BUCKETS`].
+fn effective_buckets(requested: usize, nchannels: usize) -> usize {
+    if nchannels == 0 {
+        return requested.max(1);
+    }
+    let cap = (ENVELOPE_CELL_BUDGET / nchannels).max(ENVELOPE_MIN_BUCKETS);
+    requested.min(cap).max(1)
+}
+
 /// Tunable memory knobs. `Default` uses the module constants; tests override
 /// them to force eviction on small inputs.
 pub(crate) struct Caps {
@@ -216,6 +238,9 @@ impl PlaybackStore {
         // split all (source, chunk) jobs across worker threads; each folds into
         // a thread-local envelope + text, then we merge.
         let nchannels = metas.len();
+        // Bound the dense grid: foreign recordings flatten into thousands of
+        // channels; a full-resolution grid per worker thread would OOM.
+        let envelope_buckets = effective_buckets(envelope_buckets, nchannels);
         let mut envelope = Envelope::new(nchannels, start_ns, duration_ns, envelope_buckets);
         let mut text: Vec<Option<Vec<(i64, String)>>> = metas
             .iter()
@@ -346,9 +371,12 @@ impl ChannelStore for PlaybackStore {
         overlaps.sort_by_key(|(t, _, _)| *t);
         let mut acc = SnapshotAcc::new();
         for (_, si, span_idx) in overlaps {
-            let chunk = self
-                .cache
-                .get_or_insert_with((si, span_idx), || self.sources[si].decode_chunk(span_idx, &self.metas));
+            // Decode only the topic that owns `ch`; sources that don't record it
+            // contribute nothing.
+            let Some(topic_key) = self.sources[si].topic_key_of(ch) else { continue };
+            let chunk = self.cache.get_or_insert_with((si, span_idx, topic_key), || {
+                self.sources[si].decode_chunk_topic(span_idx, topic_key, &self.metas)
+            });
             acc.extend(chunk.window(ch, window));
         }
         acc.into_snapshot(self.metas.get(ch).map(|m| m.sample_type).unwrap_or(SampleType::Float))
@@ -381,9 +409,10 @@ impl ChannelStore for PlaybackStore {
         }
         candidates.sort_by_key(|(_, _, s)| *s);
         for (si, k, _) in candidates.into_iter().rev() {
-            let chunk = self
-                .cache
-                .get_or_insert_with((si, k), || self.sources[si].decode_chunk(k, &self.metas));
+            let Some(topic_key) = self.sources[si].topic_key_of(ch) else { continue };
+            let chunk = self.cache.get_or_insert_with((si, k, topic_key), || {
+                self.sources[si].decode_chunk_topic(k, topic_key, &self.metas)
+            });
             if let Some(hit) = chunk.last_le(ch, end_ns) {
                 return Some(hit);
             }
@@ -412,6 +441,21 @@ mod tests {
     use crate::types::{ChannelSnapshot, TimeWindow};
     use std::io::Write;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn effective_buckets_bounds_dense_grid() {
+        // Few channels: full requested resolution, grid well under budget.
+        assert_eq!(effective_buckets(ENVELOPE_BUCKETS, 30), ENVELOPE_BUCKETS);
+        // Many channels: buckets scaled down so nchannels*buckets <= budget.
+        let b = effective_buckets(ENVELOPE_BUCKETS, 11467);
+        assert!(b < ENVELOPE_BUCKETS, "should reduce from {ENVELOPE_BUCKETS}, got {b}");
+        assert!(11467 * b <= ENVELOPE_CELL_BUDGET, "grid {} over budget", 11467 * b);
+        assert!(b >= ENVELOPE_MIN_BUCKETS);
+        // Pathological channel count: never collapses below the floor.
+        assert_eq!(effective_buckets(ENVELOPE_BUCKETS, usize::MAX), ENVELOPE_MIN_BUCKETS);
+        // Zero channels: requested value, never zero.
+        assert_eq!(effective_buckets(ENVELOPE_BUCKETS, 0), ENVELOPE_BUCKETS);
+    }
 
     fn make_proto_and_registry() -> (ProtoSchema, tempfile::TempDir, ChannelRegistry) {
         let dir = tempfile::tempdir().unwrap();

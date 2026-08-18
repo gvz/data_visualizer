@@ -9,13 +9,19 @@ struct Entry {
     last_used: u64,
 }
 
+/// Cache key: `(source, chunk, topic_key)`. The detail path decodes one topic
+/// at a time (see `RecordingSource::decode_chunk_topic`), so a chunk yields one
+/// cache entry per distinct topic actually read — not one fat entry holding
+/// every topic. Channels of the same topic share an entry.
+type Key = (usize, usize, u32);
+
 struct Inner {
-    map: HashMap<(usize, usize), Entry>,
+    map: HashMap<Key, Entry>,
     tick: u64,
     retained: usize,
 }
 
-/// Byte-budgeted LRU of decoded chunks keyed by `(source, chunk)`. Bounds
+/// Byte-budgeted LRU of decoded chunks keyed by `(source, chunk, topic)`. Bounds
 /// worst-case resident RAM independent of file size: once the retained byte
 /// total exceeds `cap_bytes`, least-recently-used entries are evicted (never
 /// the entry just inserted).
@@ -38,7 +44,7 @@ impl ChunkCache {
 
     pub fn get_or_insert_with(
         &self,
-        key: (usize, usize),
+        key: Key,
         make: impl FnOnce() -> DecodedChunk,
     ) -> Arc<DecodedChunk> {
         let mut inner = self.inner.lock().unwrap();
@@ -104,11 +110,11 @@ type = "float"
     fn caches_and_reuses() {
         let cache = ChunkCache::new(10 * 1024 * 1024);
         let mut built = 0;
-        let a = cache.get_or_insert_with((0, 0), || {
+        let a = cache.get_or_insert_with((0, 0, 0), || {
             built += 1;
             chunk(100)
         });
-        let b = cache.get_or_insert_with((0, 0), || {
+        let b = cache.get_or_insert_with((0, 0, 0), || {
             built += 1;
             chunk(100)
         });
@@ -121,9 +127,9 @@ type = "float"
         // Cap holds ~one 1000-sample chunk (16KB). Insert three distinct chunks.
         let cap = chunk(1000).bytes() + 8;
         let cache = ChunkCache::new(cap);
-        let _ = cache.get_or_insert_with((0, 0), || chunk(1000));
-        let _ = cache.get_or_insert_with((0, 1), || chunk(1000));
-        let _ = cache.get_or_insert_with((0, 2), || chunk(1000));
+        let _ = cache.get_or_insert_with((0, 0, 0), || chunk(1000));
+        let _ = cache.get_or_insert_with((0, 1, 0), || chunk(1000));
+        let _ = cache.get_or_insert_with((0, 2, 0), || chunk(1000));
         assert!(
             cache.retained_bytes() <= cap,
             "retained {} > cap {}",

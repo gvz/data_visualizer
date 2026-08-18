@@ -207,9 +207,12 @@ pub(crate) fn plan_file(
                     );
                     continue;
                 }
+                let fast = crate::ingest::decode::FastPlan::build(
+                    &desc, &path, &[], sample_type, 1.0, 0.0, id,
+                );
                 bindings.push(ChannelBinding {
                     id,
-                    fast: None,
+                    fast,
                     msg_desc: desc.clone(),
                     val_path: path,
                     ts_path: Vec::new(),
@@ -292,11 +295,29 @@ pub struct ChunkSpan {
 /// OS on demand, the chunk index is read from the summary, and individual
 /// chunks are decoded only when a read needs them.
 pub struct RecordingSource {
+    /// Parsed once at open and reused. `Summary::read` seeks to the footer and
+    /// parses every chunk index, channel, and schema; re-reading it per chunk
+    /// decode — once per scroll frame on a miss, once per chunk per worker at
+    /// load — is a heavy repeated cost on large files. `None` only for an
+    /// unsummarised file, where decoding uses the whole-file span instead.
+    ///
+    /// `Summary` borrows the mapped bytes; its lifetime is erased to `'static`
+    /// (see `open`). This is sound because it borrows only from `mmap`, whose
+    /// pages are stable for the struct's life, and this field is declared
+    /// before `mmap` so it is dropped first. The borrow is never exposed
+    /// beyond the struct.
+    summary: Option<mcap::Summary<'static>>,
     mmap: Mmap,
     router: TopicRouter,
     reconstructed: HashMap<String, Vec<ChannelBinding>>,
     spans: Vec<ChunkSpan>,
     pub bounds: Option<(i64, i64)>,
+    /// channel id → topic key (index into `topics_by_key`). Lets the detail path
+    /// decode only the one topic that owns a requested channel instead of every
+    /// topic in the chunk — decisive for foreign recordings that flatten into
+    /// thousands of channels across hundreds of topics.
+    chan_topic_key: HashMap<u32, u32>,
+    topics_by_key: Vec<String>,
 }
 
 impl RecordingSource {
@@ -310,8 +331,16 @@ impl RecordingSource {
 
         let (router, reconstructed) = plan_file(bytes, registry)?;
 
+        let summary = mcap::Summary::read(bytes).context("reading MCAP summary")?;
+        // SAFETY: `summary` borrows only from `mmap`'s mapped pages, which are
+        // stable for this `RecordingSource`'s lifetime and (by field order)
+        // dropped after `summary`. Erasing the borrow to 'static lets the two
+        // live in one struct; no reference outliving the struct is ever handed
+        // out. Moving `mmap` into `Self` below moves only the handle, not the
+        // pages, so the borrow stays valid.
+        let summary: Option<mcap::Summary<'static>> = unsafe { std::mem::transmute(summary) };
         let mut spans = Vec::new();
-        if let Some(summary) = mcap::Summary::read(bytes).context("reading MCAP summary")? {
+        if let Some(summary) = &summary {
             for (i, ci) in summary.chunk_indexes.iter().enumerate() {
                 spans.push(ChunkSpan {
                     start_ns: ci.message_start_time as i64,
@@ -333,11 +362,105 @@ impl RecordingSource {
             }
         }
 
-        Ok(Self { mmap, router, reconstructed, spans, bounds })
+        // Reverse index: channel id → topic, so the detail path can decode a
+        // single topic. Covers both ZMQ (router) and reconstructed topics; every
+        // bound channel belongs to exactly one topic.
+        let mut topics_by_key: Vec<String> = Vec::new();
+        let mut chan_topic_key: HashMap<u32, u32> = HashMap::new();
+        let mut index_topic = |topic: &str, bindings: &[ChannelBinding], topics: &mut Vec<String>| {
+            if bindings.is_empty() {
+                return;
+            }
+            let key = topics.len() as u32;
+            topics.push(topic.to_string());
+            for b in bindings {
+                chan_topic_key.insert(b.id.0, key);
+            }
+        };
+        // Collect ZMQ topics first (borrow of router ends before we move it).
+        let zmq_topics: Vec<String> = router.topics().map(str::to_string).collect();
+        for topic in &zmq_topics {
+            index_topic(topic, router.bindings_for(topic), &mut topics_by_key);
+        }
+        for (topic, bindings) in &reconstructed {
+            index_topic(topic, bindings, &mut topics_by_key);
+        }
+
+        Ok(Self {
+            mmap,
+            summary,
+            router,
+            reconstructed,
+            spans,
+            bounds,
+            chan_topic_key,
+            topics_by_key,
+        })
     }
 
     pub fn spans(&self) -> &[ChunkSpan] {
         &self.spans
+    }
+
+    /// The topic key owning channel `ch` in this source, or `None` if this
+    /// source records nothing for that channel (e.g. it lives in another
+    /// stitched file). The key indexes this source's cache entries.
+    pub(crate) fn topic_key_of(&self, ch: usize) -> Option<u32> {
+        self.chan_topic_key.get(&(ch as u32)).copied()
+    }
+
+    /// Decode only the messages of one topic in a span, into a fresh chunk. The
+    /// detail path uses this so serving one channel doesn't reflect-decode every
+    /// other topic in the chunk. `topic_key` comes from [`topic_key_of`].
+    pub(crate) fn decode_chunk_topic(
+        &self,
+        span_idx: usize,
+        topic_key: u32,
+        metas: &[ChannelMeta],
+    ) -> DecodedChunk {
+        let buf = ChunkDecodeBuf::from_metas(metas);
+        if let (Some(span), Some(topic)) =
+            (self.spans.get(span_idx), self.topics_by_key.get(topic_key as usize))
+        {
+            let bindings = self
+                .reconstructed
+                .get(topic)
+                .map(Vec::as_slice)
+                .unwrap_or_else(|| self.router.bindings_for(topic));
+            let _ = self.decode_topic_into(span, topic, bindings, &buf);
+        }
+        buf.freeze()
+    }
+
+    /// Stream a span (or the whole file, for the no-summary fallback), decoding
+    /// only messages on `topic` through `bindings`.
+    fn decode_topic_into(
+        &self,
+        span: &ChunkSpan,
+        topic: &str,
+        bindings: &[ChannelBinding],
+        sink: &dyn ChannelStore,
+    ) -> anyhow::Result<()> {
+        let bytes: &[u8] = &self.mmap;
+        let decode = |msg: &mcap::Message| {
+            if msg.channel.topic == topic {
+                decode_batch_at(&msg.data, bindings, sink, msg.log_time as i64);
+            }
+        };
+        if span.idx == usize::MAX {
+            for message in
+                mcap::MessageStream::new(bytes).context("opening MCAP message stream")?
+            {
+                decode(&message.context("reading MCAP message")?);
+            }
+            return Ok(());
+        }
+        let summary = self.summary.as_ref().context("MCAP summary missing")?;
+        let index = &summary.chunk_indexes[span.idx];
+        for message in summary.stream_chunk(bytes, index).context("streaming MCAP chunk")? {
+            decode(&message.context("reading MCAP message")?);
+        }
+        Ok(())
     }
 
     pub fn overlapping(&self, window: TimeWindow) -> Vec<usize> {
@@ -377,9 +500,7 @@ impl RecordingSource {
             }
             return Ok(());
         }
-        let summary = mcap::Summary::read(bytes)
-            .context("reading MCAP summary")?
-            .context("MCAP summary missing")?;
+        let summary = self.summary.as_ref().context("MCAP summary missing")?;
         let index = &summary.chunk_indexes[span.idx];
         for message in summary.stream_chunk(bytes, index).context("streaming MCAP chunk")? {
             let msg = message.context("reading MCAP message")?;
@@ -765,6 +886,58 @@ message Health {{
                 assert_eq!(vals, vec![11, 22]);
             }
             other => panic!("wrong variant for depth_val: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_chunk_topic_decodes_only_the_requested_topic() {
+        let registry = ChannelRegistry::from_toml_str("").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("foreign.mcap");
+        write_foreign_mcap(&path, &[(1_000_000_000, 7, 11), (2_000_000_000, 8, 22)]);
+
+        let src = RecordingSource::open(&path, &registry).unwrap();
+        let code_id = registry.id("S1/HEALTH/code").unwrap();
+        let depth_id = registry.id("S1/HEALTH/cmd/depth_val").unwrap();
+
+        // Both leaves belong to the same topic → same topic key.
+        let key = src.topic_key_of(code_id.0 as usize).expect("code has a topic");
+        assert_eq!(Some(key), src.topic_key_of(depth_id.0 as usize));
+
+        // Topic-scoped decode fills the topic's leaves with the same data the
+        // whole-chunk path produces.
+        let metas = metas_of(&registry);
+        let chunk = src.decode_chunk_topic(0, key, &metas);
+        let all = TimeWindow { start_ns: i64::MIN, end_ns: i64::MAX };
+        match chunk.window(code_id.0 as usize, all) {
+            ChannelSnapshot::Int { ts, vals } => {
+                assert_eq!(ts, vec![1_000_000_000, 2_000_000_000]);
+                assert_eq!(vals, vec![7, 8]);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        match chunk.window(depth_id.0 as usize, all) {
+            ChannelSnapshot::Int { vals, .. } => assert_eq!(vals, vec![11, 22]),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn foreign_topic_detail_snapshot_matches_via_playback() {
+        // Exercise the real per-topic detail path through PlaybackStore::snapshot.
+        let registry = ChannelRegistry::from_toml_str("").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("foreign.mcap");
+        write_foreign_mcap(&path, &[(1_000_000_000, 7, 11), (2_000_000_000, 8, 22)]);
+        let store = crate::record::playback::PlaybackStore::load(&path, &registry).unwrap();
+        let code_id = registry.id("S1/HEALTH/code").unwrap();
+        let w = TimeWindow { start_ns: 1_000_000_000, end_ns: 2_500_000_000 };
+        match crate::store::ChannelStore::snapshot(store.as_ref(), code_id, w) {
+            ChannelSnapshot::Int { ts, vals } => {
+                assert_eq!(ts, vec![1_000_000_000, 2_000_000_000]);
+                assert_eq!(vals, vec![7, 8]);
+            }
+            other => panic!("wrong variant: {other:?}"),
         }
     }
 
