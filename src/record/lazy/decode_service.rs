@@ -97,6 +97,12 @@ impl DecodeShared {
     pub fn active_workers(&self) -> usize {
         self.active.load(Ordering::SeqCst)
     }
+
+    /// True when no key is queued or being decoded (test settle hook).
+    #[cfg(test)]
+    pub(crate) fn in_flight_is_empty(&self) -> bool {
+        self.in_flight.lock().unwrap().is_empty()
+    }
 }
 
 /// Spawn `count` detached workers draining a bounded job queue. Returns the

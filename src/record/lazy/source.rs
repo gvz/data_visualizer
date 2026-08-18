@@ -932,7 +932,7 @@ message Health {{
         let store = crate::record::playback::PlaybackStore::load(&path, &registry).unwrap();
         let code_id = registry.id("S1/HEALTH/code").unwrap();
         let w = TimeWindow { start_ns: 1_000_000_000, end_ns: 2_500_000_000 };
-        match crate::store::ChannelStore::snapshot(store.as_ref(), code_id, w) {
+        match store.snapshot_blocking(code_id, w) {
             ChannelSnapshot::Int { ts, vals } => {
                 assert_eq!(ts, vec![1_000_000_000, 2_000_000_000]);
                 assert_eq!(vals, vec![7, 8]);

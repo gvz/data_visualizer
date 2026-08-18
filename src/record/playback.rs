@@ -346,10 +346,61 @@ impl PlaybackStore {
         }
     }
 
+    /// Enqueue a missing chunk for background decode, deduped. A full queue
+    /// (fast scrub outpacing decode) drops the request; the still-visible window
+    /// re-requests it next frame.
+    fn request(&self, key: crate::record::lazy::Job) {
+        if self.shared.reserve(key) {
+            if self.jobs.try_send(key).is_err() {
+                self.shared.unreserve(key);
+            }
+        }
+    }
+
     /// Bytes currently retained by the decoded-chunk cache (test hook).
     #[cfg(test)]
     pub(crate) fn cache_retained_bytes(&self) -> usize {
         self.shared.cache.retained_bytes()
+    }
+
+    /// Drain any queued decodes on THIS thread (used by zero-worker tests).
+    #[cfg(test)]
+    pub(crate) fn run_pending_decodes(&self) {
+        while let Ok(key) = self.rx.try_recv() {
+            self.shared.decode_and_cache(key);
+        }
+    }
+
+    /// Block until every enqueued detail decode has completed, for any worker
+    /// count: drain the queue on this thread (covers worker_count == 0), then
+    /// wait out in-flight worker decodes. Terminates — the job set is finite and
+    /// workers make progress.
+    #[cfg(test)]
+    pub(crate) fn settle_decodes(&self) {
+        while let Ok(key) = self.rx.try_recv() {
+            self.shared.decode_and_cache(key);
+        }
+        while !self.shared.in_flight_is_empty() {
+            std::thread::yield_now();
+        }
+    }
+
+    /// Snapshot with all detail decoded: prime the async request, settle, re-read.
+    /// A single snapshot enqueues at most `QUEUE_CAP` missing chunks, so a window
+    /// overlapping more chunks than the queue holds needs several rounds: prime,
+    /// settle, repeat until a probe enqueues nothing more. Each round caches at
+    /// least one new chunk, so it terminates.
+    #[cfg(test)]
+    pub(crate) fn snapshot_blocking(&self, channel: ChannelId, window: TimeWindow) -> ChannelSnapshot {
+        loop {
+            let _ = self.snapshot(channel, window);
+            let pending = !self.shared.in_flight_is_empty() || !self.rx.is_empty();
+            self.settle_decodes();
+            if !pending {
+                break;
+            }
+        }
+        self.snapshot(channel, window)
     }
 }
 
@@ -387,15 +438,31 @@ impl ChannelStore for PlaybackStore {
             }
         }
         overlaps.sort_by_key(|(t, _, _)| *t);
-        let mut acc = SnapshotAcc::new();
+        // Probe the cache for every needed chunk; never decode on the read
+        // thread. If any is missing, enqueue the misses for background decode and
+        // serve the coarse overview now — a worker fills the cache and requests a
+        // repaint, and the next frame lands in the all-cached branch below.
+        let mut chunks: Vec<Arc<DecodedChunk>> = Vec::new();
+        let mut missing = false;
         for (_, si, span_idx) in overlaps {
-            // Decode only the topic that owns `ch`; sources that don't record it
+            // Only the topic that owns `ch` matters; sources that don't record it
             // contribute nothing.
             let Some(topic_key) = self.shared.sources[si].topic_key_of(ch) else { continue };
-            let chunk = self.shared.cache.get_or_insert_with((si, span_idx, topic_key), || {
-                self.shared.sources[si].decode_chunk_topic(span_idx, topic_key, &self.shared.metas)
-            });
-            acc.extend(chunk.window(ch, window));
+            let key = (si, span_idx, topic_key);
+            match self.shared.cached(key) {
+                Some(c) => chunks.push(c),
+                None => {
+                    missing = true;
+                    self.request(key); // enqueue every missing chunk (do not early-return)
+                }
+            }
+        }
+        if missing {
+            return self.snapshot_overview(ch, window);
+        }
+        let mut acc = SnapshotAcc::new();
+        for c in chunks {
+            acc.extend(c.window(ch, window));
         }
         acc.into_snapshot(self.shared.metas.get(ch).map(|m| m.sample_type).unwrap_or(SampleType::Float))
     }
@@ -676,10 +743,46 @@ type = "float"
         let id = registry.id("accel.x").unwrap();
         // Window [1, 30) truly overlaps only the first chunk (well under budget),
         // but the pad makes every chunk "overlap". Exact detail → ts 1..=29.
-        let snap = store.snapshot(id, TimeWindow { start_ns: 1, end_ns: 30 });
+        let snap = store.snapshot_blocking(id, TimeWindow { start_ns: 1, end_ns: 30 });
         match snap {
             ChannelSnapshot::Float { ts, .. } => {
                 assert_eq!(ts, (1..30).collect::<Vec<i64>>(), "must return exact samples, not overview");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detail_snapshot_is_coarse_until_workers_decode_then_sharp() {
+        let (schema, _d, registry) = make_proto_and_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("async.mcap");
+        // Many samples, small chunks; a narrow window truly overlaps <= budget so
+        // the detail path is taken (not the overview budget path).
+        let msgs: Vec<(i64, f32)> = (0..4000).map(|i| (i as i64 + 1, i as f32)).collect();
+        write_test_mcap_chunked(&path, &schema, &msgs, 4096);
+        // Zero workers → the cache only fills when the test drains the queue.
+        let caps = Caps { cache_bytes: 64 * 1024 * 1024, envelope_buckets: 256,
+                          chunk_budget: 16, worker_count: 0 };
+        let store = PlaybackStore::load_many_with(&[&path], &registry, caps).unwrap();
+        let id = registry.id("accel.x").unwrap();
+        let window = TimeWindow { start_ns: 1, end_ns: 30 };
+
+        // First read: chunks not yet decoded → coarse overview (decimated), not the
+        // exact 1..30 detail.
+        let first = store.snapshot(id, window);
+        let coarse_len = match &first {
+            ChannelSnapshot::Float { ts, .. } => ts.len(),
+            other => panic!("wrong variant: {other:?}"),
+        };
+
+        // Drain the queued decode jobs, then re-read: now exact detail.
+        store.run_pending_decodes();
+        let sharp = store.snapshot(id, window);
+        match sharp {
+            ChannelSnapshot::Float { ts, .. } => {
+                assert_eq!(ts, (1..30).collect::<Vec<i64>>(), "must be exact detail after decode");
+                assert!(ts.len() >= coarse_len, "detail should be at least as dense as coarse");
             }
             other => panic!("wrong variant: {other:?}"),
         }

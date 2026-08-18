@@ -685,7 +685,7 @@ type = "float"
         let store = crate::record::playback::PlaybackStore::load(&path, &registry).unwrap();
         let id = registry.id("home/temp").unwrap();
         let all = TimeWindow { start_ns: i64::MIN, end_ns: i64::MAX };
-        match crate::store::ChannelStore::snapshot(store.as_ref(), id, all) {
+        match store.snapshot_blocking(id, all) {
             ChannelSnapshot::Float { ts, vals } => {
                 assert_eq!(ts.len(), 3000);
                 assert_eq!(ts[0], 1);
