@@ -55,6 +55,59 @@ pub(crate) fn value_sample_type(desc: &MessageDescriptor) -> Option<SampleType> 
     })
 }
 
+/// Sample type for a scalar protobuf kind, or None for non-scalar kinds
+/// (enum, bytes, group, message).
+fn scalar_sample_type(kind: &Kind) -> Option<SampleType> {
+    Some(match kind {
+        Kind::Double | Kind::Float => SampleType::Float,
+        Kind::Int64 | Kind::Int32 | Kind::Uint64 | Kind::Uint32 | Kind::Sint64 | Kind::Sint32
+        | Kind::Fixed64 | Kind::Fixed32 | Kind::Sfixed64 | Kind::Sfixed32 => SampleType::Int,
+        Kind::Bool => SampleType::Bool,
+        Kind::String => SampleType::Text,
+        _ => return None, // Enum, Bytes, Message, Group
+    })
+}
+
+/// Every scalar leaf field of `desc` as (field-name path, sample type). Recurses
+/// into singular sub-messages; skips repeated fields, enums, bytes, and groups.
+/// Depth-capped to guard against recursive schemas.
+pub(crate) fn enumerate_leaves(desc: &MessageDescriptor) -> Vec<(Vec<String>, SampleType)> {
+    let mut out = Vec::new();
+    let mut prefix = Vec::new();
+    walk_leaves(desc, &mut prefix, 0, &mut out);
+    out
+}
+
+fn walk_leaves(
+    desc: &MessageDescriptor,
+    prefix: &mut Vec<String>,
+    depth: usize,
+    out: &mut Vec<(Vec<String>, SampleType)>,
+) {
+    if depth > 8 {
+        return;
+    }
+    for f in desc.fields() {
+        if f.cardinality() == Cardinality::Repeated {
+            continue;
+        }
+        match f.kind() {
+            Kind::Message(sub) => {
+                prefix.push(f.name().to_string());
+                walk_leaves(&sub, prefix, depth + 1, out);
+                prefix.pop();
+            }
+            k => {
+                if let Some(st) = scalar_sample_type(&k) {
+                    let mut path = prefix.clone();
+                    path.push(f.name().to_string());
+                    out.push((path, st));
+                }
+            }
+        }
+    }
+}
+
 /// Decode one MCAP message into `store` using the file's routing. ZMQ topics
 /// resolve through the registry router; the rest fall back to reconstructed
 /// (MQTT/generated) bindings.
@@ -333,6 +386,60 @@ mod tests {
     use crate::ingest::loader::ProtoSchema;
     use crate::types::{ChannelSnapshot, TimeWindow};
     use std::io::Write;
+
+    #[test]
+    fn enumerate_leaves_collects_scalars_recurses_singular_skips_repeated() {
+        use crate::ingest::loader::ProtoSchema;
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("foreign.proto");
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(f, r#"
+syntax = "proto3";
+message Health {{
+  uint64 scheduler_got_sync = 1;
+  bool ok = 2;
+  Inner cmd = 3;
+  repeated uint64 samples = 4;
+  message Inner {{
+    string label = 1;
+    int64 code = 2;
+  }}
+}}
+"#).unwrap();
+        let schema = ProtoSchema::from_path(&path).unwrap();
+        let desc = schema.message_by_name("Health").unwrap();
+
+        let mut leaves = super::enumerate_leaves(&desc);
+        leaves.sort_by_key(|x| x.0.clone());
+        let expected = vec![
+            (vec!["cmd".to_string(), "code".to_string()], SampleType::Int),
+            (vec!["cmd".to_string(), "label".to_string()], SampleType::Text),
+            (vec!["ok".to_string()], SampleType::Bool),
+            (vec!["scheduler_got_sync".to_string()], SampleType::Int),
+        ];
+        let mut expected_sorted = expected.clone();
+        expected_sorted.sort_by_key(|x| x.0.clone());
+        assert_eq!(leaves, expected_sorted, "repeated `samples` must be skipped; singular `cmd` recursed");
+    }
+
+    #[test]
+    fn enumerate_leaves_message_without_scalars_is_empty() {
+        use crate::ingest::loader::ProtoSchema;
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.proto");
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(f, r#"
+syntax = "proto3";
+message Wrap {{
+  repeated Wrap children = 1;
+}}
+"#).unwrap();
+        let schema = ProtoSchema::from_path(&path).unwrap();
+        let desc = schema.message_by_name("Wrap").unwrap();
+        assert!(super::enumerate_leaves(&desc).is_empty());
+    }
 
     fn make_proto_and_registry() -> (ProtoSchema, tempfile::TempDir, ChannelRegistry) {
         let dir = tempfile::tempdir().unwrap();
