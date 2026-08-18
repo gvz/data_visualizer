@@ -43,28 +43,36 @@ pub(crate) struct Caps {
     pub cache_bytes: usize,
     pub envelope_buckets: usize,
     pub chunk_budget: usize,
+    pub worker_count: usize,
 }
 
 impl Default for Caps {
     fn default() -> Self {
+        let worker_count = std::thread::available_parallelism().map_or(1, |n| n.get()).min(4);
         Caps {
             cache_bytes: CACHE_BYTES,
             envelope_buckets: ENVELOPE_BUCKETS,
             chunk_budget: CHUNK_BUDGET,
+            worker_count,
         }
     }
 }
 
 pub struct PlaybackStore {
-    /// One memory-mapped recording per stitched file.
-    sources: Vec<RecordingSource>,
+    /// Decode state shared with the background worker pool: sources, cache,
+    /// channel metas.
+    shared: Arc<crate::record::lazy::DecodeShared>,
+    /// Job queue sender, cloned by anything that wants to enqueue a decode
+    /// (Task 4).
+    #[allow(dead_code)]
+    jobs: crossbeam_channel::Sender<crate::record::lazy::Job>,
+    /// Retained Receiver clone drained by `run_pending_decodes` (test hook, Task 4).
+    #[allow(dead_code)]
+    rx: crossbeam_channel::Receiver<crate::record::lazy::Job>,
     /// Numeric channels' decimated min/max overview, built once at load.
     envelope: Envelope,
     /// Text/log channels retained in full; `None` for non-text channels.
     text: Vec<Option<Vec<(i64, String)>>>,
-    /// Byte-budgeted LRU of decoded chunks for the detail path.
-    cache: ChunkCache,
-    metas: Vec<ChannelMeta>,
     pub position_ns: Arc<AtomicI64>,
     pub duration_ns: i64,
     pub start_ns: i64,
@@ -206,7 +214,7 @@ impl PlaybackStore {
         caps: Caps,
     ) -> anyhow::Result<Arc<Self>> {
         anyhow::ensure!(!paths.is_empty(), "no recording files to load");
-        let Caps { cache_bytes, envelope_buckets, chunk_budget } = caps;
+        let Caps { cache_bytes, envelope_buckets, chunk_budget, worker_count } = caps;
 
         // Open (mmap + index + routing) every file first, registering any
         // reconstructed channels BEFORE we snapshot the registry into metas, so
@@ -297,12 +305,22 @@ impl PlaybackStore {
             slot.sort_by_key(|(t, _)| *t);
         }
 
-        Ok(Arc::new(Self {
+        let shared = Arc::new(crate::record::lazy::DecodeShared::new(
             sources,
+            ChunkCache::new(cache_bytes),
+            metas,
+        ));
+        // Retain one Receiver clone so the test hook can drain the queue on the
+        // test thread; unused in production (workers own their own Receiver
+        // clones).
+        let (jobs, rx) = crate::record::lazy::spawn_decode_workers(shared.clone(), worker_count);
+
+        Ok(Arc::new(Self {
+            shared,
+            jobs,
+            rx,
             envelope,
             text,
-            cache: ChunkCache::new(cache_bytes),
-            metas,
             position_ns: Arc::new(AtomicI64::new(start_ns)),
             duration_ns,
             start_ns,
@@ -316,7 +334,7 @@ impl PlaybackStore {
     fn snapshot_overview(&self, ch: usize, window: TimeWindow) -> ChannelSnapshot {
         let pts = self.envelope.read(ch, window);
         let ts: Vec<i64> = pts.iter().map(|(t, _)| *t).collect();
-        match self.metas.get(ch).map(|m| m.sample_type).unwrap_or(SampleType::Float) {
+        match self.shared.metas.get(ch).map(|m| m.sample_type).unwrap_or(SampleType::Float) {
             SampleType::Int => {
                 ChannelSnapshot::Int { ts, vals: pts.iter().map(|(_, v)| *v as i64).collect() }
             }
@@ -331,7 +349,7 @@ impl PlaybackStore {
     /// Bytes currently retained by the decoded-chunk cache (test hook).
     #[cfg(test)]
     pub(crate) fn cache_retained_bytes(&self) -> usize {
-        self.cache.retained_bytes()
+        self.shared.cache.retained_bytes()
     }
 }
 
@@ -354,7 +372,7 @@ impl ChannelStore for PlaybackStore {
         // must not inflate the count and force a finely-chunked unbatched file
         // onto the decimated overview (a fidelity regression at some zooms).
         let true_overlaps: usize =
-            self.sources.iter().map(|src| src.overlapping_true_count(window)).sum();
+            self.shared.sources.iter().map(|src| src.overlapping_true_count(window)).sum();
         if true_overlaps > self.chunk_budget {
             return self.snapshot_overview(ch, window);
         }
@@ -363,7 +381,7 @@ impl ChannelStore for PlaybackStore {
         // chunk-start bound cannot hide in-window samples; per-sample clipping in
         // `chunk.window` keeps the result exact.
         let mut overlaps: Vec<(i64, usize, usize)> = Vec::new(); // (start_ns, source, span_idx)
-        for (si, src) in self.sources.iter().enumerate() {
+        for (si, src) in self.shared.sources.iter().enumerate() {
             for span_idx in src.overlapping(window) {
                 overlaps.push((src.spans()[span_idx].start_ns, si, span_idx));
             }
@@ -373,13 +391,13 @@ impl ChannelStore for PlaybackStore {
         for (_, si, span_idx) in overlaps {
             // Decode only the topic that owns `ch`; sources that don't record it
             // contribute nothing.
-            let Some(topic_key) = self.sources[si].topic_key_of(ch) else { continue };
-            let chunk = self.cache.get_or_insert_with((si, span_idx, topic_key), || {
-                self.sources[si].decode_chunk_topic(span_idx, topic_key, &self.metas)
+            let Some(topic_key) = self.shared.sources[si].topic_key_of(ch) else { continue };
+            let chunk = self.shared.cache.get_or_insert_with((si, span_idx, topic_key), || {
+                self.shared.sources[si].decode_chunk_topic(span_idx, topic_key, &self.shared.metas)
             });
             acc.extend(chunk.window(ch, window));
         }
-        acc.into_snapshot(self.metas.get(ch).map(|m| m.sample_type).unwrap_or(SampleType::Float))
+        acc.into_snapshot(self.shared.metas.get(ch).map(|m| m.sample_type).unwrap_or(SampleType::Float))
     }
 
     fn latest(&self, channel: ChannelId) -> Option<(i64, Sample)> {
@@ -396,7 +414,7 @@ impl ChannelStore for PlaybackStore {
         // earliest, decoding via the cache, and return the first chunk that
         // holds a sample <= end_ns. Only the containing chunk is decoded.
         let mut candidates: Vec<(usize, usize, i64)> = Vec::new(); // (source, span_idx, start_ns)
-        for (si, src) in self.sources.iter().enumerate() {
+        for (si, src) in self.shared.sources.iter().enumerate() {
             for (k, span) in src.spans().iter().enumerate() {
                 // Pad the start bound: a batched file's chunk-index start can sit
                 // up to SPAN_PAD_NS after the chunk's true earliest sample, so a
@@ -409,9 +427,9 @@ impl ChannelStore for PlaybackStore {
         }
         candidates.sort_by_key(|(_, _, s)| *s);
         for (si, k, _) in candidates.into_iter().rev() {
-            let Some(topic_key) = self.sources[si].topic_key_of(ch) else { continue };
-            let chunk = self.cache.get_or_insert_with((si, k, topic_key), || {
-                self.sources[si].decode_chunk_topic(k, topic_key, &self.metas)
+            let Some(topic_key) = self.shared.sources[si].topic_key_of(ch) else { continue };
+            let chunk = self.shared.cache.get_or_insert_with((si, k, topic_key), || {
+                self.shared.sources[si].decode_chunk_topic(k, topic_key, &self.shared.metas)
             });
             if let Some(hit) = chunk.last_le(ch, end_ns) {
                 return Some(hit);
@@ -421,7 +439,7 @@ impl ChannelStore for PlaybackStore {
     }
 
     fn channel_meta(&self, channel: ChannelId) -> &ChannelMeta {
-        &self.metas[channel.0 as usize]
+        &self.shared.metas[channel.0 as usize]
     }
 
     fn now_ns(&self) -> i64 {
@@ -598,7 +616,8 @@ type = "float"
         // Many small chunks so scrubbing touches many distinct cache keys.
         let msgs: Vec<(i64, f32)> = (0..8000).map(|i| (i as i64 + 1, i as f32)).collect();
         write_test_mcap_chunked(&path, &schema, &msgs, 2048);
-        let caps = Caps { cache_bytes: 64 * 1024, envelope_buckets: 1024, chunk_budget: 4 };
+        let caps =
+            Caps { cache_bytes: 64 * 1024, envelope_buckets: 1024, chunk_budget: 4, worker_count: 0 };
         let store = PlaybackStore::load_many_with(&[&path], &registry, caps).unwrap();
         let id = registry.id("accel.x").unwrap();
         for start in (0..8000i64).step_by(200) {
@@ -647,7 +666,12 @@ type = "float"
         // chunks, all within an 8 us total span (<< 500 ms pad).
         let msgs: Vec<(i64, f32)> = (0..8000).map(|i| (i as i64 + 1, i as f32)).collect();
         write_test_mcap_chunked(&path, &schema, &msgs, 4096);
-        let caps = Caps { cache_bytes: 64 * 1024 * 1024, envelope_buckets: 64, chunk_budget: 16 };
+        let caps = Caps {
+            cache_bytes: 64 * 1024 * 1024,
+            envelope_buckets: 64,
+            chunk_budget: 16,
+            worker_count: 0,
+        };
         let store = PlaybackStore::load_many_with(&[&path], &registry, caps).unwrap();
         let id = registry.id("accel.x").unwrap();
         // Window [1, 30) truly overlaps only the first chunk (well under budget),
