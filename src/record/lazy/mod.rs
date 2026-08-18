@@ -1,8 +1,10 @@
 pub mod cache;
 pub mod decode_buf;
+pub mod decode_service;
 pub mod envelope;
 pub mod source;
 pub use cache::ChunkCache;
 pub use decode_buf::{ChanSamples, ChunkDecodeBuf, DecodedChunk};
+pub use decode_service::{spawn_decode_workers, DecodeShared, Job};
 pub use envelope::Envelope;
 pub use source::{ChunkSpan, RecordingSource};
