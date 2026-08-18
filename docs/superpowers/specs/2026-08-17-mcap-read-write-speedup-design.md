@@ -284,5 +284,39 @@ and needs no change.
    `Sample` messages into a repeated field. No decode/re-encode; producers
    change only to encode `Sample` (identical bytes) + emit the batch schema.
 4. **Batch `log_time`** — last sample ts (keeps duration/`latest` tight);
-   coarsened chunk bounds handled by a `SPAN_PAD_NS` pad in `overlapping`.
+   coarsened chunk bounds handled by a `SPAN_PAD_NS` pad applied to the detail
+   decode set and the `latest_at` candidate scan — **not** to the
+   overview-vs-detail budget decision, which uses the unpadded
+   `overlapping_true_count` so finely-chunked unbatched files keep exact detail.
 5. **ZMQ path** — unchanged (already batched).
+
+## Measured results
+
+Measured with `examples/mcap_profile.rs` (release, `--no-default-features`) on the
+same host, existing **unbatched** recordings — this isolates the Part A read-side
+decoder win (Part B only changes newly-written files).
+
+| File | metric | before (main) | after (branch) | speedup |
+|------|--------|---------------|----------------|---------|
+| recording_1785913919.mcap (156 MiB, 15 ch, 465 chunks) | load | 1.35 s | 0.745 s | ~1.8× |
+| | scrub (400 reads × 8 ch) | 10.5 ms/read | 8.07 ms/read | ~23% |
+| recording_1785958983.mcap (71 MiB, 15 ch) | scrub | 4.71 ms/read | 3.72 ms/read | ~21% |
+
+Both after-runs return the identical exact sample counts as before (8.26M / 3.76M
+over the sweep) — the decoder is faster, not lossier. The `load` win is larger
+than `scrub` because the parallel envelope pass decodes every chunk (fully
+decoder-bound), whereas a scrub sweep is partly mcap decompression/iteration —
+the cost only **Part B** removes.
+
+**Part B (record-side batching)** is validated by the writer test
+`dynamic_samples_are_batched_and_replay_exactly`: 3000 single MQTT samples on one
+topic write **3** MCAP messages (⌈3000/1024⌉), not 3000 — a ~1000× message-count
+reduction. Since read cost scales with message count (the measured root cause was
+~1 message per sample, of which mcap decompress+iteration was 62%), a newly-batched
+recording collapses that 62% and reads dramatically faster than an equivalently
+sized legacy file, on top of the Part A decoder win.
+
+A parity defect found during final review — the fast scanner dropped proto3
+default-valued samples (`0`/`0.0`/`false`/`""` are omitted on the wire) while the
+reflection fallback writes them — was fixed so the fast path default-fills exactly
+as reflection does; a regression test locks fast == reflection for a default value.
