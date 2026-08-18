@@ -70,6 +70,12 @@ impl FastPlan {
         eu_offset: f64,
         id: ChannelId,
     ) -> Option<FastPlan> {
+        // Flatten bindings (empty ts_path) are reflection-only: their value comes from
+        // the MCAP log_time, not an embedded field, and their path may be arbitrary
+        // singular-message depth that the fast scanner does not walk.
+        if ts_path.is_empty() {
+            return None;
+        }
         // Resolve the leaf value/ts field descriptors and, for the batch shape,
         // the repeated container field number.
         match (val_path.len(), ts_path.len()) {
@@ -256,6 +262,17 @@ fn decode_fast(data: &[u8], plan: &FastPlan, store: &dyn ChannelStore) -> usize 
 }
 
 pub fn decode_batch(data: &[u8], bindings: &[ChannelBinding], store: &dyn ChannelStore) -> usize {
+    decode_batch_at(data, bindings, store, now_ns())
+}
+
+/// Like `decode_batch`, but stamps flatten channels (empty `ts_path`) with the
+/// caller's `log_time` instead of the message's own timestamp field.
+pub fn decode_batch_at(
+    data: &[u8],
+    bindings: &[ChannelBinding],
+    store: &dyn ChannelStore,
+    log_time: i64,
+) -> usize {
     if bindings.is_empty() {
         return 0;
     }
@@ -268,16 +285,22 @@ pub fn decode_batch(data: &[u8], bindings: &[ChannelBinding], store: &dyn Channe
             if reflected.is_none() {
                 match DynamicMessage::decode(bindings[0].msg_desc.clone(), data) {
                     Ok(m) => reflected = Some(m),
-                    Err(e) => { eprintln!("ingest: proto decode error: {e}"); return total; }
+                    Err(e) => {
+                        eprintln!("ingest: proto decode error: {e}");
+                        return total;
+                    }
                 }
             }
-            total += decode_channel(reflected.as_ref().unwrap(), binding, store);
+            total += decode_channel(reflected.as_ref().unwrap(), binding, log_time, store);
         }
     }
     total
 }
 
-fn decode_channel(msg: &DynamicMessage, binding: &ChannelBinding, store: &dyn ChannelStore) -> usize {
+fn decode_channel(msg: &DynamicMessage, binding: &ChannelBinding, log_time: i64, store: &dyn ChannelStore) -> usize {
+    if binding.ts_path.is_empty() {
+        return decode_deep_channel(msg, binding, log_time, store);
+    }
     match binding.val_path.len() {
         2 => decode_batch_channel(msg, binding, store),
         1 => decode_single_channel(msg, binding, store),
@@ -286,6 +309,23 @@ fn decode_channel(msg: &DynamicMessage, binding: &ChannelBinding, store: &dyn Ch
             0
         }
     }
+}
+
+/// Walk `binding.val_path` through singular message fields to the leaf value and
+/// write it stamped with `log_time`. Flatten channels carry no embedded ts, so
+/// `log_time` (the MCAP record time) is authoritative. A missing intermediate or
+/// leaf yields the proto3 default, matching the rest of the reflection path.
+fn decode_deep_channel(msg: &DynamicMessage, binding: &ChannelBinding, log_time: i64, store: &dyn ChannelStore) -> usize {
+    let mut it = binding.val_path.iter();
+    let Some(first) = it.next() else { return 0 };
+    let Some(mut cur) = get_named_field(msg, first) else { return 0 };
+    for name in it {
+        let Value::Message(m) = &cur else { return 0 };
+        let Some(v) = get_named_field(m, name) else { return 0 };
+        cur = v;
+    }
+    let ts = resolve_ts(Some(log_time));
+    usize::from(write_value(binding, ts, &cur, store))
 }
 
 fn decode_batch_channel(msg: &DynamicMessage, binding: &ChannelBinding, store: &dyn ChannelStore) -> usize {
@@ -842,6 +882,109 @@ type = "float"
                 assert_eq!(ts, vec![1_000_000_000]);
                 assert!((vals[0] - 7.5).abs() < 1e-6);
             }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    fn make_foreign_schema() -> (ProtoSchema, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("foreign.proto");
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(f, r#"
+syntax = "proto3";
+message Health {{
+  int64 code = 1;
+  Inner cmd = 2;
+  message Inner {{
+    int64 depth_val = 1;
+  }}
+}}
+"#).unwrap();
+        (ProtoSchema::from_path(&path).unwrap(), dir)
+    }
+
+    fn encode_health(schema: &ProtoSchema, code: i64, depth_val: i64) -> Vec<u8> {
+        use prost_reflect::prost::Message as _;
+        let pool = schema.pool_for_test();
+        let health = pool.get_message_by_name("Health").unwrap();
+        let inner = pool.get_message_by_name("Health.Inner").unwrap();
+        let mut im = DynamicMessage::new(inner.clone());
+        im.set_field(&inner.get_field_by_name("depth_val").unwrap(), Value::I64(depth_val));
+        let mut hm = DynamicMessage::new(health.clone());
+        hm.set_field(&health.get_field_by_name("code").unwrap(), Value::I64(code));
+        hm.set_field(&health.get_field_by_name("cmd").unwrap(), Value::Message(im));
+        hm.encode_to_vec()
+    }
+
+    fn flatten_binding(schema: &ProtoSchema, val_path: &[&str], id: ChannelId) -> ChannelBinding {
+        let desc = schema.message_by_name("Health").unwrap();
+        ChannelBinding {
+            id,
+            fast: None,
+            msg_desc: desc,
+            val_path: val_path.iter().map(|s| s.to_string()).collect(),
+            ts_path: Vec::new(), // flatten marker
+            eu_scale: 1.0,
+            eu_offset: 0.0,
+            sample_type: SampleType::Int,
+        }
+    }
+
+    #[test]
+    fn fast_plan_build_none_for_empty_ts_path() {
+        let (schema, _d) = make_foreign_schema();
+        let desc = schema.message_by_name("Health").unwrap();
+        assert!(
+            super::FastPlan::build(&desc, &["code".to_string()], &[], SampleType::Int, 1.0, 0.0, ChannelId(0)).is_none(),
+            "empty ts_path must never take the fast path"
+        );
+    }
+
+    #[test]
+    fn decode_deep_channel_depth1_stamps_log_time() {
+        let (schema, _d) = make_foreign_schema();
+        let registry = ChannelRegistry::from_toml_str("").unwrap();
+        let id = registry.add_dynamic("x", "x", SampleType::Int);
+        let store = LiveStore::from_registry(&registry);
+        let b = flatten_binding(&schema, &["code"], id);
+        let data = encode_health(&schema, 7, 0);
+        let n = super::decode_batch_at(&data, std::slice::from_ref(&b), &store, 1_234);
+        assert_eq!(n, 1);
+        match store.snapshot(id, ALL) {
+            ChannelSnapshot::Int { ts, vals } => { assert_eq!(ts, vec![1_234]); assert_eq!(vals, vec![7]); }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_deep_channel_depth2_walks_singular_message() {
+        let (schema, _d) = make_foreign_schema();
+        let registry = ChannelRegistry::from_toml_str("").unwrap();
+        let id = registry.add_dynamic("x", "x", SampleType::Int);
+        let store = LiveStore::from_registry(&registry);
+        let b = flatten_binding(&schema, &["cmd", "depth_val"], id);
+        let data = encode_health(&schema, 0, 99);
+        let n = super::decode_batch_at(&data, std::slice::from_ref(&b), &store, 5_000);
+        assert_eq!(n, 1);
+        match store.snapshot(id, ALL) {
+            ChannelSnapshot::Int { ts, vals } => { assert_eq!(ts, vec![5_000]); assert_eq!(vals, vec![99]); }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_deep_channel_missing_field_writes_proto3_default() {
+        // `cmd` unset on the wire → walk yields the default (0) leaf, still written.
+        let (schema, _d) = make_foreign_schema();
+        let registry = ChannelRegistry::from_toml_str("").unwrap();
+        let id = registry.add_dynamic("x", "x", SampleType::Int);
+        let store = LiveStore::from_registry(&registry);
+        let b = flatten_binding(&schema, &["cmd", "depth_val"], id);
+        let data = encode_health(&schema, 3, 0); // depth_val defaulted, cmd present-but-default
+        let n = super::decode_batch_at(&data, std::slice::from_ref(&b), &store, 42);
+        assert_eq!(n, 1);
+        match store.snapshot(id, ALL) {
+            ChannelSnapshot::Int { ts, vals } => { assert_eq!(ts, vec![42]); assert_eq!(vals, vec![0]); }
             other => panic!("wrong variant: {other:?}"),
         }
     }
