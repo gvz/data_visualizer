@@ -42,6 +42,18 @@ impl ChunkCache {
         self.inner.lock().unwrap().retained
     }
 
+    /// Non-inserting lookup for the render thread: returns the cached chunk and
+    /// bumps its LRU recency, or `None` without decoding. The async detail path
+    /// uses this so a cache miss never blocks on a decode.
+    pub fn get(&self, key: (usize, usize, u32)) -> Option<Arc<DecodedChunk>> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.tick += 1;
+        let tick = inner.tick;
+        let e = inner.map.get_mut(&key)?;
+        e.last_used = tick;
+        Some(e.chunk.clone())
+    }
+
     pub fn get_or_insert_with(
         &self,
         key: Key,
@@ -136,5 +148,14 @@ type = "float"
             cache.retained_bytes(),
             cap
         );
+    }
+
+    #[test]
+    fn get_returns_none_on_miss_and_hit_after_insert() {
+        let cache = ChunkCache::new(10 * 1024 * 1024);
+        assert!(cache.get((0, 0, 0)).is_none(), "miss must be None");
+        let a = cache.get_or_insert_with((0, 0, 0), || chunk(50));
+        let g = cache.get((0, 0, 0)).expect("must hit after insert");
+        assert!(Arc::ptr_eq(&a, &g));
     }
 }
