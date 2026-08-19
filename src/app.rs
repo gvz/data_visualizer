@@ -388,7 +388,7 @@ impl DataVisApp {
 
     /// Apply a finished background load, if one has arrived. Called once per
     /// frame; a no-op until the worker sends its result.
-    fn poll_pending_load(&mut self) {
+    fn poll_pending_load(&mut self, ctx: &egui::Context) {
         let Some((_, rx)) = &self.pending_load else { return };
         let result = match rx.try_recv() {
             Ok(r) => r,
@@ -403,6 +403,8 @@ impl DataVisApp {
         match result {
             Ok(playback) => {
                 self.store = playback.clone();
+                let ctx = ctx.clone();
+                playback.set_repaint_waker(move || ctx.request_repaint());
                 self.mode = AppMode::Replay(ReplayState {
                     store: playback,
                     playing: false,
@@ -1028,7 +1030,7 @@ impl eframe::App for DataVisApp {
         // repaints immediately regardless of this hint.
         // Apply a finished background recording load before deciding on repaint
         // cadence — this may flip us into Replay mode this frame.
-        self.poll_pending_load();
+        self.poll_pending_load(ctx);
 
         let animating = self.pending_load.is_some()
             || match self.mode {

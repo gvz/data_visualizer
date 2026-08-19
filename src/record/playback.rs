@@ -192,6 +192,13 @@ impl PlaybackStore {
         Self::load_many(std::slice::from_ref(&path), registry)
     }
 
+    /// Install the repaint hook workers call when a decoded chunk lands, so the
+    /// UI re-renders and picks up the now-cached detail. Set once after load with
+    /// the egui context. Idempotent (replaces any previous hook).
+    pub fn set_repaint_waker(&self, f: impl Fn() + Send + Sync + 'static) {
+        self.shared.set_waker(Box::new(f));
+    }
+
     /// Load one or more MCAP recordings into a single playback store. Channels
     /// are keyed by name via the shared registry, so same-named channels across
     /// files merge into one. Timestamps are preserved exactly as recorded; the
