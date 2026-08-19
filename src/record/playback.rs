@@ -444,7 +444,7 @@ impl PlaybackStore {
     /// Test hook: `latest` at the current position, fully decoded.
     #[cfg(test)]
     pub(crate) fn latest_blocking(&self, channel: ChannelId) -> Option<(i64, Sample)> {
-        self.latest_at_blocking(channel, self.position_ns.load(std::sync::atomic::Ordering::Relaxed))
+        self.latest_at_blocking(channel, self.position_ns.load(Ordering::Relaxed))
     }
 }
 
@@ -537,6 +537,12 @@ impl ChannelStore for PlaybackStore {
             }
         }
         candidates.sort_by_key(|(_, _, s)| *s);
+        // Newest-to-oldest scan: return the first cached hit and enqueue any
+        // uncached candidate we pass. Transient staleness is possible and
+        // accepted: if a newer candidate chunk is still decoding (uncached) while
+        // an older one is cached with a hit, the older exact sample wins for a
+        // frame or two until the background decode lands, after which the repaint
+        // re-runs this scan and the newer sample takes over. Never a future value.
         for (si, k, _) in candidates.into_iter().rev() {
             let Some(topic_key) = self.shared.sources[si].topic_key_of(ch) else { continue };
             let key = (si, k, topic_key);
@@ -738,6 +744,10 @@ type = "float"
         for start in (0..8000i64).step_by(200) {
             let w = TimeWindow { start_ns: start, end_ns: start + 100 };
             let _ = store.snapshot(id, w);
+            // `snapshot` only enqueues the missing chunks; drain them on this
+            // thread so they actually decode into the cache and trigger eviction,
+            // making the `<= cap` assertion meaningful (worker_count == 0 here).
+            store.settle_decodes();
             assert!(
                 store.cache_retained_bytes() <= 64 * 1024,
                 "cache exceeded cap: {}",

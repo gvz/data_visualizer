@@ -59,19 +59,34 @@ impl ChunkCache {
         key: Key,
         make: impl FnOnce() -> DecodedChunk,
     ) -> Arc<DecodedChunk> {
+        // Fast path: a hit under the lock, bumping recency.
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.tick += 1;
+            let tick = inner.tick;
+            if let Some(e) = inner.map.get_mut(&key) {
+                e.last_used = tick;
+                return e.chunk.clone();
+            }
+        }
+        // Decode with the lock RELEASED, so a concurrent render-thread `get` probe
+        // never blocks behind a decode and workers decode in parallel. A rare race
+        // (two threads decoding the same key) is resolved by the double-check below;
+        // decode is a pure function of the file bytes, so discarding the loser is safe.
+        let chunk = Arc::new(make());
+        let bytes = chunk.bytes();
         let mut inner = self.inner.lock().unwrap();
         inner.tick += 1;
         let tick = inner.tick;
+        // Double-check: another thread may have inserted this key while we decoded.
         if let Some(e) = inner.map.get_mut(&key) {
             e.last_used = tick;
             return e.chunk.clone();
         }
-        let chunk = Arc::new(make());
-        let bytes = chunk.bytes();
         inner.retained += bytes;
         inner.map.insert(key, Entry { chunk: chunk.clone(), bytes, last_used: tick });
-        // Evict least-recently-used until under cap, but never the entry we
-        // just inserted (its last_used == tick is the maximum).
+        // Evict least-recently-used until under cap, but never the entry we just
+        // inserted (its last_used == tick is the maximum).
         while inner.retained > self.cap_bytes {
             let Some((&victim, _)) = inner
                 .map
@@ -79,7 +94,7 @@ impl ChunkCache {
                 .filter(|(&k, _)| k != key)
                 .min_by_key(|(_, e)| e.last_used)
             else {
-                break; // only the fresh entry remains
+                break;
             };
             if let Some(e) = inner.map.remove(&victim) {
                 inner.retained -= e.bytes;
