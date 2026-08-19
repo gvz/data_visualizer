@@ -346,6 +346,23 @@ impl PlaybackStore {
         }
     }
 
+    /// Coarse `latest_at` fallback when the exact chunk isn't cached yet: the
+    /// newest envelope bucket point at or before `end_ns`, wrapped as the
+    /// channel's typed `Sample`. `None` if the envelope has nothing in range.
+    fn envelope_latest(&self, ch: usize, end_ns: i64) -> Option<(i64, Sample)> {
+        let pts = self.envelope.read(ch, TimeWindow { start_ns: self.start_ns, end_ns });
+        let (t, v) = *pts.last()?;
+        let st = self.shared.metas.get(ch).map(|m| m.sample_type).unwrap_or(SampleType::Float);
+        Some((
+            t,
+            match st {
+                SampleType::Int => Sample::Int(v as i64),
+                SampleType::Bool => Sample::Bool(v != 0.0),
+                _ => Sample::Float(v),
+            },
+        ))
+    }
+
     /// Enqueue a missing chunk for background decode, deduped. A full queue
     /// (fast scrub outpacing decode) drops the request; the still-visible window
     /// re-requests it next frame.
@@ -401,6 +418,26 @@ impl PlaybackStore {
             }
         }
         self.snapshot(channel, window)
+    }
+
+    /// Test hook: latest_at with all needed detail decoded (prime → settle → re-read).
+    #[cfg(test)]
+    pub(crate) fn latest_at_blocking(&self, channel: ChannelId, end_ns: i64) -> Option<(i64, Sample)> {
+        loop {
+            let _ = self.latest_at(channel, end_ns);
+            let pending = !self.shared.in_flight_is_empty() || !self.rx.is_empty();
+            self.settle_decodes();
+            if !pending {
+                break;
+            }
+        }
+        self.latest_at(channel, end_ns)
+    }
+
+    /// Test hook: `latest` at the current position, fully decoded.
+    #[cfg(test)]
+    pub(crate) fn latest_blocking(&self, channel: ChannelId) -> Option<(i64, Sample)> {
+        self.latest_at_blocking(channel, self.position_ns.load(std::sync::atomic::Ordering::Relaxed))
     }
 }
 
@@ -495,14 +532,18 @@ impl ChannelStore for PlaybackStore {
         candidates.sort_by_key(|(_, _, s)| *s);
         for (si, k, _) in candidates.into_iter().rev() {
             let Some(topic_key) = self.shared.sources[si].topic_key_of(ch) else { continue };
-            let chunk = self.shared.cache.get_or_insert_with((si, k, topic_key), || {
-                self.shared.sources[si].decode_chunk_topic(k, topic_key, &self.shared.metas)
-            });
-            if let Some(hit) = chunk.last_le(ch, end_ns) {
-                return Some(hit);
+            let key = (si, k, topic_key);
+            match self.shared.cached(key) {
+                Some(chunk) => {
+                    if let Some(hit) = chunk.last_le(ch, end_ns) {
+                        return Some(hit);
+                    }
+                }
+                None => self.request(key),
             }
         }
-        None
+        // Nothing cached yields a hit yet: coarse fallback from the envelope, or None.
+        self.envelope_latest(ch, end_ns)
     }
 
     fn channel_meta(&self, channel: ChannelId) -> &ChannelMeta {
@@ -709,11 +750,40 @@ type = "float"
         write_test_mcap_chunked(&path, &schema, &msgs, 4096);
         let store = PlaybackStore::load(&path, &registry).unwrap();
         let id = registry.id("accel.x").unwrap();
-        let (t, s) = store.latest_at(id, 3500).unwrap();
+        let (t, s) = store.latest_at_blocking(id, 3500).unwrap();
         assert_eq!(t, 3500);
         match s {
             Sample::Float(v) => assert!((v - 3499.0).abs() < 1e-6),
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn latest_at_is_nonblocking_and_sharpens_after_decode() {
+        let (schema, _d, registry) = make_proto_and_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("latest_async.mcap");
+        let msgs: Vec<(i64, f32)> = (0..4000).map(|i| (i as i64 + 1, i as f32)).collect();
+        write_test_mcap_chunked(&path, &schema, &msgs, 4096);
+        let caps = Caps {
+            cache_bytes: 64 * 1024 * 1024,
+            envelope_buckets: 256,
+            chunk_budget: 16,
+            worker_count: 0,
+        };
+        let store = PlaybackStore::load_many_with(&[&path], &registry, caps).unwrap();
+        let id = registry.id("accel.x").unwrap();
+
+        // Cold cache: must return without decoding (either None or an envelope-coarse
+        // value), never blocking.
+        let _cold = store.latest_at(id, 3500);
+        // After draining, the exact containing chunk is decoded → precise sample.
+        store.run_pending_decodes();
+        let (t, s) = store.latest_at(id, 3500).expect("exact after decode");
+        assert_eq!(t, 3500);
+        match s {
+            Sample::Float(v) => assert!((v - 3499.0).abs() < 1e-6),
+            o => panic!("{o:?}"),
         }
     }
 
@@ -903,21 +973,21 @@ type = "float"
 
         // Position before any sample → None
         store.position_ns.store(0, Ordering::Relaxed);
-        assert!(store.latest(id).is_none());
+        assert!(store.latest_blocking(id).is_none());
 
         // Position at first sample → returns first
         store.position_ns.store(1_000_000_000, Ordering::Relaxed);
-        let (ts, _) = store.latest(id).unwrap();
+        let (ts, _) = store.latest_blocking(id).unwrap();
         assert_eq!(ts, 1_000_000_000);
 
         // Position between samples → returns first
         store.position_ns.store(2_000_000_000, Ordering::Relaxed);
-        let (ts, _) = store.latest(id).unwrap();
+        let (ts, _) = store.latest_blocking(id).unwrap();
         assert_eq!(ts, 1_000_000_000);
 
         // Position at second sample → returns second
         store.position_ns.store(3_000_000_000, Ordering::Relaxed);
-        let (ts, _) = store.latest(id).unwrap();
+        let (ts, _) = store.latest_blocking(id).unwrap();
         assert_eq!(ts, 3_000_000_000);
     }
 
